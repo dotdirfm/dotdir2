@@ -553,6 +553,7 @@ impl DotDir {
                 d.cursor = index;
             }
             self.update_column_preview(self.active);
+            self.reveal_column(self.active, true);
             cx.notify();
         }
     }
@@ -1651,6 +1652,9 @@ impl DotDir {
         }
     }
     pub fn reveal_column(&mut self, pane: usize, preview: bool) {
+        if self.settings.presentation(pane) != Presentation::Columns {
+            return;
+        }
         if let Some(browser) = self.browser(pane) {
             let id = browser.id;
             let index = (browser.active + usize::from(preview)).min(browser.columns.len() - 1);
@@ -1671,7 +1675,6 @@ impl DotDir {
         if let Some(id) = reload {
             self.reload(id);
         }
-        self.reveal_column(pane, true);
     }
     pub fn set_presentation(
         &mut self,
@@ -1699,6 +1702,7 @@ impl DotDir {
         self.unwatch_removed_columns(old_ids);
         if presentation == Presentation::Columns {
             self.update_column_preview(pane);
+            self.reveal_column(pane, true);
         }
         if self.modal.is_none() {
             self.focus_pane(pane, window, cx);
@@ -1743,6 +1747,7 @@ impl DotDir {
         let entry = directory.focused().cloned();
         if !marking {
             self.update_column_preview(pane);
+            self.reveal_column(pane, true);
         }
         self.focus_pane(pane, window, cx);
         if event.click_count == 2
@@ -1868,6 +1873,7 @@ impl DotDir {
                         layout.move_cursor(d, id);
                     }
                     self.update_column_preview(self.active);
+                    self.reveal_column(self.active, true);
                 }
             }
             "first" | "last" => {
@@ -1880,6 +1886,7 @@ impl DotDir {
                     d.ensure_visible(rows, columns);
                 }
                 self.update_column_preview(self.active);
+                self.reveal_column(self.active, true);
             }
             "switch" => {
                 let pane = 1 - self.active;

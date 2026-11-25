@@ -277,8 +277,17 @@ impl DotDir {
             .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
                 let delta = event.delta.pixel_delta(px(layout.cell_height));
                 let (x, y): (f32, f32) = (delta.x.into(), delta.y.into());
-                if event.modifiers.shift || x.abs() > y.abs() {
+                if event.modifiers.shift || x.abs() > y.abs() || y == 0. {
                     return;
+                }
+                if layout.presentation == Presentation::Columns
+                    && let Some(browser) = this.browser(pane)
+                {
+                    let browser_id = browser.id;
+                    this.panel_scrolls
+                        .entry(browser_id)
+                        .or_default()
+                        .hold_position();
                 }
                 let changed = this
                     .directory_by_id(id)
@@ -397,7 +406,6 @@ impl DotDir {
                         })),
                 );
             }
-            let wheel_scroll = scroll.clone();
             let mut columns = div()
                 .id(("finder-columns", browser.id))
                 .flex()
@@ -405,16 +413,18 @@ impl DotDir {
                 .min_h_0()
                 .min_w_0()
                 .w_full()
-                .overflow_x_scroll()
-                .restrict_scroll_to_axis()
+                // The scroll handler below owns the horizontal input.
+                .overflow_hidden()
                 .track_scroll(&scroll)
                 .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
                     let delta = event.delta.pixel_delta(px(26.));
                     let (x, y): (f32, f32) = (delta.x.into(), delta.y.into());
-                    let amount = if event.modifiers.shift && x == 0. {
-                        y
-                    } else {
+                    let amount = if event.modifiers.shift {
+                        if x == 0. { y } else { x }
+                    } else if x.abs() > y.abs() {
                         x
+                    } else {
+                        return;
                     };
                     if amount == 0. {
                         return;
@@ -422,11 +432,7 @@ impl DotDir {
                     let Some(motion) = this.panel_scrolls.get_mut(&browser_id) else {
                         return;
                     };
-                    motion.cancel();
-                    let mut offset = wheel_scroll.offset();
-                    offset.x =
-                        (offset.x + px(amount)).clamp(px(-motion.max_offset(column_count)), px(0.));
-                    wheel_scroll.set_offset(offset);
+                    motion.scroll_by(amount, column_count);
                     cx.stop_propagation();
                     window.refresh();
                     cx.notify();

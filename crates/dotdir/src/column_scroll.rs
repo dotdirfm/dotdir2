@@ -17,16 +17,25 @@ pub(crate) struct ColumnScroll {
     pub handle: ScrollHandle,
     reveal: Option<usize>,
     transition: Option<Transition>,
+    hold_position: bool,
 }
 
 impl ColumnScroll {
     pub fn reveal(&mut self, index: usize) {
+        self.hold_position = false;
         self.reveal = Some(index);
     }
 
     pub fn cancel(&mut self) {
         self.reveal = None;
         self.transition = None;
+        self.hold_position = false;
+    }
+
+    /// Vertical input changes the directory preview without moving the strip.
+    pub fn hold_position(&mut self) {
+        self.cancel();
+        self.hold_position = true;
     }
 
     pub fn finish(&mut self) {
@@ -58,14 +67,13 @@ impl ColumnScroll {
         (columns as f32 * COLUMN_WIDTH - width).max(0.)
     }
 
-    pub fn max_offset(&self, columns: usize) -> f32 {
+    fn max_offset(&self, columns: usize) -> f32 {
         Self::max_for_width(columns, self.handle.bounds().size.width.into())
     }
 
-    /// Let GPUI lay out the current offset even when the real strip has just
-    /// shrunk. The spacer recedes with the viewport and has no scroll target.
+    /// Keep enough blank space for GPUI to lay out the current scroll offset.
     pub fn trailing_space(&self, columns: usize) -> f32 {
-        if self.transition.is_none() {
+        if !self.hold_position && self.transition.is_none() {
             return 0.;
         }
         let width: f32 = self.handle.bounds().size.width.into();
@@ -76,11 +84,24 @@ impl ColumnScroll {
         (width - current - columns as f32 * COLUMN_WIDTH).ceil()
     }
 
+    pub fn scroll_by(&mut self, amount: f32, columns: usize) {
+        let mut offset = self.handle.offset();
+        let min = px(-self.max_offset(columns));
+        // Let manual input move gradually out of the blank area.
+        offset.x = (offset.x + px(amount)).clamp(min.min(offset.x), px(0.));
+        if offset.x < min {
+            self.hold_position();
+        } else {
+            self.cancel();
+        }
+        self.handle.set_offset(offset);
+    }
+
     pub fn step(&mut self, direction: i32, columns: usize) {
         let current: f32 = self.handle.offset().x.into();
         let target = self.transition.as_ref().map_or(current, |t| t.to);
         let max = self.max_offset(columns);
-        self.reveal = None;
+        self.cancel();
         self.animate_to(
             (target - direction as f32 * COLUMN_WIDTH).clamp(-max, 0.),
             Instant::now(),
@@ -94,6 +115,9 @@ impl ColumnScroll {
     }
 
     fn advance_with_width(&mut self, columns: usize, width: f32, now: Instant) -> bool {
+        if self.hold_position {
+            return false;
+        }
         if width <= 0. {
             return self.reveal.is_some();
         }
@@ -206,6 +230,24 @@ mod tests {
         assert!(scroll.advance_with_width(3, 480., now + DURATION / 2));
         assert_eq!(x(&scroll), -330.);
         assert!(!scroll.advance_with_width(3, 480., now + DURATION));
+        assert_eq!(x(&scroll), -240.);
+    }
+
+    #[test]
+    fn vertical_scroll_holds_offset_across_preview_changes_until_an_explicit_reveal() {
+        let mut scroll = ColumnScroll::default();
+        let now = Instant::now();
+        scroll.handle.set_offset(point(px(-960.), px(0.)));
+        scroll.reveal(6);
+        assert!(scroll.advance_with_width(8, 480., now));
+        scroll.hold_position();
+        for columns in [3, 4, 8, 3] {
+            assert!(!scroll.advance_with_width(columns, 480., now + DURATION));
+            assert_eq!(x(&scroll), -960.);
+        }
+        scroll.reveal(2);
+        assert!(scroll.advance_with_width(3, 480., now + DURATION));
+        assert!(!scroll.advance_with_width(3, 480., now + DURATION * 2));
         assert_eq!(x(&scroll), -240.);
     }
 
