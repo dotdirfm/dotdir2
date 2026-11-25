@@ -10,7 +10,20 @@ serde.workspace = true
 serde_json.workspace = true
 dotdir-core = { path = "../dotdir-core" }
 dotdir-extension-host = { path = "../dotdir-extension-host" }
-gpui-kit = { version = "=0.11.0", features = ["tree-sitter-rust", "tree-sitter", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-toml", "tree-sitter-css", "tree-sitter-bash", "tree-sitter-markdown"] }
+gpui-kit = { version = "=0.11.0", features = [
+    "tree-sitter",
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-css",
+    "tree-sitter-go",
+    "tree-sitter-javascript",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-toml",
+    "tree-sitter-typescript",
+] }
+ts-parser-perl = "2.1.2"
 dirs = "6"
 chrono = "0.4"
 trash = "5"

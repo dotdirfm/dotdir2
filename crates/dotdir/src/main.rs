@@ -7,6 +7,7 @@ mod media_native;
 mod model;
 mod operations;
 mod panels;
+mod syntax;
 mod terminal;
 mod theme;
 mod ui;
@@ -25,6 +26,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            syntax::register_perl();
             commands::bind(cx, &config.join("keybindings.json"));
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
             gpui_kit::open_window(

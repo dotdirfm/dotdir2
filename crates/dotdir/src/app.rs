@@ -5,6 +5,7 @@ use crate::{
     media::{MediaEvent, MediaFilter, MediaViewer},
     model::*,
     operations::*,
+    syntax::language_for,
     terminal::Terminal,
     theme::Palette,
 };
@@ -924,19 +925,6 @@ impl DotDir {
             cx.notify();
             window.refresh();
         }
-    }
-}
-fn language_for(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "rs" => "rust",
-        "js" | "jsx" | "mjs" => "javascript",
-        "ts" | "tsx" => "typescript",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "css" => "css",
-        "md" => "markdown",
-        "sh" | "zsh" | "bash" => "bash",
-        _ => "plain_text",
     }
 }
 pub(crate) struct Document {
