@@ -39,7 +39,14 @@ impl ColumnScroll {
 
     fn animate_to(&mut self, target: f32, now: Instant) {
         let from: f32 = self.handle.offset().x.into();
-        self.transition = ((target - from).abs() > 0.5).then_some(Transition {
+        if (target - from).abs() <= 0.5 {
+            self.transition = None;
+            let mut offset = self.handle.offset();
+            offset.x = px(target);
+            self.handle.set_offset(offset);
+            return;
+        }
+        self.transition = Some(Transition {
             from,
             to: target,
             started: now,
@@ -47,10 +54,32 @@ impl ColumnScroll {
         });
     }
 
-    pub fn step(&mut self, direction: i32) {
+    fn max_for_width(columns: usize, width: f32) -> f32 {
+        (columns as f32 * COLUMN_WIDTH - width).max(0.)
+    }
+
+    pub fn max_offset(&self, columns: usize) -> f32 {
+        Self::max_for_width(columns, self.handle.bounds().size.width.into())
+    }
+
+    /// Let GPUI lay out the current offset even when the real strip has just
+    /// shrunk. The spacer recedes with the viewport and has no scroll target.
+    pub fn trailing_space(&self, columns: usize) -> f32 {
+        if self.transition.is_none() {
+            return 0.;
+        }
+        let width: f32 = self.handle.bounds().size.width.into();
+        let current: f32 = self.handle.offset().x.into();
+        if current >= -Self::max_for_width(columns, width) {
+            return 0.;
+        }
+        (width - current - columns as f32 * COLUMN_WIDTH).ceil()
+    }
+
+    pub fn step(&mut self, direction: i32, columns: usize) {
         let current: f32 = self.handle.offset().x.into();
         let target = self.transition.as_ref().map_or(current, |t| t.to);
-        let max: f32 = self.handle.max_offset().x.into();
+        let max = self.max_offset(columns);
         self.reveal = None;
         self.animate_to(
             (target - direction as f32 * COLUMN_WIDTH).clamp(-max, 0.),
@@ -58,8 +87,7 @@ impl ColumnScroll {
         );
     }
 
-    /// Called from render, once layout has supplied the viewport width. New
-    /// columns can be targeted before their first layout without jumping.
+    /// Called from render, once layout has supplied the viewport width.
     pub fn advance(&mut self, columns: usize, now: Instant) -> bool {
         let width: f32 = self.handle.bounds().size.width.into();
         self.advance_with_width(columns, width, now)
@@ -69,7 +97,7 @@ impl ColumnScroll {
         if width <= 0. {
             return self.reveal.is_some();
         }
-        let max = (columns as f32 * COLUMN_WIDTH - width).max(0.);
+        let max = Self::max_for_width(columns, width);
         let current: f32 = self.handle.offset().x.into();
         // Scrollbar dragging/native scrolling must not fight an animation.
         if self
@@ -79,22 +107,26 @@ impl ColumnScroll {
         {
             self.transition = None;
         }
-        if let Some(index) = self.reveal.take() {
-            let base = self.transition.as_ref().map_or(current, |t| t.to);
+        let base = self.transition.as_ref().map_or(current, |t| t.to);
+        let target = if let Some(index) = self.reveal.take() {
+            let index = index.min(columns.saturating_sub(1));
             let left = index as f32 * COLUMN_WIDTH;
             let right = left + COLUMN_WIDTH.min(width);
-            let target = if left + base < 0. {
+            if left + base < 0. {
                 -left
             } else if right + base > width {
                 width - right
             } else {
                 base
             }
-            .clamp(-max, 0.);
-            // Repeated requests for the same column don't restart easing.
-            if self.transition.as_ref().is_none_or(|t| t.to != target) {
-                self.animate_to(target, now);
-            }
+        } else {
+            base
+        }
+        .clamp(-max, 0.);
+        // A directory refresh can shorten the strip without a reveal request.
+        // Keep easing toward an unchanged target when input repeats.
+        if target != base {
+            self.animate_to(target, now);
         }
         let Some(transition) = self.transition.as_mut() else {
             return false;
@@ -102,12 +134,12 @@ impl ColumnScroll {
         let progress =
             (now.duration_since(transition.started).as_secs_f32() / DURATION.as_secs_f32()).min(1.);
         let eased = 1. - (1. - progress).powi(3);
-        let x = (transition.from + (transition.to - transition.from) * eased).clamp(-max, 0.);
+        let x = transition.from + (transition.to - transition.from) * eased;
         let mut offset = self.handle.offset();
         offset.x = px(x);
         self.handle.set_offset(offset);
         transition.applied = x;
-        if progress >= 1. || transition.to < -max {
+        if progress >= 1. {
             self.transition = None;
         }
         self.transition.is_some()
@@ -160,6 +192,33 @@ mod tests {
         assert_eq!(x(&scroll), before);
         scroll.advance_with_width(4, 480., halfway + DURATION);
         assert_eq!(x(&scroll), 0.);
+    }
+
+    #[test]
+    fn a_shorter_branch_eases_back_from_the_existing_offset() {
+        let mut scroll = ColumnScroll::default();
+        let now = Instant::now();
+        scroll.handle.set_offset(point(px(-960.), px(0.)));
+        // Replacing the last five columns with a leaf leaves three columns.
+        scroll.reveal(2);
+        assert!(scroll.advance_with_width(3, 480., now));
+        assert_eq!(x(&scroll), -960.);
+        assert!(scroll.advance_with_width(3, 480., now + DURATION / 2));
+        assert_eq!(x(&scroll), -330.);
+        assert!(!scroll.advance_with_width(3, 480., now + DURATION));
+        assert_eq!(x(&scroll), -240.);
+    }
+
+    #[test]
+    fn a_refresh_can_shorten_the_trail_without_a_reveal_request() {
+        let mut scroll = ColumnScroll::default();
+        let now = Instant::now();
+        scroll.handle.set_offset(point(px(-480.), px(0.)));
+        assert!(scroll.advance_with_width(1, 480., now));
+        assert_eq!(x(&scroll), -480.);
+        scroll.finish(); // Reduce Motion settles in the first frame.
+        assert_eq!(x(&scroll), 0.);
+        assert!(!scroll.advance_with_width(1, 480., now));
     }
 
     #[test]

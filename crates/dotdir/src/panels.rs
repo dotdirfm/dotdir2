@@ -362,13 +362,15 @@ impl DotDir {
             .child(self.panel_view_selector(pane, cx));
         let contents = if layout.presentation == Presentation::Columns {
             let motion = self.panel_scrolls.entry(browser.id).or_default();
-            let animating = motion.advance(browser.columns.len(), std::time::Instant::now());
+            let column_count = browser.columns.len();
+            let animating = motion.advance(column_count, std::time::Instant::now());
             if cx.reduce_motion() {
                 motion.finish();
             }
-            if animating {
+            if animating && !cx.reduce_motion() {
                 window.request_animation_frame();
             }
+            let trailing_space = motion.trailing_space(column_count);
             let scroll = motion.handle.clone();
             let browser_id = browser.id;
             toolbar = toolbar.child(div().flex_1());
@@ -388,7 +390,7 @@ impl DotDir {
                         .child(label)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(motion) = this.panel_scrolls.get_mut(&browser_id) {
-                                motion.step(direction);
+                                motion.step(direction, column_count);
                             }
                             window.refresh();
                             cx.notify();
@@ -417,11 +419,13 @@ impl DotDir {
                     if amount == 0. {
                         return;
                     }
-                    if let Some(motion) = this.panel_scrolls.get_mut(&browser_id) {
-                        motion.cancel();
-                    }
+                    let Some(motion) = this.panel_scrolls.get_mut(&browser_id) else {
+                        return;
+                    };
+                    motion.cancel();
                     let mut offset = wheel_scroll.offset();
-                    offset.x = (offset.x + px(amount)).clamp(-wheel_scroll.max_offset().x, px(0.));
+                    offset.x =
+                        (offset.x + px(amount)).clamp(px(-motion.max_offset(column_count)), px(0.));
                     wheel_scroll.set_offset(offset);
                     cx.stop_propagation();
                     window.refresh();
@@ -477,6 +481,9 @@ impl DotDir {
                             cx,
                         )),
                 );
+            }
+            if trailing_space > 0. {
+                columns = columns.child(div().w(px(trailing_space)).flex_shrink_0());
             }
             // Keep the overlay outside the scrolling strip: an absolute child
             // of that strip inherits its content extent and scroll offset.
