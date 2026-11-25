@@ -1,14 +1,20 @@
+use crate::archive::Archive;
 use dotdir_core::{
     copy::{self, CancelToken, ConflictResolution, CopyEvent, CopyOptions},
     move_op::{self, MoveOptions},
 };
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum OperationKind {
     Copy,
     Move,
     Trash,
+    Extract,
 }
 impl OperationKind {
     pub fn title(self) -> &'static str {
@@ -16,6 +22,7 @@ impl OperationKind {
             Self::Copy => "Copy",
             Self::Move => "Move",
             Self::Trash => "Move to Trash",
+            Self::Extract => "Extract ZIP",
         }
     }
 }
@@ -44,6 +51,82 @@ impl Operation {
         destination: PathBuf,
         options: CopyOptions,
     ) -> Self {
+        Self::spawn(id, kind, move |cancel, emit, conflict| {
+            for p in &sources {
+                if p.parent().is_none() || p.file_name().is_none() {
+                    anyhow::bail!("Filesystem roots cannot be transferred or removed");
+                }
+            }
+            if sources.is_empty() {
+                return Ok(());
+            }
+            match kind {
+                OperationKind::Copy => {
+                    copy::copy_tree(&sources, &destination, &options, cancel, emit, conflict)?;
+                }
+                OperationKind::Move => {
+                    move_op::move_tree(
+                        &sources,
+                        &destination,
+                        &MoveOptions {
+                            conflict_policy: options.conflict_policy,
+                        },
+                        cancel,
+                        emit,
+                        conflict,
+                    )?;
+                }
+                OperationKind::Extract => anyhow::bail!("ZIP extraction needs an archive source"),
+                OperationKind::Trash => {
+                    for (i, path) in sources.iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        trash::delete(path)?;
+                        emit(CopyEvent::Progress(copy::CopyProgress {
+                            bytes_copied: i as u64 + 1,
+                            bytes_total: sources.len() as u64,
+                            files_done: i as u32 + 1,
+                            files_total: sources.len() as u32,
+                            current_file: path.to_string_lossy().into_owned(),
+                        }));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn extract(
+        id: u64,
+        archive: Arc<Archive>,
+        members: Vec<PathBuf>,
+        destination: PathBuf,
+        options: CopyOptions,
+    ) -> Self {
+        Self::spawn(id, OperationKind::Extract, move |cancel, emit, conflict| {
+            archive.extract(
+                members,
+                &destination,
+                options.conflict_policy,
+                cancel,
+                emit,
+                conflict,
+            )
+        })
+    }
+
+    fn spawn(
+        id: u64,
+        kind: OperationKind,
+        work: impl FnOnce(
+            &CancelToken,
+            &dyn Fn(CopyEvent),
+            &dyn Fn(&Path, &Path) -> ConflictResolution,
+        ) -> anyhow::Result<()>
+        + Send
+        + 'static,
+    ) -> Self {
         let (tx, events) = mpsc::channel();
         let token = CancelToken::new();
         let cancel = token.clone();
@@ -71,56 +154,7 @@ impl Operation {
                     }
                 }
             };
-            let result = (|| -> anyhow::Result<()> {
-                for p in &sources {
-                    if p.parent().is_none() || p.file_name().is_none() {
-                        anyhow::bail!("Filesystem roots cannot be transferred or removed");
-                    }
-                }
-                if sources.is_empty() {
-                    return Ok(());
-                }
-                match kind {
-                    OperationKind::Copy => {
-                        copy::copy_tree(
-                            &sources,
-                            &destination,
-                            &options,
-                            &cancel,
-                            &emit,
-                            &conflict,
-                        )?;
-                    }
-                    OperationKind::Move => {
-                        move_op::move_tree(
-                            &sources,
-                            &destination,
-                            &MoveOptions {
-                                conflict_policy: options.conflict_policy,
-                            },
-                            &cancel,
-                            &emit,
-                            &conflict,
-                        )?;
-                    }
-                    OperationKind::Trash => {
-                        for (i, path) in sources.iter().enumerate() {
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            trash::delete(path)?;
-                            emit(CopyEvent::Progress(copy::CopyProgress {
-                                bytes_copied: i as u64 + 1,
-                                bytes_total: sources.len() as u64,
-                                files_done: i as u32 + 1,
-                                files_total: sources.len() as u32,
-                                current_file: path.to_string_lossy().into_owned(),
-                            }));
-                        }
-                    }
-                }
-                Ok(())
-            })();
+            let result = work(&cancel, &emit, &conflict);
             let _ = tx.send(OperationEvent::Settled(result.map_err(|e| e.to_string())));
         });
         Self {

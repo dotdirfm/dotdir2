@@ -3,7 +3,7 @@ use crate::{app::*, column_scroll::COLUMN_WIDTH, model::*, ui::text};
 use gpui_kit::{component::scroll::ScrollableElement, prelude::FluentBuilder, *};
 
 fn modified(entry: &Entry) -> String {
-    if entry.parent {
+    if entry.parent || (entry.path.local().is_none() && entry.modified == 0.) {
         return String::new();
     }
     chrono::DateTime::from_timestamp_millis(entry.modified as i64)
@@ -361,15 +361,12 @@ impl DotDir {
             .border_color(p.border)
             .text_size(px(12.))
             .overflow_hidden();
-        for (index, path) in d
-            .path
-            .ancestors()
+        for (index, path) in std::iter::successors(Some(d.path.clone()), |path| path.parent())
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .enumerate()
         {
-            let path = path.to_path_buf();
             let label = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())

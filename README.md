@@ -86,6 +86,10 @@ Tab moves into the preview, and Tab from a preview returns to its source tab.
 existing firm tabs remain open. Tab in a firm editor keeps its normal editing
 behavior.
 
+Drag tab headers to reorder them or move them to the other pane. Hold
+**Option** while dropping into the other pane to duplicate a tab. Two tabs for
+the same file share its edits.
+
 ## File pane presentations
 
 Each pane has its own **Brief / Large icons / Details / Columns** selector below
@@ -114,7 +118,32 @@ Vertical wheel input moves the cursor and viewport together, keeping the cursor
 visible. In Large icons it advances grid rows. Small trackpad deltas accumulate,
 and file-list bounds limit movement without changing marked entries.
 
+## ZIP archives
+
+Select a ZIP and press **Enter** or **F3** to browse it in the current pane.
+Use **F3** to preview text, images, or hex data and **⌘F3** to preview in the
+opposite pane. Previews are limited to 16 MiB per entry. Select files or
+folders and press **F5** to extract them. The destination defaults to the
+opposite local pane. Extraction uses the regular progress and conflict dialogs.
+ZIP panes are read-only and support stored and DEFLATE entries.
+
 ## Extensions
+
+**TypeScript 7** is detected from an unpacked `TypeScriptTeam.native-preview`
+extension in the DotDir configuration directory's `extensions` folder. Opening
+a JavaScript or TypeScript file in **Edit** starts the bundled compiler in LSP
+mode. Edit supports diagnostics for unsaved changes, hovers, completions
+(**Ctrl+Space**), and Go to Definition (**⌘⌥↓**, **⌘-click**, or **F1**).
+DotDir prefers the native architecture and can use the Intel package through
+Rosetta on Apple Silicon.
+
+**rust-analyzer** starts when you open a Rust file in Edit. DotDir looks for
+the native server at `server/rust-analyzer` inside an unpacked
+`rust-lang.rust-analyzer` extension. For a VSIX that ships without a server,
+add the matching native binary from the
+[rust-analyzer releases](https://github.com/rust-lang/rust-analyzer/releases).
+Rust projects use the same diagnostics, hover, completion, and definition
+features as TypeScript.
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the
@@ -155,6 +184,6 @@ cargo fmt --all -- --check
 This initial native version includes filesystem operations, text editing and
 text/hex/image viewing, search, terminals, persisted directory tabs, themes and
 local script extensions. Remaining specialized viewers, marketplace/accounts,
-full FSS styling, external LSP processes and WASM loaders are tracked explicitly
+full FSS styling and WASM loaders are tracked explicitly
 in [architecture](docs/architecture.md). Source provenance and visual references
 are recorded in [source reference](docs/source-reference.md).

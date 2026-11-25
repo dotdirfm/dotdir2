@@ -39,6 +39,20 @@ the file panes and application chrome are custom GPUI elements.
   saved snapshot on completion, so edits made during a save remain dirty. Closing
   or quitting checks dirty buffers. An external change detected before a save is
   rejected. The check and write are not an atomic filesystem compare-and-swap.
+- ZIP directory tabs use typed locations carrying an archive and a member path.
+  The app shares pane navigation and selection with local directories, and
+  preview reads work directly on archive entries. An indexed ZIP directory
+  reloads when the archive's metadata changes. Extraction streams entries into
+  temporary destination files and publishes them on success. It uses the copy
+  worker's cancellation, progress, and conflict dialog. Local write commands
+  are disabled for archive selections.
+- TypeScript 7 and rust-analyzer run as background language servers per project
+  root. The
+  editor sends versioned incremental edits over stdio and converts between
+  the server's UTF-16 positions and the editor's Unicode-scalar positions.
+  TypeScript pull diagnostics are debounced and both servers' results are
+  tied to buffer revisions. Server lifetimes follow open editor buffers.
+  DotDir discovers the native executables from the installed extensions.
 - Each tab has its own stable identity, preview flag and optional source-tab ID,
   separate from its replaceable viewer content. Opposite-pane previews follow
   the source directory's focused file without changing keyboard focus. Preview
@@ -110,11 +124,12 @@ This port covers the native file-manager shell, core file operations, text/hex/i
 viewing, text editing, recursive name/content search, real terminal sessions,
 settings/session persistence and local JavaScript commands/panels. The original
 website/demo, account/marketplace integration, full FSS styling language, external
-LSP process integration, WASM filesystem-provider loading and specialized PDF,
-SQLite and archive surfaces are separate remaining porting work. Image/video
-viewing now has a native renderer; video and AVIF currently use macOS APIs. The
-component editor has syntax highlighting and editor search; no LSP connection is
-claimed merely because its upstream component supports LSP providers.
+WASM filesystem-provider loading and specialized PDF and SQLite surfaces are
+separate remaining porting work. Image/video viewing has a native renderer.
+Video and AVIF currently use macOS APIs. ZIP entry previews cover text, images,
+and hex. Language-server integration covers document sync, diagnostics, completion,
+hover, and definition. Project-wide watch registration and the VS Code
+JavaScript extension host are separate work.
 
 Native text/hex opening is currently capped at 16 MiB. Search retains the first
 10,000 matching paths. User keybinding changes apply on restart. Platform-specific

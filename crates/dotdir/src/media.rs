@@ -42,8 +42,14 @@ impl MediaFilter {
     ) -> anyhow::Result<Vec<PathBuf>> {
         Ok(read_directory(parent, hidden, sort)?
             .into_iter()
-            .filter(|e| !e.directory && self.matches(&e.path))
-            .map(|e| e.path)
+            .filter(|entry| !entry.directory)
+            .filter_map(|entry| {
+                entry
+                    .path
+                    .local()
+                    .filter(|path| self.matches(path))
+                    .map(PathBuf::from)
+            })
             .collect())
     }
 }

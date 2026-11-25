@@ -1,8 +1,10 @@
 use crate::{
     app::*,
+    archive::Location,
     commands::{COMMANDS, function_key_command},
     model::*,
     terminal,
+    theme::Palette,
 };
 use dotdir_core::copy::{ConflictPolicy, ConflictResolution};
 use dotdir_extension_host::PanelNode;
@@ -15,9 +17,71 @@ use gpui_kit::{
     *,
 };
 use serde_json::json;
+use std::ffi::OsStr;
 
-fn icon(name: IconName, color: Hsla) -> impl IntoElement {
+struct TabDrag {
+    id: u64,
+}
+
+struct TabDragPreview {
+    label: String,
+    icon: TabIcon,
+    palette: Palette,
+}
+
+#[derive(Clone)]
+enum TabIcon {
+    Themed(ImageSource),
+    File { directory: bool },
+    Glyph(IconName),
+}
+
+impl TabIcon {
+    fn render(self, palette: Palette) -> AnyElement {
+        match self {
+            Self::Themed(source) => icon_image(source, 16.),
+            Self::File { directory } => {
+                let color = if directory {
+                    palette.folder
+                } else {
+                    palette.muted
+                };
+                file_icon(directory, color)
+            }
+            Self::Glyph(name) => icon(name, palette.muted).flex_shrink_0().into_any_element(),
+        }
+    }
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(28.))
+            .max_w(px(200.))
+            .px(px(8.))
+            .border_1()
+            .border_color(p.accent)
+            .bg(p.bg)
+            .text_color(p.fg)
+            .text_size(px(12.))
+            .child(self.icon.clone().render(p))
+            .child(text(self.label.clone()))
+    }
+}
+
+fn icon(name: IconName, color: Hsla) -> Icon {
     Icon::new(name).size(px(16.)).text_color(color)
+}
+fn icon_image(source: ImageSource, size: f32) -> AnyElement {
+    img(source)
+        .size(px(size))
+        .flex_shrink_0()
+        .object_fit(ObjectFit::Contain)
+        .into_any_element()
 }
 fn file_icon(directory: bool, color: Hsla) -> AnyElement {
     if directory {
@@ -47,7 +111,9 @@ fn file_icon(directory: bool, color: Hsla) -> AnyElement {
             )
             .into_any_element()
     } else {
-        icon(IconName::File, color).into_any_element()
+        icon(IconName::File, color)
+            .flex_shrink_0()
+            .into_any_element()
     }
 }
 pub(crate) fn text(value: impl Into<SharedString>) -> Div {
@@ -91,25 +157,35 @@ impl DotDir {
     pub(crate) fn entry_icon(&self, entry: &Entry) -> AnyElement {
         self.entry_icon_sized(entry, 16.)
     }
-    pub(crate) fn entry_icon_sized(&self, entry: &Entry, size: f32) -> AnyElement {
-        if !entry.parent
-            && let Some(path) = self.icon_theme.as_ref().and_then(|theme| {
-                theme.icon(&entry.name, entry.directory, self.settings.theme == "light")
-            })
-        {
-            let source = if path
+    fn themed_file_icon(&self, name: &str, directory: bool, size: f32) -> Option<ImageSource> {
+        let path =
+            self.icon_theme
+                .as_ref()?
+                .icon(name, directory, self.settings.theme == "light")?;
+        Some(
+            if path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             {
                 crate::icon_theme::sized_icon(path, size)
             } else {
                 ImageSource::from(path.to_path_buf())
-            };
-            return img(source)
-                .size(px(size))
-                .flex_shrink_0()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element();
+            },
+        )
+    }
+    fn file_tab_label(&self, name: &OsStr, directory: bool) -> (String, TabIcon) {
+        let label = name.to_string_lossy().into_owned();
+        let icon = self
+            .themed_file_icon(&label, directory, 16.)
+            .map(TabIcon::Themed)
+            .unwrap_or(TabIcon::File { directory });
+        (label, icon)
+    }
+    pub(crate) fn entry_icon_sized(&self, entry: &Entry, size: f32) -> AnyElement {
+        if !entry.parent
+            && let Some(source) = self.themed_file_icon(&entry.name, entry.directory, size)
+        {
+            return icon_image(source, size);
         }
         if size > 16. {
             if entry.directory {
@@ -202,39 +278,40 @@ impl DotDir {
             let id = tab.id();
             let preview = tab.preview;
             let selected = self.panes[pane].active == index;
-            let label = match &tab.content {
-                TabContent::Directory(d) => d
-                    .current()
-                    .path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".into()),
-                TabContent::Document(id) => self
-                    .documents
-                    .get(id)
-                    .map(|d| {
-                        format!(
-                            "{}{}",
-                            if d.dirty(cx) { "● " } else { "" },
-                            d.path.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                    })
-                    .unwrap_or_default(),
-                TabContent::Image { path, .. } | TabContent::Media { path, .. } => path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                TabContent::Panel { title, .. } => title.clone(),
+            let (label, tab_icon) = match &tab.content {
+                TabContent::Directory(browser) => {
+                    let path = &browser.current().path;
+                    let archive_root = matches!(path, Location::Zip { member, .. } if member.as_os_str().is_empty());
+                    self.file_tab_label(path.file_name().unwrap_or(OsStr::new("/")), !archive_root)
+                }
+                TabContent::Document(id) => {
+                    let doc = &self.documents[id];
+                    let (mut label, icon) =
+                        self.file_tab_label(doc.path.file_name().unwrap_or_default(), false);
+                    if doc.dirty(cx) {
+                        label.insert_str(0, "● ");
+                    }
+                    (label, icon)
+                }
+                TabContent::Image { path, .. } => {
+                    self.file_tab_label(path.file_name().unwrap_or_default(), false)
+                }
+                TabContent::Media { path, .. } => {
+                    self.file_tab_label(path.file_name().unwrap_or_default(), false)
+                }
+                TabContent::Panel { title, .. } => {
+                    (title.clone(), TabIcon::Glyph(IconName::LayoutDashboard))
+                }
                 TabContent::Pending { path, .. } => path
                     .as_ref()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Preview".into()),
+                    .and_then(Location::file_name)
+                    .map(|name| self.file_tab_label(name, false))
+                    .unwrap_or_else(|| ("Preview".into(), TabIcon::Glyph(IconName::Eye))),
             };
             tabs = tabs.child(
                 div()
-                    .id(("tab", (pane * 10000 + index)))
+                    .id(("tab", id as usize))
+                    .relative()
                     .role(Role::Tab)
                     .aria_label(label.clone())
                     .aria_selected(selected)
@@ -247,7 +324,7 @@ impl DotDir {
                     .items_center()
                     .gap(px(6.))
                     .h_full()
-                    .min_w(px(48.))
+                    .min_w(px(64.))
                     .max_w(px(200.))
                     .px(px(8.))
                     .border_r_1()
@@ -259,20 +336,37 @@ impl DotDir {
                     .text_color(if selected { p.fg } else { p.muted })
                     .text_size(px(12.))
                     .cursor_pointer()
+                    .on_drag(TabDrag { id }, {
+                        let label = label.clone();
+                        let icon = tab_icon.clone();
+                        move |_, _, _, cx| {
+                            cx.new(|_| TabDragPreview {
+                                label: label.clone(),
+                                icon: icon.clone(),
+                                palette: p,
+                            })
+                        }
+                    })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.set_tab(pane, index, window, cx);
                         if preview && event.click_count() == 2 {
                             this.run("keep-preview", window, cx);
                         }
                     }))
-                    .child(text(label).when(tab.preview, |text| text.italic()))
+                    .child(tab_icon.render(p))
+                    .child(
+                        text(label)
+                            .min_w_0()
+                            .when(tab.preview, |text| text.italic()),
+                    )
                     .child(
                         div()
-                            .id(("close-tab", pane * 10000 + index))
+                            .id(("close-tab", id as usize))
                             .flex()
                             .items_center()
                             .justify_center()
                             .size(px(16.))
+                            .flex_shrink_0()
                             .rounded(px(2.))
                             .hover(move |s| s.bg(p.selected))
                             .child(icon(IconName::Close, p.muted))
@@ -280,26 +374,68 @@ impl DotDir {
                                 cx.stop_propagation();
                                 this.request_close_tab(pane, id, window, cx);
                             })),
-                    ),
+                    )
+                    .children([false, true].map(|after| {
+                        div()
+                            .id(("tab-drop", usize::from(after)))
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .w(relative(0.5))
+                            .when(after, |s| s.right_0())
+                            .when(!after, |s| s.left_0())
+                            .drag_over::<TabDrag>(move |s, _, _, _| {
+                                let s = s.border_color(p.accent);
+                                if after {
+                                    s.border_r_2()
+                                } else {
+                                    s.border_l_2()
+                                }
+                            })
+                            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+                                this.drop_tab(
+                                    drag.id,
+                                    pane,
+                                    index + usize::from(after),
+                                    window.modifiers().alt,
+                                    window,
+                                    cx,
+                                );
+                            }))
+                    })),
             )
         }
-        tabs = tabs.child(div().flex_1()).child(
-            div()
-                .id(("pane-menu", pane))
-                .w(px(28.))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(p.accent)
-                .text_color(p.accent_fg)
-                .cursor_pointer()
-                .child(icon(IconName::EllipsisVertical, p.accent_fg))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.active = pane;
-                    this.show_modal(Modal::Palette, window, cx);
-                })),
-        );
+        let end = self.panes[pane].tabs.len();
+        tabs = tabs
+            .child(
+                div()
+                    .id(("tab-drop-end", pane))
+                    .flex_1()
+                    .h_full()
+                    .drag_over::<TabDrag>(move |s, _, _, _| {
+                        s.border_l_2().border_color(p.accent).bg(p.selected)
+                    })
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+                        this.drop_tab(drag.id, pane, end, window.modifiers().alt, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id(("pane-menu", pane))
+                    .w(px(28.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(p.accent)
+                    .text_color(p.accent_fg)
+                    .cursor_pointer()
+                    .child(icon(IconName::EllipsisVertical, p.accent_fg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.active = pane;
+                        this.show_modal(Modal::Palette, window, cx);
+                    })),
+            );
         let content = match &self.panes[pane].tabs[self.panes[pane].active].content {
             TabContent::Directory(_) => self.render_directory(pane, window, cx),
             TabContent::Pending { path, error, .. } => div()
@@ -318,14 +454,14 @@ impl DotDir {
                 }))
                 .into_any_element(),
             TabContent::Document(id) => {
-                let doc = &self.documents[id];
+                let id = *id;
+                let (state, readonly) = self.editor_for_pane(pane, id, window, cx);
+                let doc = &self.documents[&id];
                 let path = doc.path.display().to_string();
-                let state = doc.input.clone();
-                let readonly = doc.readonly;
                 let status = doc.error.clone().unwrap_or_else(|| {
                     if doc.saving {
                         "Saving…".into()
-                    } else if readonly {
+                    } else if doc.readonly {
                         "Read only".into()
                     } else if doc.dirty(cx) {
                         "Modified · F2 / ⌘S to save".into()
@@ -333,6 +469,11 @@ impl DotDir {
                         "Saved".into()
                     }
                 });
+                let status = if let Some(language) = &doc.lsp_status {
+                    format!("{status} · {language}")
+                } else {
+                    status
+                };
                 div()
                     .flex()
                     .flex_col()
@@ -383,7 +524,7 @@ impl DotDir {
                     .into_any_element()
             }
             TabContent::Media { view, .. } => view.clone().into_any_element(),
-            TabContent::Image { path, .. } => div()
+            TabContent::Image { path, image, .. } => div()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -399,11 +540,15 @@ impl DotDir {
                         .child(text(path.display().to_string())),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Contain)),
+                    div().flex_1().min_h_0().overflow_hidden().child(
+                        if let Some(image) = image {
+                            img(image.clone())
+                        } else {
+                            img(path.host_path().to_path_buf())
+                        }
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                    ),
                 )
                 .into_any_element(),
             TabContent::Panel {
@@ -442,7 +587,24 @@ impl DotDir {
             .border_color(if active { p.accent } else { p.border })
             .bg(p.bg)
             .child(tabs)
-            .child(content)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .capture_any_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, window, cx| {
+                            this.focus_pane_from_click(pane, event, window, cx);
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+                        if this.panes[pane].tabs.iter().all(|tab| tab.id() != drag.id) {
+                            this.drop_tab(drag.id, pane, end, window.modifiers().alt, window, cx);
+                        }
+                    }))
+                    .child(content),
+            )
             .into_any_element()
     }
 
@@ -1091,6 +1253,15 @@ impl Render for DotDir {
                 window.refresh();
             }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    if this.dismiss_hover(cx) {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        return;
+                    }
+                } else if !this.hover.contains(window.mouse_position()) {
+                    this.dismiss_hover(cx);
+                }
                 if this.modal.is_some() {
                     let key = event.keystroke.key.as_str();
                     if key == "escape" {
@@ -1348,7 +1519,10 @@ impl Render for DotDir {
                         .find(|command| command.id == id)
                         .map(|command| {
                             command
-                                .keybar_label(self.active_document().is_some())
+                                .keybar_label(
+                                    self.active_document().is_some(),
+                                    self.archive_active(self.active),
+                                )
                                 .to_string()
                         })
                         .or_else(|| {
@@ -1415,6 +1589,7 @@ impl Render for DotDir {
         if self.modal.is_some() {
             root = root.child(self.render_modal(window, cx));
         }
+        root = root.children(self.render_hover(window, cx));
         root
     }
 }

@@ -13,6 +13,7 @@ pub struct RunCommand {
 pub struct CommandState {
     pub panels_visible: bool,
     pub directory: bool,
+    pub archive: bool,
     pub entry: bool,
     pub real_entry: bool,
     pub file: bool,
@@ -20,6 +21,7 @@ pub struct CommandState {
     pub selection: bool,
     pub parent: bool,
     pub can_save: bool,
+    pub language_server: bool,
     pub has_tab: bool,
     pub multiple_tabs: bool,
     pub preview: bool,
@@ -39,14 +41,19 @@ pub enum Availability {
     Always,
     Panels,
     Directory,
+    LocalDirectory,
+    LocalLocation,
     Entry,
     RealEntry,
     File,
+    EditableFile,
     Items,
-    Transfer,
+    Copy,
+    LocalTransfer,
     Parent,
     RenameOrSave,
     Save,
+    LanguageServer,
     Tab,
     MultipleTabs,
     Preview,
@@ -61,16 +68,22 @@ impl Availability {
             Self::Always => true,
             Self::Panels => state.panels_visible,
             Self::Directory => state.directory,
+            Self::LocalDirectory => state.directory && !state.archive,
+            Self::LocalLocation => !state.archive,
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
             Self::File => state.directory && state.file,
+            Self::EditableFile => state.directory && state.file && !state.archive,
             Self::Items => state.directory && state.items,
-            Self::Transfer => state.directory && state.selection && state.operation_idle,
+            Self::Copy => state.directory && state.selection && state.operation_idle,
+            Self::LocalTransfer => Self::Copy.matches(state) && !state.archive,
             Self::Parent => state.directory && state.parent,
             Self::RenameOrSave => {
-                (state.directory && state.real_entry && state.operation_idle) || state.can_save
+                (state.directory && !state.archive && state.real_entry && state.operation_idle)
+                    || state.can_save
             }
             Self::Save => state.can_save,
+            Self::LanguageServer => state.panels_visible && state.language_server,
             Self::Tab => state.has_tab,
             Self::MultipleTabs => state.multiple_tabs,
             Self::Preview => state.panels_visible && state.preview,
@@ -94,13 +107,22 @@ impl Command {
         self.availability.matches(state)
     }
 
-    pub fn keybar_label(&self, editor: bool) -> &str {
+    pub fn title(&self, state: &CommandState) -> &'static str {
+        if self.id == "copy" && state.archive {
+            "Extract ZIP"
+        } else {
+            self.title
+        }
+    }
+
+    pub fn keybar_label(&self, editor: bool, archive: bool) -> &str {
         match self.id {
             "palette" => "Commands",
             "rename" if editor => "Save",
             "rename" => "Rename",
             "view" => "View",
             "edit" => "Edit",
+            "copy" if archive => "Extract",
             "copy" => "Copy",
             "move" => "Move",
             "mkdir" => "Mkdir",
@@ -178,35 +200,35 @@ pub const COMMANDS: &[Command] = &[
         title: "Edit File",
         key: "f4",
         context: "FilePane",
-        availability: Availability::File,
+        availability: Availability::EditableFile,
     },
     Command {
         id: "copy",
         title: "Copy to Opposite Panel",
         key: "f5",
         context: "FilePane",
-        availability: Availability::Transfer,
+        availability: Availability::Copy,
     },
     Command {
         id: "move",
         title: "Move to Opposite Panel",
         key: "f6",
         context: "FilePane",
-        availability: Availability::Transfer,
+        availability: Availability::LocalTransfer,
     },
     Command {
         id: "mkdir",
         title: "Make Directory",
         key: "f7",
         context: "FilePane",
-        availability: Availability::Directory,
+        availability: Availability::LocalDirectory,
     },
     Command {
         id: "trash",
         title: "Move to Trash",
         key: "f8",
         context: "FilePane",
-        availability: Availability::Transfer,
+        availability: Availability::LocalTransfer,
     },
     Command {
         id: "settings",
@@ -402,14 +424,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Find Files",
         key: "alt-f7",
         context: "DotDir",
-        availability: Availability::Always,
+        availability: Availability::LocalLocation,
     },
     Command {
         id: "new-file",
         title: "Open / Create File",
         key: "shift-f4",
         context: "DotDir",
-        availability: Availability::Always,
+        availability: Availability::LocalLocation,
     },
     Command {
         id: "save",
@@ -417,6 +439,20 @@ pub const COMMANDS: &[Command] = &[
         key: "cmd-s",
         context: "DotDir",
         availability: Availability::Save,
+    },
+    Command {
+        id: "definition",
+        title: "Language: Go to Definition",
+        key: "cmd-alt-down",
+        context: "Input",
+        availability: Availability::LanguageServer,
+    },
+    Command {
+        id: "completions",
+        title: "Language: Show Completions",
+        key: "ctrl-space",
+        context: "Input",
+        availability: Availability::LanguageServer,
     },
     Command {
         id: "escape",
@@ -535,7 +571,7 @@ pub const COMMANDS: &[Command] = &[
         title: "Edit in Opposite Panel",
         key: "cmd-f4",
         context: "FilePane",
-        availability: Availability::File,
+        availability: Availability::EditableFile,
     },
     Command {
         id: "panels",
@@ -626,6 +662,35 @@ mod tests {
             .find(|c| c.id == id)
             .unwrap()
             .available(state)
+    }
+
+    #[test]
+    fn zip_panes_allow_preview_and_extraction_and_reject_mutation() {
+        let state = CommandState {
+            panels_visible: true,
+            directory: true,
+            archive: true,
+            entry: true,
+            file: true,
+            real_entry: true,
+            selection: true,
+            operation_idle: true,
+            ..Default::default()
+        };
+        for id in ["open", "view", "quick-view", "copy"] {
+            assert!(available(id, &state), "{id}");
+        }
+        for id in [
+            "edit",
+            "quick-edit",
+            "move",
+            "trash",
+            "mkdir",
+            "rename",
+            "new-file",
+        ] {
+            assert!(!available(id, &state), "{id}");
+        }
     }
 
     #[test]

@@ -1,7 +1,10 @@
 mod app;
+mod archive;
 mod column_scroll;
 mod commands;
+mod hover;
 mod icon_theme;
+mod lsp;
 mod media;
 mod media_native;
 mod model;

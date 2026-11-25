@@ -1,3 +1,4 @@
+use crate::archive::{Location, SavedLocation};
 use dotdir_core::ops::{EntryInfo, EntryKind};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,7 +11,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
-    pub path: PathBuf,
+    pub path: Location,
     pub directory: bool,
     pub symlink: bool,
     pub size: u64,
@@ -20,10 +21,10 @@ pub struct Entry {
     pub mode: u32,
 }
 
-fn parent_entry(path: &Path) -> Option<Entry> {
+fn parent_entry(path: &Location) -> Option<Entry> {
     Some(Entry {
         name: "..".into(),
-        path: path.parent()?.into(),
+        path: path.parent()?,
         directory: true,
         symlink: false,
         size: 0,
@@ -35,7 +36,7 @@ fn parent_entry(path: &Path) -> Option<Entry> {
 }
 
 pub fn read_directory(path: &Path, hidden: bool, sort: SortOrder) -> anyhow::Result<Vec<Entry>> {
-    let mut items = dotdir_core::ops::entries(
+    let items = dotdir_core::ops::entries(
         path.to_str()
             .ok_or_else(|| anyhow::anyhow!("Directory is not valid UTF-8"))?,
     )?
@@ -47,7 +48,7 @@ pub fn read_directory(path: &Path, hidden: bool, sort: SortOrder) -> anyhow::Res
             directory: matches!(e.kind, EntryKind::Directory)
                 || (matches!(e.kind, EntryKind::Symlink) && child.is_dir()),
             symlink: matches!(e.kind, EntryKind::Symlink),
-            path: child,
+            path: child.into(),
             name: e.name,
             size: e.size as u64,
             modified: e.mtime_ms,
@@ -57,6 +58,37 @@ pub fn read_directory(path: &Path, hidden: bool, sort: SortOrder) -> anyhow::Res
         }
     })
     .collect::<Vec<_>>();
+    Ok(sort_entries(&path.into(), items, sort))
+}
+
+pub fn read_location(path: &Location, hidden: bool, sort: SortOrder) -> anyhow::Result<Vec<Entry>> {
+    match path {
+        Location::Local(path) => read_directory(path, hidden, sort),
+        Location::Zip { archive, member } => {
+            let items = archive
+                .list(member)?
+                .into_iter()
+                .filter_map(|(path, member)| {
+                    let is_hidden = member.name.starts_with('.');
+                    (hidden || !is_hidden).then_some(Entry {
+                        path,
+                        name: member.name,
+                        directory: member.directory,
+                        symlink: member.symlink,
+                        size: member.size,
+                        modified: member.modified,
+                        hidden: is_hidden,
+                        parent: false,
+                        mode: 0,
+                    })
+                })
+                .collect();
+            Ok(sort_entries(path, items, sort))
+        }
+    }
+}
+
+fn sort_entries(path: &Location, mut items: Vec<Entry>, sort: SortOrder) -> Vec<Entry> {
     items.sort_by(|a, b| {
         b.directory.cmp(&a.directory).then_with(|| match sort {
             SortOrder::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -72,7 +104,7 @@ pub fn read_directory(path: &Path, hidden: bool, sort: SortOrder) -> anyhow::Res
     if let Some(parent) = parent_entry(path) {
         items.insert(0, parent);
     }
-    Ok(items)
+    items
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -264,24 +296,24 @@ impl IconScroll {
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub id: u64,
-    pub path: PathBuf,
+    pub path: Location,
     pub entries: Arc<Vec<Entry>>,
     show_parent: bool,
     pub cursor: usize,
     pub top: usize,
     wheel_remainder: f32,
     icon_scroll: Option<IconScroll>,
-    pub marked: HashSet<PathBuf>,
+    pub marked: HashSet<Location>,
     pub generation: u64,
     pub loading: bool,
     pub error: Option<String>,
-    pub history: Vec<PathBuf>,
-    pub forward: Vec<PathBuf>,
+    pub history: Vec<Location>,
+    pub forward: Vec<Location>,
     pub restore_name: Option<String>,
     pub sort: SortOrder,
 }
 impl Directory {
-    pub fn new(id: u64, path: PathBuf) -> Self {
+    pub fn new(id: u64, path: Location) -> Self {
         Self {
             id,
             path,
@@ -345,12 +377,12 @@ impl Directory {
             }
         }
     }
-    pub fn navigate(&mut self, path: PathBuf) {
+    pub fn navigate(&mut self, path: Location) {
         if self.path == path {
             return;
         }
         let old = self.path.clone();
-        self.restore_name = if old.parent() == Some(path.as_path()) {
+        self.restore_name = if old.parent().as_ref() == Some(&path) {
             old.file_name().map(|n| n.to_string_lossy().into_owned())
         } else {
             None
@@ -449,7 +481,7 @@ pub struct DirectoryBrowser {
     pub active: usize,
 }
 impl DirectoryBrowser {
-    pub fn new(id: u64, path: PathBuf) -> Self {
+    pub fn new(id: u64, path: Location) -> Self {
         Self {
             id,
             columns: vec![Directory::new(id, path)],
@@ -521,8 +553,8 @@ pub struct Settings {
     pub brief: bool,
     pub presentations: Option<[Presentation; 2]>,
     pub font_size: f32,
-    pub left: Vec<PathBuf>,
-    pub right: Vec<PathBuf>,
+    pub left: Vec<SavedLocation>,
+    pub right: Vec<SavedLocation>,
     pub left_active: usize,
     pub right_active: usize,
     pub active_pane: usize,
@@ -538,8 +570,8 @@ impl Default for Settings {
             brief: true,
             presentations: None,
             font_size: 13.,
-            left: vec![home.clone()],
-            right: vec![home],
+            left: vec![SavedLocation::Local(home.clone())],
+            right: vec![SavedLocation::Local(home)],
             left_active: 0,
             right_active: 0,
             active_pane: 0,
@@ -574,9 +606,11 @@ impl Settings {
             }; 2],
         );
         for pane in [&mut s.left, &mut s.right] {
-            pane.retain(|p| p.is_dir());
+            pane.retain(SavedLocation::available);
             if pane.is_empty() {
-                pane.push(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+                pane.push(SavedLocation::Local(
+                    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+                ));
             }
         }
         s
@@ -616,12 +650,12 @@ pub fn valid_name(name: &str) -> bool {
 mod tests {
     use super::*;
     fn numbered_directory(count: usize) -> Directory {
-        let mut directory = Directory::new(1, "/fixture".into());
+        let mut directory = Directory::new(1, Path::new("/fixture").into());
         directory.entries = Arc::new(
             (0..count)
                 .map(|i| Entry {
                     name: format!("{i:03}.txt"),
-                    path: PathBuf::from(format!("/fixture/{i:03}.txt")),
+                    path: PathBuf::from(format!("/fixture/{i:03}.txt")).into(),
                     directory: false,
                     symlink: false,
                     size: i as u64,
@@ -791,14 +825,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
         std::fs::create_dir(&child).unwrap();
-        let mut d = Directory::new(1, child.clone());
+        let mut d = Directory::new(1, child.clone().into());
         d.generation = 1;
         d.apply(1, read_directory(&child, true, SortOrder::Name));
         d.toggle_mark();
         assert!(d.selected().is_empty());
         d.navigate(temp.path().into());
         d.apply(1, read_directory(temp.path(), true, SortOrder::Name));
-        assert_eq!(d.focused().unwrap().path, child);
+        assert_eq!(d.focused().unwrap().path, child.into());
     }
     #[test]
     fn pane_presentations_migrate_and_persist_independently() {
@@ -860,11 +894,14 @@ mod tests {
             .current()
             .entries
             .iter()
-            .position(|e| e.path == a)
+            .position(|e| e.path.local() == Some(&a))
             .unwrap();
         assert_eq!(browser.preview(2), Some(2));
         assert_eq!(browser.active, 0);
-        assert_eq!(browser.current().selected()[0].path, a);
+        assert_eq!(
+            browser.current().selected()[0].path.local(),
+            Some(a.as_path())
+        );
         assert_eq!(browser.preview(99), None);
         assert_eq!(browser.columns[1].id, 2);
         browser.active = 1;
@@ -878,11 +915,11 @@ mod tests {
             .current()
             .entries
             .iter()
-            .position(|e| e.path == b)
+            .position(|e| e.path.local() == Some(&b))
             .unwrap();
         assert_eq!(browser.preview(4), Some(4));
         assert_eq!(browser.columns.len(), 2);
-        assert_eq!(browser.columns[1].path, b);
+        assert_eq!(browser.columns[1].path, b.into());
         assert!(!browser.columns.iter().any(|d| matches!(d.id, 2 | 3)));
     }
     #[test]
@@ -909,7 +946,7 @@ mod tests {
         browser.collapse();
         assert_eq!(browser.id, 1);
         assert_eq!(browser.current().id, 2);
-        assert_eq!(browser.current().path, a);
+        assert_eq!(browser.current().path, a.into());
         assert_eq!((browser.active, browser.columns.len()), (0, 1));
     }
     #[test]

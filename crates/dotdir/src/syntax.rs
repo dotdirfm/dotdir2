@@ -19,8 +19,8 @@ pub(crate) fn language_for(path: &Path) -> &'static str {
     let extension = path.extension().and_then(|extension| extension.to_str());
     match extension.map(str::to_ascii_lowercase).as_deref() {
         Some("rs") => "rust",
-        Some("js" | "jsx" | "mjs") => "javascript",
-        Some("ts" | "tsx") => "typescript",
+        Some("js" | "jsx" | "mjs" | "cjs") => "javascript",
+        Some("ts" | "tsx" | "mts" | "cts") => "typescript",
         Some("json" | "jsonc") => "json",
         Some("toml") => "toml",
         Some("css") => "css",

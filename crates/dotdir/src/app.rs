@@ -1,7 +1,10 @@
 use crate::{
+    archive::{Archive, Location, SavedLocation, is_zip},
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
+    hover::HoverHints,
     icon_theme::IconTheme,
+    lsp::{self, LanguageServers},
     media::{MediaEvent, MediaFilter, MediaViewer},
     model::*,
     operations::*,
@@ -16,26 +19,28 @@ use dotdir_core::{
 };
 use dotdir_extension_host::{ExtensionHost, ExtensionReply, LoadedExtension, PanelNode};
 use gpui_kit::{
-    component::input::{EditorState, InputEvent, InputState},
+    component::input::{EditorState, GoToDefinition, InputEvent, InputState, ShowCompletions},
     *,
 };
 use serde_json::json;
 use std::{
     cell::Cell,
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, atomic::Ordering, mpsc},
     time::{Duration, Instant},
 };
 
 pub(crate) enum Message {
     IconTheme(u64, anyhow::Result<Box<IconTheme>>),
+    Lsp(lsp::Notice),
     Directory(u64, u64, anyhow::Result<Vec<Entry>>),
     Watch(u64),
     Opened {
         request: u64,
         pane: usize,
-        path: PathBuf,
+        path: Location,
         readonly: bool,
         tab: Option<u64>,
         result: anyhow::Result<Vec<u8>>,
@@ -49,6 +54,7 @@ pub(crate) enum Message {
     Extension(anyhow::Result<LoadedExtension>),
     ExtensionReply {
         request: u64,
+        target: Option<u64>,
         extension: String,
         command: String,
         title: String,
@@ -99,10 +105,14 @@ impl DotDir {
                 }
                 PromptKind::Location => {
                     let p = self.resolve_path(&value);
-                    if !p.is_dir() {
-                        anyhow::bail!("Directory does not exist");
-                    }
-                    self.navigate(self.active, p, window, cx);
+                    let location = if p.is_dir() {
+                        p.into()
+                    } else if p.is_file() && is_zip(&p) {
+                        Archive::mount(p)
+                    } else {
+                        anyhow::bail!("Directory or ZIP archive does not exist");
+                    };
+                    self.navigate(self.active, location, window, cx);
                 }
                 PromptKind::Mkdir => {
                     if !valid_name(value.trim()) {
@@ -142,6 +152,9 @@ impl DotDir {
                     self.open_document(self.active, path, false, window, cx);
                 }
                 PromptKind::Transfer(kind, sources) => {
+                    if value.trim().is_empty() {
+                        anyhow::bail!("Enter a local destination directory");
+                    }
                     let destination = self.resolve_path(&value);
                     if !destination.is_dir() {
                         anyhow::bail!("Destination directory does not exist");
@@ -151,6 +164,23 @@ impl DotDir {
                         id,
                         kind,
                         sources,
+                        destination,
+                        self.copy_options.clone(),
+                    ));
+                }
+                PromptKind::Extract(archive, members) => {
+                    if value.trim().is_empty() {
+                        anyhow::bail!("Enter a local destination directory");
+                    }
+                    let destination = self.resolve_path(value.trim());
+                    if !destination.is_dir() {
+                        anyhow::bail!("Destination directory does not exist");
+                    }
+                    let id = self.id();
+                    self.operation = Some(Operation::extract(
+                        id,
+                        archive,
+                        members,
                         destination,
                         self.copy_options.clone(),
                     ));
@@ -227,7 +257,13 @@ impl DotDir {
                         | "escape"
                 )
             })
-            .map(|c| (c.id.to_string(), c.title.to_string(), c.key.to_string()))
+            .map(|c| {
+                (
+                    c.id.to_string(),
+                    c.title(&state).to_string(),
+                    c.key.to_string(),
+                )
+            })
             .chain(self.extensions.iter().flat_map(|e| {
                 e.contributions
                     .iter()
@@ -254,6 +290,7 @@ impl DotDir {
         CommandState {
             panels_visible: self.panels_visible,
             directory: directory.is_some(),
+            archive: self.archive_active(self.active),
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
             file: entry.is_some_and(|entry| !entry.directory && !entry.parent),
@@ -262,6 +299,7 @@ impl DotDir {
                 .is_some_and(|d| !d.marked.is_empty() || d.focused().is_some_and(|e| !e.parent)),
             parent: directory.is_some_and(|d| d.path.parent().is_some()),
             can_save: self.panels_visible && document.is_some_and(|d| !d.readonly && !d.saving),
+            language_server: document.is_some_and(|d| d.lsp.is_some()),
             has_tab: self.panels_visible && tab.is_some(),
             multiple_tabs: self.panels_visible && self.panes[self.active].tabs.len() > 1,
             preview: self.preview_target().is_some(),
@@ -352,7 +390,7 @@ impl DotDir {
         {
             self.dismiss(window, cx);
             if path.is_dir() {
-                self.navigate(self.active, path, window, cx);
+                self.navigate(self.active, path.into(), window, cx);
             } else if let Some(parent) = path.parent() {
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned());
                 self.navigate(self.active, parent.into(), window, cx);
@@ -405,7 +443,7 @@ impl DotDir {
             .directory(source)
             .map(Directory::selected)
             .unwrap_or_default();
-        json!({"path":self.cwd(source),"oppositePath":self.cwd(1-source),"selected":selected.iter().map(|e|json!({"name":e.name,"path":e.path,"size":e.size,"directory":e.directory})).collect::<Vec<_>>()})
+        json!({"path":self.pane_location(source).display(),"oppositePath":self.pane_location(1-source).display(),"selected":selected.iter().map(|e|json!({"name":e.name,"path":e.path.display(),"size":e.size,"directory":e.directory})).collect::<Vec<_>>()})
     }
     pub fn invoke_extension(
         &mut self,
@@ -415,6 +453,15 @@ impl DotDir {
         event: serde_json::Value,
         _cx: &mut Context<Self>,
     ) {
+        let target = (!event.is_null())
+            .then(|| {
+                let pane = &self.panes[self.active];
+                let tab = &pane.tabs[pane.active];
+                matches!(&tab.content, TabContent::Panel { extension: e, command: c, .. }
+                if e == &extension && c == &command)
+                .then(|| tab.id())
+            })
+            .flatten();
         self.extension_request += 1;
         let request = self.extension_request;
         let rx = self.extension_host.invoke(
@@ -428,6 +475,7 @@ impl DotDir {
             if let Ok(result) = rx.recv() {
                 let _ = tx.send(Message::ExtensionReply {
                     request,
+                    target,
                     extension,
                     command,
                     title,
@@ -464,7 +512,7 @@ impl DotDir {
             };
             let path = self.resolve_path(path);
             if path.is_dir() {
-                self.navigate(self.active, path, window, cx);
+                self.navigate(self.active, path.into(), window, cx);
             } else {
                 self.error("Directory does not exist", cx);
                 return;
@@ -580,16 +628,70 @@ impl DotDir {
                         Err(error) => self.error(format!("Icon theme: {error:#}"), cx),
                     }
                 }
+                Message::Lsp(notice) => match notice {
+                    lsp::Notice::Diagnostics {
+                        document,
+                        revision,
+                        items,
+                    } => {
+                        if let Some(doc) = self.documents.get_mut(&document)
+                            && let Some(buffer) = doc
+                                .lsp
+                                .as_ref()
+                                .filter(|buffer| buffer.revision() == revision)
+                        {
+                            let name = buffer.server_name();
+                            doc.lsp_status = Some(match items.len() {
+                                0 => name.into(),
+                                1 => format!("{name} · 1 diagnostic"),
+                                count => format!("{name} · {count} diagnostics"),
+                            });
+                            doc.input.update(cx, |state, cx| {
+                                let text = state.text().clone();
+                                if let Some(diagnostics) = state.diagnostics_mut() {
+                                    diagnostics.reset(&text);
+                                    diagnostics.extend(items);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                    lsp::Notice::Failed { session, error } => {
+                        for doc in self.documents.values_mut().filter(|doc| {
+                            doc.lsp
+                                .as_ref()
+                                .is_some_and(|buffer| buffer.session() == session)
+                        }) {
+                            doc.lsp = None;
+                            doc.lsp_status = Some(error.clone());
+                            doc.input.update(cx, |state, cx| {
+                                let lsp = state.lsp_mut();
+                                lsp.completion_provider = None;
+                                lsp.hover_provider = None;
+                                lsp.definition_provider = None;
+                                lsp.show_document = None;
+                                if let Some(diagnostics) = state.diagnostics_mut() {
+                                    diagnostics.clear();
+                                }
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
                 Message::Directory(id, generation, result) => {
-                    let path = if let Some(d) = self.directory_by_id(id) {
-                        d.apply(generation, result);
-                        Some(d.path.clone())
-                    } else {
-                        None
+                    let Some(directory) = self
+                        .directory_by_id(id)
+                        .filter(|d| d.generation == generation)
+                    else {
+                        continue;
                     };
-                    if let (Some(w), Some(path)) = (&self.watcher, path) {
+                    directory.apply(generation, result);
+                    let local = directory.path.local().map(PathBuf::from);
+                    if let Some(w) = &self.watcher {
                         w.remove(&id.to_string());
-                        w.add(&id.to_string(), &path.to_string_lossy());
+                        if let Some(path) = local {
+                            w.add(&id.to_string(), &path.to_string_lossy());
+                        }
                     }
                     let mut old_ids = vec![];
                     for pane in &mut self.panes {
@@ -613,16 +715,26 @@ impl DotDir {
                     tab,
                     result,
                 } => {
-                    let current = match tab {
-                        Some(id) => self.panes[pane]
-                            .tabs
-                            .iter()
-                            .any(|tab| tab.id() == id && tab.accepts_load(request)),
-                        None => self.open_request[pane] == request,
+                    let pane = match tab {
+                        Some(id) => {
+                            let Some((pane, index)) = self.tab_position(id) else {
+                                continue;
+                            };
+                            if !self.panes[pane].tabs[index].accepts_load(request) {
+                                continue;
+                            }
+                            pane
+                        }
+                        None if self.open_request[pane] == request => pane,
+                        None => continue,
                     };
-                    if !current {
-                        continue;
-                    }
+                    let source_position = if tab.is_none() {
+                        self.source_jump[pane]
+                            .take()
+                            .and_then(|(reply, position)| (request == reply).then_some(position))
+                    } else {
+                        None
+                    };
                     match result {
                         Err(e) => {
                             if let Some(id) = tab {
@@ -639,6 +751,27 @@ impl DotDir {
                             }
                         }
                         Ok(bytes) => {
+                            if readonly
+                                && path.local().is_none()
+                                && let Some(format) = image_format(&path)
+                            {
+                                let id = self.id();
+                                self.install_content(
+                                    pane,
+                                    TabContent::Image {
+                                        id,
+                                        path,
+                                        image: Some(Arc::new(Image::from_bytes(format, bytes))),
+                                    },
+                                    tab,
+                                    window,
+                                    cx,
+                                );
+                                if tab.is_none() {
+                                    self.status.clear();
+                                }
+                                continue;
+                            }
                             let (text, readonly) = match String::from_utf8(bytes.clone()) {
                                 Ok(text) => (text, readonly),
                                 Err(_) => {
@@ -670,23 +803,37 @@ impl DotDir {
                             let id = if let Some(document) =
                                 self.documents.values_mut().find(|d| d.path == path)
                             {
-                                if !readonly {
+                                if !readonly && std::str::from_utf8(&document.saved).is_ok() {
                                     document.readonly = false;
                                 }
                                 document.id
                             } else {
                                 let id = self.id();
-                                let language = language_for(&path);
+                                let language = language_for(path.name_path());
                                 let input = cx.new(|cx| {
                                     EditorState::new(window, cx)
                                         .language(language)
                                         .default_value(text)
                                 });
                                 let subscription =
-                                    cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+                                    cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
                                         if matches!(event, InputEvent::Change)
                                             && let Some(doc) = this.documents.get(&id)
                                         {
+                                            if let Some(view) = &doc.inactive_view {
+                                                let text = input.read(cx).value();
+                                                view.update(cx, |editor, cx| {
+                                                    let scroll = editor.scroll_offset();
+                                                    editor.set_value(text, window, cx);
+                                                    editor.set_scroll_offset(scroll, cx);
+                                                });
+                                            }
+                                            if let Some(buffer) = &doc.lsp {
+                                                buffer.change(input.read(cx).text().clone());
+                                            }
+                                            if this.hover.is_for_document(id) && this.hover.clear() {
+                                                cx.notify();
+                                            }
                                             let previous = doc.dirty_cache.replace(None);
                                             // The editor redraws itself. Rebuild the surrounding
                                             // panes only when their modified indicator changes.
@@ -707,17 +854,24 @@ impl DotDir {
                                         id,
                                         path,
                                         input,
+                                        inactive_view: None,
                                         saved: bytes,
                                         dirty_cache: Cell::new(None),
                                         readonly,
                                         saving: false,
                                         error: None,
+                                        lsp: None,
+                                        lsp_status: None,
                                         _subscription: subscription,
                                     },
                                 );
                                 id
                             };
+                            self.enable_language_server(id, cx);
                             self.install_content(pane, TabContent::Document(id), tab, window, cx);
+                            if let Some(position) = source_position {
+                                self.reveal_source_position(id, position, window, cx);
+                            }
                             if tab.is_none() {
                                 self.status.clear();
                             }
@@ -729,6 +883,9 @@ impl DotDir {
                         d.saving = false;
                         match result {
                             Ok(()) => {
+                                if let Some(buffer) = &d.lsp {
+                                    buffer.save();
+                                }
                                 d.saved = text.into_bytes();
                                 d.dirty_cache.set(None);
                                 d.error = None;
@@ -778,6 +935,7 @@ impl DotDir {
                 },
                 Message::ExtensionReply {
                     request,
+                    target,
                     extension,
                     command,
                     title,
@@ -793,7 +951,23 @@ impl DotDir {
                                 self.status = message;
                             }
                             if let Some(node) = reply.panel {
-                                let existing=self.panes.iter().enumerate().find_map(|(p,pane)|pane.tabs.iter().position(|t|matches!(&t.content,TabContent::Panel{extension:e,command:c,..} if e==&extension && c==&command)).map(|i|(p,i)));
+                                let existing = if let Some(target) = target {
+                                    let Some(position) = self.tab_position(target) else {
+                                        continue;
+                                    };
+                                    Some(position)
+                                } else {
+                                    self.panes.iter().enumerate().find_map(|(pane, tabs)| {
+                                        tabs.tabs
+                                            .iter()
+                                            .position(|tab| {
+                                                matches!(&tab.content, TabContent::Panel {
+                                                extension: e, command: c, ..
+                                            } if e == &extension && c == &command)
+                                            })
+                                            .map(|index| (pane, index))
+                                    })
+                                };
                                 if let Some((p, i)) = existing {
                                     if let TabContent::Panel { node: n, .. } =
                                         &mut self.panes[p].tabs[i].content
@@ -929,8 +1103,9 @@ impl DotDir {
 }
 pub(crate) struct Document {
     pub id: u64,
-    pub path: PathBuf,
+    pub path: Location,
     pub input: Entity<EditorState>,
+    pub inactive_view: Option<Entity<EditorState>>,
     pub saved: Vec<u8>,
     // Invalidated by text changes and successful saves, never by cursor movement
     // or redraws. Keep undo-to-saved detection without allocating the full text.
@@ -938,6 +1113,8 @@ pub(crate) struct Document {
     pub readonly: bool,
     pub saving: bool,
     pub error: Option<String>,
+    pub lsp: Option<Rc<lsp::Buffer>>,
+    pub lsp_status: Option<String>,
     pub _subscription: Subscription,
 }
 impl Document {
@@ -964,14 +1141,15 @@ impl Document {
 pub(crate) enum TabContent {
     Pending {
         id: u64,
-        path: Option<PathBuf>,
+        path: Option<Location>,
         error: Option<String>,
     },
     Directory(DirectoryBrowser),
     Document(u64),
     Image {
         id: u64,
-        path: PathBuf,
+        path: Location,
+        image: Option<Arc<Image>>,
     },
     Media {
         id: u64,
@@ -1006,7 +1184,7 @@ pub(crate) struct Tab {
     pub preview_source: Option<u64>,
     id: u64,
     load_request: u64,
-    preview_path: Option<PathBuf>,
+    preview_path: Option<Location>,
 }
 impl Tab {
     pub fn new(content: TabContent) -> Self {
@@ -1022,14 +1200,20 @@ impl Tab {
     pub fn id(&self) -> u64 {
         self.id
     }
+    fn with_id(id: u64, content: TabContent) -> Self {
+        Self {
+            id,
+            ..Self::new(content)
+        }
+    }
     pub fn make_permanent(&mut self) {
         self.preview = false;
         self.preview_source = None;
     }
-    fn follows_changed_file(&self, source: u64, path: &Option<PathBuf>) -> bool {
+    fn follows_changed_file(&self, source: u64, path: &Option<Location>) -> bool {
         self.preview && self.preview_source == Some(source) && &self.preview_path != path
     }
-    fn begin_preview_load(&mut self, path: Option<PathBuf>, request: u64) {
+    fn begin_preview_load(&mut self, path: Option<Location>, request: u64) {
         self.preview_path = path.clone();
         self.load_request = request;
         self.content = TabContent::Pending {
@@ -1047,6 +1231,35 @@ pub(crate) struct Pane {
     pub active: usize,
 }
 impl Pane {
+    fn insert_after_active(&mut self, tab: Tab) {
+        let index = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(index, tab);
+        self.active = index;
+    }
+
+    fn remove_tab(&mut self, index: usize) -> Tab {
+        let closed = self.tabs.remove(index);
+        let file_tab = matches!(
+            closed.content,
+            TabContent::Document(_)
+                | TabContent::Image { .. }
+                | TabContent::Media { .. }
+                | TabContent::Pending { .. }
+        );
+        if index < self.active || (index == self.active && file_tab) {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        closed
+    }
+
+    fn reorder_tab(&mut self, from: usize, slot: usize) -> usize {
+        let slot = slot - usize::from(slot > from);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(slot, tab);
+        slot
+    }
+
     fn opposite_tab(&self, opposite: &Pane) -> usize {
         self.tabs
             .get(self.active)
@@ -1056,11 +1269,17 @@ impl Pane {
             .unwrap_or(opposite.active)
     }
     fn remove_previews(&mut self) {
-        let active = self.tabs.get(self.active).map(Tab::id);
+        let preceding = self
+            .tabs
+            .iter()
+            .take(self.active)
+            .filter(|tab| !tab.preview)
+            .count();
+        let closing_active = self.tabs.get(self.active).is_some_and(|tab| tab.preview);
         self.tabs.retain(|tab| !tab.preview);
-        self.active = active
-            .and_then(|id| self.tabs.iter().position(|tab| tab.id() == id))
-            .unwrap_or_else(|| self.active.min(self.tabs.len().saturating_sub(1)));
+        self.active = preceding
+            .saturating_sub(usize::from(closing_active))
+            .min(self.tabs.len().saturating_sub(1));
     }
 }
 #[derive(Clone)]
@@ -1071,6 +1290,7 @@ pub(crate) enum PromptKind {
     Rename(PathBuf),
     NewFile,
     Transfer(OperationKind, Vec<PathBuf>),
+    Extract(Arc<Archive>, Vec<PathBuf>),
     Trash(Vec<PathBuf>),
     CloseTab { pane: usize, id: u64 },
     Quit,
@@ -1127,6 +1347,9 @@ pub(crate) struct DotDir {
     pub panels_visible: bool,
     pub extensions: Vec<LoadedExtension>,
     pub extension_host: ExtensionHost,
+    language_servers: LanguageServers,
+    pub hover: HoverHints,
+    source_jump: [Option<(u64, lsp_types::Position)>; 2],
     pub extension_errors: Vec<String>,
     pub search: Option<SearchState>,
     pub status: String,
@@ -1151,15 +1374,31 @@ impl DotDir {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut settings = Settings::load(&settings_path);
-        if let Some(path) = initial
-            && path.is_dir()
-        {
-            settings.left = vec![path.clone()];
-            settings.right = vec![path];
+        if let Some(path) = initial {
+            if path.is_dir() {
+                settings.left = vec![SavedLocation::Local(path.clone())];
+                settings.right = vec![SavedLocation::Local(path)];
+            } else if path.is_file() && is_zip(&path) {
+                let path = path.canonicalize().unwrap_or(path);
+                if let Some(parent) = path.parent() {
+                    settings.right = vec![SavedLocation::Local(parent.into())];
+                }
+                settings.left = vec![SavedLocation::from(&Archive::mount(path))];
+            }
         }
         let palette = Palette::named(&settings.theme);
         palette.apply(&settings.theme, cx);
         let (tx, rx) = mpsc::channel();
+        let lsp_tx = tx.clone();
+        let language_servers = LanguageServers::new(
+            settings_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("extensions"),
+            move |notice| {
+                let _ = lsp_tx.send(Message::Lsp(notice));
+            },
+        );
         let watch_tx = tx.clone();
         let watcher = FsWatcher::new(Arc::new(move |id, _, _| {
             if let Ok(id) = id.parse() {
@@ -1213,7 +1452,7 @@ impl DotDir {
             tabs: paths
                 .into_iter()
                 .map(|path| {
-                    let d = DirectoryBrowser::new(next_id, path);
+                    let d = DirectoryBrowser::new(next_id, path.into());
                     next_id += 1;
                     Tab::new(TabContent::Directory(d))
                 })
@@ -1274,6 +1513,9 @@ impl DotDir {
             panels_visible: true,
             extensions: vec![],
             extension_host: host,
+            language_servers,
+            hover: HoverHints::default(),
+            source_jump: [None, None],
             extension_errors: vec![],
             search: None,
             status: String::new(),
@@ -1381,7 +1623,7 @@ impl DotDir {
                 _ => None,
             })
     }
-    pub fn cwd(&self, pane: usize) -> PathBuf {
+    fn pane_location(&self, pane: usize) -> Location {
         match self.panes[pane]
             .tabs
             .get(self.panes[pane].active)
@@ -1391,22 +1633,38 @@ impl DotDir {
             Some(TabContent::Document(id)) => self
                 .documents
                 .get(id)
-                .and_then(|d| d.path.parent().map(PathBuf::from))
-                .unwrap_or_default(),
-            Some(TabContent::Image { path, .. } | TabContent::Media { path, .. }) => {
-                path.parent().map(PathBuf::from).unwrap_or_default()
+                .and_then(|d| d.path.parent())
+                .unwrap_or_else(|| PathBuf::new().into()),
+            Some(TabContent::Image { path, .. }) => {
+                path.parent().unwrap_or_else(|| PathBuf::new().into())
             }
+            Some(TabContent::Media { path, .. }) => path
+                .parent()
+                .map(Location::from)
+                .unwrap_or_else(|| PathBuf::new().into()),
             _ => self.panes[pane]
                 .tabs
                 .iter()
-                .find_map(|t| {
-                    if let TabContent::Directory(d) = &t.content {
-                        Some(d.current().path.clone())
-                    } else {
-                        None
-                    }
+                .find_map(|t| match &t.content {
+                    TabContent::Directory(d) => Some(d.current().path.clone()),
+                    _ => None,
                 })
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default()),
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().into()),
+        }
+    }
+    pub fn archive_active(&self, pane: usize) -> bool {
+        self.pane_location(pane).local().is_none()
+    }
+    pub fn cwd(&self, pane: usize) -> PathBuf {
+        let location = self.pane_location(pane);
+        if let Some(local) = location.local() {
+            local.into()
+        } else {
+            location
+                .host_path()
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_default()
         }
     }
     pub fn active_document(&self) -> Option<u64> {
@@ -1432,7 +1690,7 @@ impl DotDir {
                 let _ = tx.send(Message::Directory(
                     id,
                     generation,
-                    read_directory(&path, hidden, sort),
+                    read_location(&path, hidden, sort),
                 ));
             });
         }
@@ -1459,7 +1717,7 @@ impl DotDir {
     pub fn navigate(
         &mut self,
         pane: usize,
-        path: PathBuf,
+        path: Location,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1475,15 +1733,15 @@ impl DotDir {
         if let Some(browser) = self.browser_mut(pane) {
             if columns && let Some(index) = browser.columns.iter().position(|d| d.path == path) {
                 browser.active = index;
-            } else if columns && path.parent() == Some(browser.current().path.as_path()) {
-                if let Some(index) = browser
+            } else if columns
+                && path.parent().as_ref() == Some(&browser.current().path)
+                && let Some(index) = browser
                     .current()
                     .entries
                     .iter()
-                    .position(|e| e.path == path)
-                {
-                    browser.current_mut().cursor = index;
-                }
+                    .position(|entry| entry.directory && !entry.parent && entry.path == path)
+            {
+                browser.current_mut().cursor = index;
                 reload = browser.preview(next_id);
                 if browser
                     .columns
@@ -1555,6 +1813,46 @@ impl DotDir {
         });
         cx.notify();
     }
+
+    pub fn focus_pane_from_click(
+        &mut self,
+        pane: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || self.active == pane || self.modal.is_some() {
+            return;
+        }
+        let mirror = self.active_document().and_then(|id| {
+            if !matches!(self.panes[pane].tabs[self.panes[pane].active].content,
+                TabContent::Document(document) if document == id)
+            {
+                return None;
+            }
+            self.documents[&id]
+                .inactive_view
+                .as_ref()
+                .filter(|mirror| mirror.read(cx).input_bounds().contains(&event.position))
+                .map(|mirror| (id, mirror.clone()))
+        });
+        self.focus_pane(pane, window, cx);
+        if let Some((id, mirror)) = mirror {
+            let app = cx.weak_entity();
+            // Let the editor under the pointer place its caret before the
+            // editable view takes over this pane.
+            window.defer(cx, move |window, cx| {
+                let _ = app.update(cx, |this, cx| {
+                    if this.active == pane && this.active_document() == Some(id) {
+                        let position = mirror.read(cx).cursor_position();
+                        this.documents[&id].input.update(cx, |editor, cx| {
+                            editor.set_cursor_position(position, window, cx);
+                        });
+                    }
+                });
+            });
+        }
+    }
     fn focus_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.modal_focus.focus(window, cx);
         let view = cx.weak_entity();
@@ -1588,6 +1886,168 @@ impl DotDir {
         self.panes[pane].active = index.min(self.panes[pane].tabs.len() - 1);
         self.focus_pane(pane, window, cx);
         self.persist();
+    }
+
+    fn tab_position(&self, id: u64) -> Option<(usize, usize)> {
+        self.panes.iter().enumerate().find_map(|(pane, tabs)| {
+            tabs.tabs
+                .iter()
+                .position(|tab| tab.id() == id)
+                .map(|index| (pane, index))
+        })
+    }
+
+    pub fn drop_tab(
+        &mut self,
+        id: u64,
+        destination: usize,
+        slot: usize,
+        duplicate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some((source, index)) = self.tab_position(id) else {
+            return;
+        };
+        let slot = slot.min(self.panes[destination].tabs.len());
+        if source == destination {
+            let index = self.panes[source].reorder_tab(index, slot);
+            self.set_tab(source, index, window, cx);
+            return;
+        }
+
+        let (tab, load) = if duplicate {
+            self.duplicate_tab(source, index)
+        } else {
+            let fallback = self.pane_location(source);
+            let mut tab = self.panes[source].remove_tab(index);
+            tab.make_permanent();
+            self.open_request[source] += 1;
+            self.ensure_directory_tab(source, fallback);
+            // A preview in the destination can no longer follow a source that
+            // now lives beside it in the same pane.
+            for preview in &mut self.panes[destination].tabs {
+                if preview.preview_source == Some(id) {
+                    preview.make_permanent();
+                }
+            }
+            (tab, None)
+        };
+
+        let tab_id = tab.id();
+        let directories = if duplicate {
+            match &tab.content {
+                TabContent::Directory(browser) => {
+                    browser.columns.iter().map(|column| column.id).collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        self.panes[destination].tabs.insert(slot, tab);
+        self.set_tab(destination, slot, window, cx);
+        for id in directories {
+            self.reload(id);
+        }
+        self.reveal_column(destination, false);
+        if let Some(path) = load {
+            self.open_document_into(destination, path, true, Some(tab_id), window, cx);
+        }
+    }
+
+    fn duplicate_tab(&mut self, pane: usize, index: usize) -> (Tab, Option<Location>) {
+        let id = self.id();
+        let (content, load) = match &self.panes[pane].tabs[index].content {
+            TabContent::Directory(browser) => {
+                let mut browser = browser.clone();
+                browser.id = id;
+                for (index, column) in browser.columns.iter_mut().enumerate() {
+                    column.id = if index == 0 { id } else { self.id() };
+                }
+                (TabContent::Directory(browser), None)
+            }
+            TabContent::Document(document) => (TabContent::Document(*document), None),
+            TabContent::Image { path, image, .. } => (
+                TabContent::Image {
+                    id,
+                    path: path.clone(),
+                    image: image.clone(),
+                },
+                None,
+            ),
+            TabContent::Panel {
+                title,
+                extension,
+                command,
+                node,
+                ..
+            } => (
+                TabContent::Panel {
+                    id,
+                    title: title.clone(),
+                    extension: extension.clone(),
+                    command: command.clone(),
+                    node: node.clone(),
+                },
+                None,
+            ),
+            TabContent::Pending { path, error, .. } => (
+                TabContent::Pending {
+                    id,
+                    path: path.clone(),
+                    error: error.clone(),
+                },
+                path.clone(),
+            ),
+            TabContent::Media { path, .. } => {
+                let path = Some(Location::from(path.clone()));
+                (
+                    TabContent::Pending {
+                        id,
+                        path: path.clone(),
+                        error: None,
+                    },
+                    path,
+                )
+            }
+        };
+        (Tab::with_id(id, content), load)
+    }
+
+    /// A GPUI editor's layout and focus handle belong to one mounted surface.
+    /// When a buffer is visible in both panes, the focused pane owns the editor
+    /// and the other pane paints a separate view of the same text.
+    pub fn editor_for_pane(
+        &mut self,
+        pane: usize,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<EditorState>, bool) {
+        let shared = self.panes.iter().all(|pane| {
+            matches!(pane.tabs[pane.active].content, TabContent::Document(document) if document == id)
+        });
+        let doc = self.documents.get_mut(&id).expect("document tab");
+        if !shared {
+            doc.inactive_view = None;
+        }
+        if !shared || self.active == pane {
+            return (doc.input.clone(), doc.readonly);
+        }
+        let view = doc.inactive_view.get_or_insert_with(|| {
+            let text = doc.input.read(cx).value();
+            let language = language_for(doc.path.name_path());
+            cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language(language)
+                    .default_value(text)
+            })
+        });
+        (view.clone(), true)
     }
     pub fn layout_for(&self, pane: usize, window: &Window) -> PanelLayout {
         let height: f32 = window.viewport_size().height.into();
@@ -1747,11 +2207,7 @@ impl DotDir {
             && !marking
             && let Some(entry) = entry
         {
-            if entry.directory {
-                self.navigate(pane, entry.path, window, cx);
-            } else {
-                self.open_document(pane, entry.path, false, window, cx);
-            }
+            self.open_entry(pane, entry, false, window, cx);
         }
         self.persist();
         cx.notify();
@@ -1893,25 +2349,17 @@ impl DotDir {
                     .and_then(Directory::focused)
                     .cloned()
                 {
-                    if e.directory {
-                        self.navigate(self.active, e.path, window, cx);
-                    } else {
-                        let path = e.path;
-                        std::thread::spawn(move || {
-                            let _ = open::that(path);
-                        });
-                    }
+                    self.open_entry(self.active, e, true, window, cx);
                 }
             }
             "parent" => {
-                let cwd = self.cwd(self.active);
-                if let Some(p) = cwd.parent() {
-                    self.navigate(self.active, p.into(), window, cx);
+                if let Some(path) = self.directory(self.active).and_then(|d| d.path.parent()) {
+                    self.navigate(self.active, path, window, cx);
                 }
             }
             "home" => {
                 if let Some(p) = dirs::home_dir() {
-                    self.navigate(self.active, p, window, cx);
+                    self.navigate(self.active, p.into(), window, cx);
                 }
             }
             "refresh" => {
@@ -1964,7 +2412,7 @@ impl DotDir {
             "new-tab" => {
                 self.open_request[self.active] += 1;
                 let id = self.id();
-                let path = self.cwd(self.active);
+                let path = self.pane_location(self.active);
                 let p = &mut self.panes[self.active];
                 p.tabs
                     .push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
@@ -1988,7 +2436,7 @@ impl DotDir {
             "location" => self.prompt(
                 PromptKind::Location,
                 "Go to directory",
-                "Enter an absolute path or a path relative to this panel.".into(),
+                "Enter a directory or ZIP archive path.".into(),
                 self.cwd(self.active).to_string_lossy().into_owned(),
                 window,
                 cx,
@@ -2014,13 +2462,13 @@ impl DotDir {
                     .directory(self.active)
                     .and_then(Directory::focused)
                     .filter(|e| !e.parent)
-                    .cloned()
+                    .and_then(|e| Some((e.path.local()?.to_path_buf(), e.name.clone())))
                 {
                     self.prompt(
-                        PromptKind::Rename(e.path),
+                        PromptKind::Rename(e.0),
                         "Rename",
-                        e.name.clone(),
-                        e.name,
+                        e.1.clone(),
+                        e.1,
                         window,
                         cx,
                     );
@@ -2029,6 +2477,19 @@ impl DotDir {
             "rename" | "save" => {
                 if let Some(id) = self.active_document() {
                     self.save(id, cx);
+                }
+            }
+            "definition" | "completions" => {
+                if let Some(doc) = self
+                    .active_document()
+                    .and_then(|id| self.documents.get(&id))
+                {
+                    let focus = doc.input.read(cx).focus_handle(cx);
+                    if id == "definition" {
+                        focus.dispatch_action(&GoToDefinition, window, cx);
+                    } else {
+                        focus.dispatch_action(&ShowCompletions, window, cx);
+                    }
                 }
             }
             "view" | "edit" | "quick-view" | "quick-edit" => {
@@ -2054,19 +2515,24 @@ impl DotDir {
                         if self.panes[pane].tabs.is_empty() {
                             let id = self.id();
                             self.panes[pane].tabs.push(Tab::new(TabContent::Directory(
-                                DirectoryBrowser::new(id, cwd),
+                                DirectoryBrowser::new(id, cwd.into()),
                             )));
                             self.panes[pane].active = 0;
                             self.reload(id);
                         }
                     }
-                    self.open_document(
-                        pane,
-                        e.path,
-                        id.ends_with("view") || id == "view",
-                        window,
-                        cx,
-                    );
+                    if id == "view"
+                        && let Some(path) = e.path.local().filter(|path| is_zip(path))
+                    {
+                        self.navigate(
+                            pane,
+                            Archive::mount(path.canonicalize().unwrap_or_else(|_| path.into())),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        self.open_document_into(pane, e.path, id == "view", None, window, cx);
+                    }
                 }
             }
             "copy" | "move" | "trash" => {
@@ -2074,52 +2540,58 @@ impl DotDir {
                     self.error("Wait for the current operation to finish", cx);
                     return;
                 }
-                let paths = self
-                    .directory(self.active)
-                    .map(Directory::selected)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|e| e.path)
-                    .collect::<Vec<_>>();
-                if paths.is_empty() {
+                let Some(directory) = self.directory(self.active) else {
                     return;
-                }
-                let title = if id == "copy" {
-                    "Copy"
-                } else if id == "move" {
-                    "Move"
-                } else {
-                    "Move to Trash"
                 };
-                let desc = format!(
+                let selected = directory.selected();
+                let description = format!(
                     "{} item(s) from {}",
-                    paths.len(),
-                    self.cwd(self.active).display()
+                    selected.len(),
+                    directory.path.display()
                 );
-                let kind = if id == "trash" {
-                    PromptKind::Trash(paths)
+                let destination = if self.archive_active(1 - self.active) {
+                    String::new()
                 } else {
-                    PromptKind::Transfer(
-                        if id == "copy" {
-                            OperationKind::Copy
-                        } else {
-                            OperationKind::Move
-                        },
-                        paths,
-                    )
+                    self.cwd(1 - self.active).display().to_string()
                 };
-                self.prompt(
-                    kind,
-                    title,
-                    desc,
-                    self.cwd(1 - self.active).display().to_string(),
-                    window,
-                    cx,
-                );
+                if let Location::Zip { archive, .. } = &directory.path {
+                    let members = selected
+                        .into_iter()
+                        .filter_map(|entry| match entry.path {
+                            Location::Zip { member, .. } => Some(member),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !members.is_empty() {
+                        self.prompt(
+                            PromptKind::Extract(archive.clone(), members),
+                            "Extract ZIP",
+                            description,
+                            destination,
+                            window,
+                            cx,
+                        );
+                    }
+                } else {
+                    let paths = selected
+                        .into_iter()
+                        .filter_map(|entry| entry.path.local().map(PathBuf::from))
+                        .collect::<Vec<_>>();
+                    if paths.is_empty() {
+                        return;
+                    }
+                    let (kind, title) = match id {
+                        "trash" => (PromptKind::Trash(paths), "Move to Trash"),
+                        "move" => (PromptKind::Transfer(OperationKind::Move, paths), "Move"),
+                        _ => (PromptKind::Transfer(OperationKind::Copy, paths), "Copy"),
+                    };
+                    self.prompt(kind, title, description, destination, window, cx);
+                }
             }
             "sync" => {
-                let path = self.cwd(self.active);
-                self.navigate(1 - self.active, path, window, cx);
+                if let Some(path) = self.directory(self.active).map(|d| d.path.clone()) {
+                    self.navigate(1 - self.active, path, window, cx);
+                }
             }
             "palette" => self.show_modal(Modal::Palette, window, cx),
             "settings" => self.show_modal(Modal::Settings, window, cx),
@@ -2146,6 +2618,9 @@ impl DotDir {
             }
             "command-line" => self.command_line.update(cx, |s, cx| s.focus(window, cx)),
             "escape" => {
+                if self.modal.is_none() && self.dismiss_hover(cx) {
+                    return;
+                }
                 if self.modal.is_some() {
                     self.dismiss(window, cx);
                 } else if self.active_document().is_some() {
@@ -2210,9 +2685,9 @@ impl DotDir {
     fn start_preview(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
         let source_id = self.panes[source].tabs[self.panes[source].active].id();
         let pane = 1 - source;
-        let index = if let Some(index) = self.panes[pane].tabs.iter().position(|tab| tab.preview) {
+        if let Some(index) = self.panes[pane].tabs.iter().position(|tab| tab.preview) {
             self.panes[pane].tabs[index].preview_source = Some(source_id);
-            index
+            self.panes[pane].active = index;
         } else {
             let id = self.id();
             let mut tab = Tab::new(TabContent::Pending {
@@ -2222,10 +2697,8 @@ impl DotDir {
             });
             tab.preview = true;
             tab.preview_source = Some(source_id);
-            self.panes[pane].tabs.push(tab);
-            self.panes[pane].tabs.len() - 1
-        };
-        self.panes[pane].active = index;
+            self.panes[pane].insert_after_active(tab);
+        }
         self.sync_previews(window, cx);
         cx.notify();
     }
@@ -2338,14 +2811,17 @@ impl DotDir {
         } else {
             None
         };
-        let index = if let Some(index) = existing {
+        if let Some(index) = existing {
             self.panes[pane].tabs[index].make_permanent();
-            index
+            self.panes[pane].active = index;
         } else {
-            self.panes[pane].tabs.push(Tab::new(content));
-            self.panes[pane].tabs.len() - 1
-        };
-        self.panes[pane].active = index;
+            let tab = if matches!(content, TabContent::Document(_)) {
+                Tab::with_id(self.id(), content)
+            } else {
+                Tab::new(content)
+            };
+            self.panes[pane].insert_after_active(tab);
+        }
         self.focus_pane(pane, window, cx);
     }
     pub fn open_document(
@@ -2356,19 +2832,49 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_document_into(pane, path, readonly, None, window, cx);
+        self.open_document_into(pane, path.into(), readonly, None, window, cx);
+    }
+    fn open_entry(
+        &mut self,
+        pane: usize,
+        entry: Entry,
+        external: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if entry.directory {
+            self.navigate(pane, entry.path, window, cx);
+        } else if let Some(path) = entry.path.local().filter(|path| is_zip(path)) {
+            self.navigate(
+                pane,
+                Archive::mount(path.canonicalize().unwrap_or_else(|_| path.into())),
+                window,
+                cx,
+            );
+        } else if let Some(path) = entry.path.local().filter(|_| external) {
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = open::that(path);
+            });
+        } else {
+            self.open_document_into(pane, entry.path, false, None, window, cx);
+        }
     }
     fn open_document_into(
         &mut self,
         pane: usize,
-        path: PathBuf,
+        path: Location,
         readonly: bool,
         tab: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = path.canonicalize().unwrap_or(path);
-        if readonly {
+        let path = match path {
+            Location::Local(path) => Location::Local(path.canonicalize().unwrap_or(path)),
+            archive => archive,
+        };
+        let readonly = readonly || path.local().is_none();
+        if readonly && let Some(local) = path.local() {
             let viewer = self
                 .extensions
                 .iter()
@@ -2377,7 +2883,7 @@ impl DotDir {
                 .filter_map(|v| {
                     MediaFilter::new(&v.patterns)
                         .ok()
-                        .filter(|f| f.matches(&path))
+                        .filter(|f| f.matches(local))
                         .map(|f| (v.priority, f))
                 })
                 .max_by_key(|(priority, _)| *priority);
@@ -2390,11 +2896,17 @@ impl DotDir {
                 let sort = self.directory(source).map(|d| d.sort).unwrap_or_default();
                 let source_directory = self
                     .directory(source)
-                    .filter(|d| d.path.canonicalize().ok().as_deref() == path.parent())
+                    .filter(|d| {
+                        d.path
+                            .local()
+                            .and_then(|p| p.canonicalize().ok())
+                            .as_deref()
+                            == local.parent()
+                    })
                     .map(|d| (d.id, d.path.clone()));
                 let view = cx.new(|cx| {
                     MediaViewer::new(
-                        path.clone(),
+                        local.to_path_buf(),
                         filter,
                         self.settings.show_hidden,
                         sort,
@@ -2407,19 +2919,33 @@ impl DotDir {
                     window,
                     move |this, view, event, window, cx| match event {
                         MediaEvent::AvailabilityChanged => cx.notify(),
-                        MediaEvent::Close => this.request_close_tab(pane, id, window, cx),
+                        MediaEvent::Close => {
+                            if let Some((pane, index)) = this.tab_position(id)
+                                && matches!(&this.panes[pane].tabs[index].content,
+                                    TabContent::Media { view: current, .. } if current == view)
+                            {
+                                this.request_close_tab(pane, id, window, cx);
+                            }
+                        }
                         MediaEvent::Changed => {
+                            let Some((pane, index)) = this.tab_position(id) else {
+                                return;
+                            };
+                            let target = &mut this.panes[pane].tabs[index];
+                            let TabContent::Media {
+                                path,
+                                view: current,
+                                ..
+                            } = &mut target.content
+                            else {
+                                return;
+                            };
+                            if current.entity_id() != view.entity_id() {
+                                return;
+                            }
                             let new_path = view.read(cx).path.clone();
-                            let following = this.panes[pane]
-                                .tabs
-                                .iter_mut()
-                                .find(|t| t.id() == id)
-                                .is_some_and(|target| {
-                                    if let TabContent::Media { path, .. } = &mut target.content {
-                                        *path = new_path.clone();
-                                    }
-                                    target.preview
-                                });
+                            *path = new_path.clone();
+                            let following = target.preview;
                             let (rows, columns) = this.layout(window);
                             let mut selected_path = None;
                             if (tab.is_none() || following)
@@ -2435,17 +2961,16 @@ impl DotDir {
                                 directory.ensure_visible(rows, columns);
                                 selected_path = Some(directory.entries[index].path.clone());
                             }
-                            if following
-                                && let Some(target) = this.panes[pane]
-                                    .tabs
-                                    .iter_mut()
-                                    .find(|target| target.id() == id)
-                            {
+                            if following {
                                 // Keep the source spelling (e.g. /tmp versus /private/tmp).
                                 // Decoder status changes must not restart the same preview.
-                                target.preview_path = selected_path.or(Some(new_path));
+                                this.panes[pane].tabs[index].preview_path =
+                                    selected_path.or(Some(new_path.into()));
                             }
-                            if this.active == pane && this.modal.is_none() {
+                            if this.active == pane
+                                && this.panes[pane].active == index
+                                && this.modal.is_none()
+                            {
                                 this.focus_pane(pane, window, cx);
                             }
                             cx.notify();
@@ -2456,7 +2981,7 @@ impl DotDir {
                     pane,
                     TabContent::Media {
                         id,
-                        path,
+                        path: local.to_path_buf(),
                         view,
                         _subscription: subscription,
                     },
@@ -2467,28 +2992,30 @@ impl DotDir {
                 return;
             }
         }
-        if readonly
-            && matches!(
-                path.extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
-            )
-        {
+        if readonly && path.local().is_some() && image_format(&path).is_some() {
             if tab.is_none() {
                 self.open_request[pane] += 1;
             }
             let id = self.id();
-            self.install_content(pane, TabContent::Image { id, path }, tab, window, cx);
+            self.install_content(
+                pane,
+                TabContent::Image {
+                    id,
+                    path,
+                    image: None,
+                },
+                tab,
+                window,
+                cx,
+            );
             return;
         }
         if let Some(doc) = self.documents.values_mut().find(|d| d.path == path) {
             let id = doc.id;
-            if !readonly {
+            if !readonly && std::str::from_utf8(&doc.saved).is_ok() {
                 doc.readonly = false;
             }
+            self.enable_language_server(id, cx);
             if tab.is_none() {
                 self.open_request[pane] += 1;
             }
@@ -2516,14 +3043,7 @@ impl DotDir {
             self.status = format!("Opening {}…", path.display());
         }
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Vec<u8>> {
-                if std::fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
-                    anyhow::bail!(
-                        "Files over 16 MiB require the streaming viewer (not yet ported)"
-                    );
-                }
-                Ok(std::fs::read(&path)?)
-            })();
+            let result = path.read_preview();
             let _ = tx.send(Message::Opened {
                 request,
                 pane,
@@ -2534,18 +3054,103 @@ impl DotDir {
             });
         });
     }
+    fn enable_language_server(&mut self, id: u64, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let Some(doc) = self
+            .documents
+            .get_mut(&id)
+            .filter(|doc| !doc.readonly && doc.lsp.is_none())
+        else {
+            return;
+        };
+        let Some(path) = doc.path.local().map(PathBuf::from) else {
+            return;
+        };
+        let Some(buffer) =
+            self.language_servers
+                .attach(id, &path, doc.input.read(cx).text().clone())
+        else {
+            return;
+        };
+        doc.lsp_status = Some(format!("Starting {}…", buffer.server_name()));
+        doc.lsp = Some(buffer.clone());
+        let provider = Rc::new(lsp::EditorProvider(buffer));
+        doc.input.update(cx, |state, _| {
+            let lsp = state.lsp_mut();
+            lsp.completion_provider = Some(provider.clone());
+            lsp.definition_provider = Some(provider);
+            lsp.show_document = Some(Rc::new(move |params, window, cx| {
+                let Some(destination) = lsp::uri_to_path(&params.uri) else {
+                    return false;
+                };
+                if path == destination {
+                    return false;
+                }
+                let target = params.selection.map(|range| range.start);
+                let weak = weak.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        let pane = this.active;
+                        if this.active_document() != Some(id) {
+                            return;
+                        }
+                        this.open_source_location(pane, destination, target, window, cx);
+                    });
+                });
+                true
+            }));
+        });
+    }
+
+    pub(crate) fn open_source_location(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        position: Option<lsp_types::Position>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.open_document(pane, path.clone(), false, window, cx);
+        if let Some(position) = position {
+            let selected = &self.panes[pane].tabs[self.panes[pane].active];
+            if let TabContent::Document(id) = selected.content
+                && self.documents[&id].path.local() == Some(path.as_path())
+            {
+                self.reveal_source_position(id, position, window, cx);
+            } else {
+                self.source_jump[pane] = Some((self.open_request[pane], position));
+            }
+        }
+    }
+
+    fn reveal_source_position(
+        &self,
+        id: u64,
+        position: lsp_types::Position,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.documents.get(&id) {
+            doc.input.update(cx, |editor, cx| {
+                let position = lsp::editor_position(editor.text(), position);
+                editor.set_cursor_position(position, window, cx);
+            });
+        }
+    }
+
     pub fn save(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(d) = self.documents.get_mut(&id) {
             if d.readonly || d.saving {
                 return;
             }
+            let Some(path) = d.path.local().map(PathBuf::from) else {
+                return;
+            };
             d.saving = true;
             d.error = None;
-            let (path, expected, text) = (
-                d.path.clone(),
-                d.saved.clone(),
-                d.input.read(cx).value().to_string(),
-            );
+            let (path, expected, text) =
+                (path, d.saved.clone(), d.input.read(cx).value().to_string());
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let result = save_document(&path, &expected, &text);
@@ -2593,7 +3198,7 @@ impl DotDir {
     }
     pub fn close_tab(&mut self, pane: usize, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.open_request[pane] += 1;
-        let cwd = self.cwd(pane);
+        let fallback = Location::from(self.cwd(pane));
         let p = &mut self.panes[pane];
         if let Some(i) = p.tabs.iter().position(|t| t.id() == id) {
             if let TabContent::Directory(browser) = &p.tabs[i].content {
@@ -2604,27 +3209,25 @@ impl DotDir {
                 }
                 self.panel_scrolls.remove(&browser.id);
             }
-            p.tabs.remove(i);
-            if p.active > i {
-                p.active -= 1;
-            }
-            p.active = p.active.min(p.tabs.len().saturating_sub(1));
+            p.remove_tab(i);
         }
         self.release_unused_documents();
         if let Some(w) = &self.watcher {
             w.remove(&id.to_string());
         }
-        if self.panes[pane].tabs.is_empty() {
-            let id = self.id();
-            self.panes[pane]
-                .tabs
-                .push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
-                    id, cwd,
-                ))));
-            self.reload(id);
-        }
+        self.ensure_directory_tab(pane, fallback);
         self.focus_pane(pane, window, cx);
         self.persist();
+    }
+    fn ensure_directory_tab(&mut self, pane: usize, fallback: Location) {
+        if self.panes[pane].tabs.is_empty() {
+            let id = self.id();
+            let browser = DirectoryBrowser::new(id, fallback);
+            self.panes[pane]
+                .tabs
+                .push(Tab::new(TabContent::Directory(browser)));
+            self.reload(id);
+        }
     }
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.modal, Some(Modal::Conflict { .. })) {
@@ -2657,7 +3260,7 @@ impl DotDir {
                 .iter()
                 .filter_map(|t| {
                     if let TabContent::Directory(d) = &t.content {
-                        Some(d.current().path.clone())
+                        Some(SavedLocation::from(&d.current().path))
                     } else {
                         None
                     }
@@ -2686,8 +3289,20 @@ impl DotDir {
     }
 }
 
+fn image_format(path: &Location) -> Option<ImageFormat> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "webp" => Some(ImageFormat::Webp),
+        "bmp" => Some(ImageFormat::Bmp),
+        "ico" => Some(ImageFormat::Ico),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
-mod preview_tests {
+mod tab_tests {
     use super::{Pane, Tab, TabContent};
     use std::path::PathBuf;
 
@@ -2700,6 +3315,44 @@ mod preview_tests {
         tab.preview = true;
         tab.preview_source = Some(3);
         tab
+    }
+
+    #[test]
+    fn file_tabs_open_next_to_the_active_tab_and_close_back_to_it() {
+        let file = |id| Tab::new(TabContent::Document(id));
+        let mut pane = Pane {
+            tabs: vec![file(1), file(2), file(3)],
+            active: 1,
+        };
+        pane.insert_after_active(file(4));
+        assert_eq!(
+            pane.tabs.iter().map(Tab::id).collect::<Vec<_>>(),
+            [1, 2, 4, 3]
+        );
+        assert_eq!(pane.tabs[pane.active].id(), 4);
+        pane.remove_tab(pane.active);
+        assert_eq!(pane.tabs[pane.active].id(), 2);
+        pane.remove_tab(0);
+        assert_eq!(pane.tabs[pane.active].id(), 2);
+        pane.remove_tab(pane.active);
+        assert_eq!(pane.tabs[pane.active].id(), 3);
+    }
+
+    #[test]
+    fn drag_reorder_resolves_slots_on_both_sides_of_the_original_tab() {
+        let mut pane = Pane {
+            tabs: [1, 2, 3, 4]
+                .map(|id| Tab::new(TabContent::Document(id)))
+                .into(),
+            active: 1,
+        };
+        assert_eq!(pane.reorder_tab(1, 4), 3);
+        assert_eq!(pane.reorder_tab(3, 0), 0);
+        assert_eq!(pane.reorder_tab(0, 1), 0);
+        assert_eq!(
+            pane.tabs.iter().map(Tab::id).collect::<Vec<_>>(),
+            [2, 1, 3, 4]
+        );
     }
 
     #[test]
@@ -2746,12 +3399,27 @@ mod preview_tests {
         only_preview.remove_previews();
         assert!(only_preview.tabs.is_empty());
         assert_eq!(only_preview.active, 0);
+
+        let mut between_tabs = Pane {
+            tabs: vec![
+                Tab::new(TabContent::Document(11)),
+                preview(),
+                Tab::new(TabContent::Document(12)),
+            ],
+            active: 1,
+        };
+        between_tabs.remove_previews();
+        between_tabs.insert_after_active(Tab::new(TabContent::Document(13)));
+        assert_eq!(
+            between_tabs.tabs.iter().map(Tab::id).collect::<Vec<_>>(),
+            [11, 13, 12]
+        );
     }
 
     #[test]
     fn preview_tracks_only_its_source_and_preserves_identity_across_files() {
         let mut tab = preview();
-        let first = Some(PathBuf::from("/tmp/first.txt"));
+        let first = Some(PathBuf::from("/tmp/first.txt").into());
         assert!(tab.follows_changed_file(3, &first));
         assert!(!tab.follows_changed_file(4, &first));
         tab.begin_preview_load(first.clone(), 20);
@@ -2759,12 +3427,13 @@ mod preview_tests {
         assert!(tab.preview);
         assert_eq!(tab.id(), 10);
         assert!(!tab.follows_changed_file(3, &first));
-        let next = Some(PathBuf::from("/tmp/next.png"));
+        let next = Some(PathBuf::from("/tmp/next.png").into());
         assert!(tab.follows_changed_file(3, &next));
         tab.begin_preview_load(next.clone(), 21);
         tab.content = TabContent::Image {
             id: 31,
             path: next.unwrap(),
+            image: None,
         };
         assert_eq!(tab.id(), 10);
         assert!(tab.preview);
@@ -2778,17 +3447,17 @@ mod preview_tests {
     #[test]
     fn keeping_a_pending_preview_freezes_its_file_without_cancelling_its_load() {
         let mut firm = preview();
-        let file = Some(PathBuf::from("/tmp/first.txt"));
+        let file = Some(PathBuf::from("/tmp/first.txt").into());
         firm.begin_preview_load(file.clone(), 20);
         firm.make_permanent();
         assert!(!firm.preview);
         assert_eq!(firm.preview_source, None);
         assert_eq!(firm.preview_path, file);
         assert!(firm.accepts_load(20));
-        assert!(!firm.follows_changed_file(3, &Some(PathBuf::from("/tmp/next.txt"))));
+        assert!(!firm.follows_changed_file(3, &Some(PathBuf::from("/tmp/next.txt").into())));
         // A new preview has independent request state; it cannot cancel the firm tab.
         let mut next = preview();
-        next.begin_preview_load(Some(PathBuf::from("/tmp/next.txt")), 21);
+        next.begin_preview_load(Some(PathBuf::from("/tmp/next.txt").into()), 21);
         assert!(firm.accepts_load(20));
         assert!(!firm.accepts_load(21));
         assert!(next.preview);
