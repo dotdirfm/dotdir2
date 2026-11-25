@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone)]
@@ -240,6 +241,26 @@ impl PanelLayout {
     }
 }
 
+const ICON_SCROLL_DURATION: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Clone, Copy)]
+struct IconScroll {
+    from: f32,
+    target: f32,
+    started: Instant,
+    rows: usize,
+    columns: usize,
+}
+
+impl IconScroll {
+    fn position(self, now: Instant) -> f32 {
+        let progress = (now.duration_since(self.started).as_secs_f32()
+            / ICON_SCROLL_DURATION.as_secs_f32())
+        .min(1.);
+        self.target + (self.from - self.target) * (1. - progress).powi(3)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub id: u64,
@@ -249,6 +270,7 @@ pub struct Directory {
     pub cursor: usize,
     pub top: usize,
     wheel_remainder: f32,
+    icon_scroll: Option<IconScroll>,
     pub marked: HashSet<PathBuf>,
     pub generation: u64,
     pub loading: bool,
@@ -268,6 +290,7 @@ impl Directory {
             cursor: 0,
             top: 0,
             wheel_remainder: 0.,
+            icon_scroll: None,
             marked: HashSet::new(),
             generation: 0,
             loading: false,
@@ -338,6 +361,7 @@ impl Directory {
         self.cursor = 0;
         self.top = 0;
         self.wheel_remainder = 0.;
+        self.icon_scroll = None;
         self.marked.clear();
         self.entries = Arc::new(vec![]);
     }
@@ -351,6 +375,42 @@ impl Directory {
             .saturating_add_signed(delta)
             .min(self.entries.len().saturating_sub(1));
         self.ensure_visible(rows, columns);
+    }
+    pub fn icon_scroll_position(
+        &mut self,
+        layout: PanelLayout,
+        reduce_motion: bool,
+        now: Instant,
+    ) -> (f32, bool) {
+        let target = (self.top / layout.columns) as f32;
+        let max = self
+            .entries
+            .len()
+            .div_ceil(layout.columns)
+            .saturating_sub(layout.rows) as f32;
+        let previous = self.icon_scroll.filter(|scroll| {
+            !reduce_motion
+                && scroll.rows == layout.rows
+                && scroll.columns == layout.columns
+                && scroll.target <= max
+        });
+        let scroll = if let Some(previous) = previous.filter(|scroll| scroll.target == target) {
+            previous
+        } else {
+            IconScroll {
+                from: previous.map_or(target, |scroll| scroll.position(now)),
+                target,
+                started: now,
+                rows: layout.rows,
+                columns: layout.columns,
+            }
+        };
+        self.icon_scroll = Some(scroll);
+        let position = scroll.position(now);
+        (position, position != target)
+    }
+    pub fn reset_icon_scroll(&mut self) {
+        self.icon_scroll = None;
     }
     pub fn ensure_visible(&mut self, rows: usize, columns: usize) {
         let capacity = rows.max(1) * columns.max(1);
@@ -573,6 +633,43 @@ mod tests {
                 .collect(),
         );
         directory
+    }
+
+    #[test]
+    fn icon_scroll_retargets_between_rows_and_respects_reduce_motion() {
+        let mut directory = numbered_directory(100);
+        let layout = PanelLayout::new(Presentation::Icons, 360., 250.);
+        let now = Instant::now();
+        let halfway = now + ICON_SCROLL_DURATION / 2;
+        assert_eq!(
+            directory.icon_scroll_position(layout, false, now),
+            (0., false)
+        );
+        assert!(layout.scroll_pixels(&mut directory, layout.cell_height));
+        assert_eq!((directory.cursor, directory.top), (3, 3));
+        assert_eq!(
+            directory.icon_scroll_position(layout, false, now),
+            (0., true)
+        );
+        assert_eq!(
+            directory.icon_scroll_position(layout, false, halfway),
+            (0.875, true)
+        );
+        assert!(layout.scroll_pixels(&mut directory, layout.cell_height));
+        assert_eq!((directory.cursor, directory.top), (6, 6));
+        assert_eq!(
+            directory.icon_scroll_position(layout, false, halfway),
+            (0.875, true)
+        );
+        assert_eq!(
+            directory.icon_scroll_position(layout, false, halfway + ICON_SCROLL_DURATION),
+            (2., false)
+        );
+        assert!(layout.scroll_pixels(&mut directory, -layout.cell_height));
+        assert_eq!(
+            directory.icon_scroll_position(layout, true, halfway + ICON_SCROLL_DURATION),
+            (1., false)
+        );
     }
 
     #[test]

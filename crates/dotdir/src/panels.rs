@@ -194,25 +194,49 @@ impl DotDir {
     }
     fn panel_entries(
         &mut self,
-        pane: usize,
-        column: usize,
+        location: (usize, usize),
         mut directory: Directory,
         layout: PanelLayout,
         active: bool,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let (pane, column) = location;
         let p = self.palette;
         layout.ensure_visible(&mut directory);
-        if let Some(actual) = self.directory_by_id(directory.id) {
+        let scroll_position = if let Some(actual) = self.directory_by_id(directory.id) {
             actual.top = directory.top;
-        }
+            if layout.presentation == Presentation::Icons {
+                let (position, animating) = actual.icon_scroll_position(
+                    layout,
+                    cx.reduce_motion(),
+                    std::time::Instant::now(),
+                );
+                if animating {
+                    window.request_animation_frame();
+                }
+                position
+            } else {
+                0.
+            }
+        } else {
+            (directory.top / layout.columns) as f32
+        };
         let mut content = div().flex().flex_1().min_h_0().overflow_hidden();
         if layout.presentation == Presentation::Icons {
-            content = content.flex_col();
-            for row in 0..layout.rows {
+            let first_row = scroll_position.floor() as usize;
+            let fraction = scroll_position.fract();
+            let mut grid = div()
+                .absolute()
+                .top(px(-fraction * layout.cell_height))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_col();
+            for row in first_row..first_row + layout.rows + usize::from(fraction > 0.) {
                 let mut line = div().flex().h(px(layout.cell_height)).flex_shrink_0();
                 for col in 0..layout.columns {
-                    let index = directory.top + row * layout.columns + col;
+                    let index = row * layout.columns + col;
                     if index < directory.entries.len() {
                         line = line.child(self.panel_item(
                             (pane, column),
@@ -226,8 +250,18 @@ impl DotDir {
                         line = line.child(div().flex_1().min_w_0());
                     }
                 }
-                content = content.child(line);
+                grid = grid.child(line);
             }
+            content = content.flex_col().child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(layout.rows as f32 * layout.cell_height))
+                    .max_h_full()
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(grid),
+            );
         } else {
             for col in 0..layout.columns {
                 let mut line = div()
@@ -479,11 +513,11 @@ impl DotDir {
                                 })),
                         )
                         .child(self.panel_entries(
-                            pane,
-                            index,
+                            (pane, index),
                             directory.clone(),
                             layout,
                             active && browser.active == index,
+                            window,
                             cx,
                         )),
                 );
@@ -544,8 +578,15 @@ impl DotDir {
                 }
                 list = list.child(header);
             }
-            list.child(self.panel_entries(pane, browser.active, d.clone(), layout, active, cx))
-                .into_any_element()
+            list.child(self.panel_entries(
+                (pane, browser.active),
+                d.clone(),
+                layout,
+                active,
+                window,
+                cx,
+            ))
+            .into_any_element()
         };
         let count = d
             .entries

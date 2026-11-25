@@ -1684,6 +1684,11 @@ impl DotDir {
         cx: &mut Context<Self>,
     ) {
         let mut modes = [self.settings.presentation(0), self.settings.presentation(1)];
+        if modes[pane] != presentation
+            && let Some(directory) = self.directory_mut(pane)
+        {
+            directory.reset_icon_scroll();
+        }
         modes[pane] = presentation;
         self.settings.presentations = Some(modes);
         let old_ids = self
@@ -1878,6 +1883,7 @@ impl DotDir {
             }
             "first" | "last" => {
                 if let Some(d) = self.directory_mut(self.active) {
+                    d.reset_icon_scroll();
                     d.cursor = if id == "first" {
                         0
                     } else {
