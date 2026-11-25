@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/dotdir", "crates/dotdir-core", "crates/dotdir-extension-host"]
+default-members = ["crates/dotdir"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+

@@ -1,0 +1,7 @@
+{
+  "id": "dotdir.image-viewer",
+  "name": "Image & Video Viewer",
+  "version": "0.1.0",
+  "api_version": 1,
+  "main": "main.js"
+}

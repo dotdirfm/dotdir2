@@ -1,0 +1,24 @@
+package dotdir:panels@0.1.0;
+
+// Draft WASM transport for the same semantic panel tree used by QuickJS.
+// There is deliberately no dependency on GPUI's Rust types or memory layout.
+interface host {
+    api-version: func() -> u32;
+    record size { width: u32, height: u32, scale: f32 }
+    record context { json: string }
+}
+
+interface panel {
+    use host.{size, context};
+    record action { id: string, data-json: string }
+    variant event { activate, resize(size), action(action), close }
+    // Returned JSON follows dotdir-extension-host::PanelNode.
+    // The host validates size, depth and resource budgets before rendering.
+    open: func(context: context) -> result<string, string>;
+    handle-event: func(context: context, event: event) -> result<string, string>;
+}
+
+world panel-extension {
+    import host;
+    export panel;
+}
