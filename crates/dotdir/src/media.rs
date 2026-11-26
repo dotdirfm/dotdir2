@@ -1,9 +1,11 @@
 use crate::{
+    archive::{Location, PREVIEW_LIMIT, VirtualFile},
     commands::MediaState,
+    filesystems::Filesystems,
     media_native::NativeMedia,
-    model::{SortOrder, read_directory},
+    model::{SortOrder, read_location},
 };
-use dotdir_core::watch::FsWatcher;
+use dotdir_core::{copy::CancelToken, watch::FsWatcher};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -36,23 +38,34 @@ impl MediaFilter {
     }
     fn gallery(
         &self,
-        parent: &Path,
+        parent: &Location,
+        filesystems: &Filesystems,
         hidden: bool,
         sort: SortOrder,
-    ) -> anyhow::Result<Vec<PathBuf>> {
-        Ok(read_directory(parent, hidden, sort)?
+    ) -> anyhow::Result<Vec<Location>> {
+        Ok(read_location(parent, filesystems, hidden, sort)?
             .into_iter()
-            .filter(|entry| !entry.directory)
-            .filter_map(|entry| {
-                entry
-                    .path
-                    .local()
-                    .filter(|path| self.matches(path))
-                    .map(PathBuf::from)
-            })
+            .filter(|entry| !entry.directory && (!entry.symlink || entry.path.local().is_some()))
+            .map(|entry| entry.path)
+            .filter(|path| self.matches(path.name_path()))
             .collect())
     }
 }
+
+pub fn image_format(path: &Location) -> Option<ImageFormat> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "webp" => Some(ImageFormat::Webp),
+        "bmp" => Some(ImageFormat::Bmp),
+        "ico" => Some(ImageFormat::Ico),
+        "svg" => Some(ImageFormat::Svg),
+        "tif" | "tiff" => Some(ImageFormat::Tiff),
+        _ => None,
+    }
+}
+
 pub fn is_video(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -66,15 +79,15 @@ pub fn is_video(path: &Path) -> bool {
 
 #[derive(Default)]
 struct Gallery {
-    paths: Vec<PathBuf>,
+    paths: Vec<Location>,
     index: Option<usize>,
 }
 impl Gallery {
-    fn update(&mut self, paths: Vec<PathBuf>, current: &Path) {
+    fn update(&mut self, paths: Vec<Location>, current: &Location) {
         self.index = paths.iter().position(|p| p == current);
         self.paths = paths;
     }
-    fn neighbor(&self, delta: isize) -> Option<PathBuf> {
+    fn neighbor(&self, delta: isize) -> Option<Location> {
         let next = match self.index {
             Some(i) => i.checked_add_signed(delta)?,
             None if delta > 0 => 0,
@@ -96,13 +109,21 @@ pub enum MediaEvent {
     Close,
 }
 enum Backend {
-    Image,
+    Loading,
+    Image(ImageSource),
     Native(NativeMedia),
     Error(String),
 }
 
+enum MediaData {
+    Image(Arc<Image>),
+    Avif(Vec<u8>),
+    Video(VirtualFile, String),
+}
+
 pub struct MediaViewer {
-    pub path: PathBuf,
+    pub path: Location,
+    filesystems: Filesystems,
     filter: MediaFilter,
     gallery: Gallery,
     hidden: bool,
@@ -113,10 +134,12 @@ pub struct MediaViewer {
     generation: u64,
     image_epoch: usize,
     status: String,
-    watched_path: Arc<Mutex<PathBuf>>,
+    watched_path: Arc<Mutex<Option<PathBuf>>>,
     _watcher: Option<FsWatcher>,
     watch_task: Option<Task<()>>,
     gallery_task: Option<Task<()>>,
+    file_task: Option<Task<()>>,
+    file_cancel: CancelToken,
     video_task: Option<Task<()>>,
 }
 impl EventEmitter<MediaEvent> for MediaViewer {}
@@ -130,14 +153,15 @@ impl Focusable for MediaViewer {
 }
 impl MediaViewer {
     pub fn new(
-        path: PathBuf,
+        path: Location,
+        filesystems: Filesystems,
         filter: MediaFilter,
         hidden: bool,
         sort: SortOrder,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let watched_path = Arc::new(Mutex::new(path.clone()));
+        let watched_path = Arc::new(Mutex::new(path.host_path().map(Path::to_path_buf)));
         let changed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::bounded(1);
         let (watch_path, current_changed) = (watched_path.clone(), changed.clone());
@@ -146,7 +170,8 @@ impl MediaViewer {
                 watch_path
                     .lock()
                     .unwrap()
-                    .file_name()
+                    .as_deref()
+                    .and_then(Path::file_name)
                     .is_some_and(|n| n == name)
             }) {
                 current_changed.store(true, Ordering::Relaxed);
@@ -154,16 +179,17 @@ impl MediaViewer {
             let _ = tx.try_send(());
         }))
         .ok();
-        if let (Some(watcher), Some(parent)) = (&watcher, path.parent()) {
+        if let (Some(watcher), Some(parent)) = (&watcher, path.host_path().and_then(Path::parent)) {
             watcher.add("media", &parent.to_string_lossy());
         }
         let mut this = Self {
             path,
+            filesystems,
             filter,
             hidden,
             sort,
             focus: cx.focus_handle(),
-            backend: Backend::Image,
+            backend: Backend::Loading,
             gallery: Gallery::default(),
             visible: true,
             generation: 0,
@@ -173,6 +199,8 @@ impl MediaViewer {
             _watcher: watcher,
             watch_task: None,
             gallery_task: None,
+            file_task: None,
+            file_cancel: CancelToken::new(),
             video_task: None,
         };
         this.watch_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -207,11 +235,14 @@ impl MediaViewer {
         self.generation += 1;
         let generation = self.generation;
         let filter = self.filter.clone();
-        let parent = self.path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let filesystems = self.filesystems.clone();
         let (hidden, sort) = (self.hidden, self.sort);
         let read = cx
             .background_executor()
-            .spawn(async move { filter.gallery(&parent, hidden, sort) });
+            .spawn(async move { filter.gallery(&parent, &filesystems, hidden, sort) });
         self.gallery_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = read.await;
             let _ = this.update_in(cx, |this, _, cx| {
@@ -228,11 +259,15 @@ impl MediaViewer {
         }));
     }
     fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_cancel.cancel();
+        self.file_task = None;
         self.video_task = None;
         self.image_epoch = self.image_epoch.wrapping_add(1);
-        *self.watched_path.lock().unwrap() = self.path.clone();
-        ImageSource::from(self.path.clone()).remove_asset(cx);
-        let video = is_video(&self.path);
+        *self.watched_path.lock().unwrap() = self.path.host_path().map(Path::to_path_buf);
+        if let Backend::Image(source) = &self.backend {
+            source.remove_asset(cx);
+        }
+        let video = is_video(self.path.name_path());
         let avif = self
             .path
             .extension()
@@ -240,23 +275,99 @@ impl MediaViewer {
         self.status = if video {
             "Loading video…"
         } else {
-            "Image · ← / → to navigate"
+            "Loading image…"
         }
         .into();
-        self.backend = if video || avif {
-            match NativeMedia::new(&self.path, video, window, cx) {
-                Ok(mut native) => {
-                    native.set_visible(self.visible);
-                    Backend::Native(native)
-                }
-                Err(e) => {
-                    self.status = "Media unavailable".into();
-                    Backend::Error(e.to_string())
+        self.backend = Backend::Loading;
+
+        if let Some(local) = self.path.local() {
+            if video || avif {
+                let native = NativeMedia::new(local, video, window, cx);
+                self.set_native(native, video, window, cx);
+            } else {
+                self.set_image(ImageSource::from(local.to_path_buf()));
+            }
+            cx.notify();
+            return;
+        }
+
+        let path = self.path.clone();
+        let filesystems = self.filesystems.clone();
+        self.file_cancel = CancelToken::new();
+        let cancel = self.file_cancel.clone();
+        let read = cx.background_executor().spawn(async move {
+            if video {
+                let extension = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or_default();
+                let file = path.open_seekable(&filesystems, &cancel)?;
+                Ok(MediaData::Video(file, extension.to_ascii_lowercase()))
+            } else {
+                let bytes = path.read_limited(&filesystems, PREVIEW_LIMIT, &cancel)?;
+                if avif {
+                    Ok(MediaData::Avif(bytes))
+                } else {
+                    let format = image_format(&path)
+                        .ok_or_else(|| anyhow::anyhow!("Unsupported image format"))?;
+                    Ok(MediaData::Image(Arc::new(Image::from_bytes(format, bytes))))
                 }
             }
-        } else {
-            Backend::Image
-        };
+        });
+        self.file_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<MediaData> = read.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let was_focused = this.focus.contains_focused(window, cx);
+                match result {
+                    Ok(MediaData::Image(image)) => this.set_image(ImageSource::from(image)),
+                    Ok(MediaData::Avif(bytes)) => {
+                        let native = NativeMedia::from_image(bytes, window, cx);
+                        this.set_native(native, false, window, cx);
+                    }
+                    Ok(MediaData::Video(file, extension)) => {
+                        let native = NativeMedia::from_video(file, &extension, window, cx);
+                        this.set_native(native, true, window, cx);
+                    }
+                    Err(error) => this.set_error(format!("{error:#}")),
+                }
+                if was_focused && matches!(this.backend, Backend::Native(_)) {
+                    cx.emit(MediaEvent::Changed);
+                } else {
+                    cx.emit(MediaEvent::AvailabilityChanged);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn set_image(&mut self, source: ImageSource) {
+        self.backend = Backend::Image(source);
+        self.status = "Image · ← / → to navigate".into();
+    }
+
+    fn set_error(&mut self, message: String) {
+        self.backend = Backend::Error(message);
+        self.status = "Media unavailable".into();
+    }
+
+    fn set_native(
+        &mut self,
+        native: anyhow::Result<NativeMedia>,
+        video: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match native {
+            Ok(mut native) => {
+                native.set_visible(self.visible);
+                self.backend = Backend::Native(native);
+                if !video {
+                    self.status = "Image · ← / → to navigate".into();
+                }
+            }
+            Err(error) => self.set_error(format!("{error:#}")),
+        }
         if video && matches!(self.backend, Backend::Native(_)) {
             self.video_task = Some(cx.spawn_in(window, async move |this, cx| {
                 let started = Instant::now();
@@ -277,15 +388,13 @@ impl MediaViewer {
                                 false
                             }
                             Some(Err(e)) => {
-                                this.status = "Video unavailable · try Open externally".into();
-                                this.backend = Backend::Error(format!("Cannot play this video: {e}"));
+                                this.set_error(format!("Cannot play this video: {e}"));
                                 cx.emit(MediaEvent::Changed);
                                 cx.notify();
                                 false
                             }
                             None if started.elapsed() > Duration::from_secs(20) => {
-                                this.status = "Video unavailable · try Open externally".into();
-                                this.backend = Backend::Error("The video could not be loaded. Its format or codec may not be supported by macOS.".into());
+                                this.set_error("The video could not be loaded. Its format or codec may not be supported by macOS.".into());
                                 cx.emit(MediaEvent::Changed);
                                 cx.notify();
                                 false
@@ -309,7 +418,7 @@ impl MediaViewer {
     }
     pub fn command_state(&self) -> MediaState {
         MediaState {
-            playable_video: is_video(&self.path)
+            playable_video: is_video(self.path.name_path())
                 && matches!(&self.backend, Backend::Native(n) if matches!(n.playback_status(), Some(Ok(())))),
             previous: self.gallery.neighbor(-1).is_some(),
             next: self.gallery.neighbor(1).is_some(),
@@ -376,10 +485,17 @@ impl MediaViewer {
             .into_any_element()
     }
 }
+impl Drop for MediaViewer {
+    fn drop(&mut self) {
+        self.file_cancel.cancel();
+    }
+}
+
 impl Render for MediaViewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.backend {
-            Backend::Image => img(self.path.clone())
+            Backend::Loading => div().child(self.status.clone()).into_any_element(),
+            Backend::Image(source) => img(source.clone())
                 .id(("media-image", self.image_epoch))
                 .max_w_full()
                 .max_h_full()
@@ -388,7 +504,7 @@ impl Render for MediaViewer {
                     div()
                         .p(px(24.))
                         .text_color(rgb(0xffffff))
-                        .child("This image could not be decoded. Try Open externally.")
+                        .child("This image could not be decoded.")
                         .into_any_element()
                 })
                 .into_any_element(),
@@ -399,7 +515,7 @@ impl Render for MediaViewer {
                 .child(error.clone())
                 .into_any_element(),
         };
-        let path = self.path.clone();
+        let local = self.path.local().map(Path::to_path_buf);
         div()
             .size_full()
             .flex()
@@ -417,7 +533,7 @@ impl Render for MediaViewer {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .child(self.path.display().to_string()),
+                    .child(self.path.display()),
             )
             .child(
                 div()
@@ -430,7 +546,7 @@ impl Render for MediaViewer {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgb(if is_video(&self.path) {
+                    .bg(rgb(if is_video(self.path.name_path()) {
                         0x000000
                     } else {
                         0x1a1a1a
@@ -466,20 +582,22 @@ impl Render for MediaViewer {
                     .text_size(px(11.))
                     .gap(px(12.))
                     .child(div().flex_1().overflow_hidden().child(self.status.clone()))
-                    .child(
-                        div()
-                            .id("media-external")
-                            .role(Role::Button)
-                            .aria_label("Open externally")
-                            .cursor_pointer()
-                            .child("Open externally")
-                            .on_click(cx.listener(move |_, _, _, _| {
-                                let path = path.clone();
-                                std::thread::spawn(move || {
-                                    let _ = open::that(path);
-                                });
-                            })),
-                    ),
+                    .when_some(local, |status, path| {
+                        status.child(
+                            div()
+                                .id("media-external")
+                                .role(Role::Button)
+                                .aria_label("Open externally")
+                                .cursor_pointer()
+                                .child("Open externally")
+                                .on_click(cx.listener(move |_, _, _, _| {
+                                    let path = path.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = open::that(path);
+                                    });
+                                })),
+                        )
+                    }),
             )
     }
 }
@@ -487,7 +605,7 @@ impl Render for MediaViewer {
 #[cfg(test)]
 mod tests {
     use super::{Gallery, MediaFilter, is_video};
-    use crate::model::SortOrder;
+    use crate::{archive::Location, filesystems::Filesystems, model::SortOrder};
     use std::path::PathBuf;
     #[test]
     fn gallery_filters_formats_and_preserves_directory_sort() {
@@ -497,7 +615,14 @@ mod tests {
         }
         std::fs::create_dir(temp.path().join("folder.png")).unwrap();
         let filter = MediaFilter::new(&["*.png".into(), "*.svg".into(), "*.mp4".into()]).unwrap();
-        let paths = filter.gallery(temp.path(), false, SortOrder::Name).unwrap();
+        let paths = filter
+            .gallery(
+                &temp.path().into(),
+                &Filesystems::new(Default::default()),
+                false,
+                SortOrder::Name,
+            )
+            .unwrap();
         assert_eq!(
             paths
                 .iter()
@@ -505,13 +630,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a.svg", "b.MP4"]
         );
-        assert!(is_video(&paths[1]));
-        assert!(!is_video(&paths[0]));
+        assert!(is_video(paths[1].name_path()));
+        assert!(!is_video(paths[0].name_path()));
     }
     #[test]
     fn gallery_does_not_wrap_and_recovers_after_current_file_removed() {
-        let a = PathBuf::from("a.png");
-        let b = PathBuf::from("b.mp4");
+        let a = Location::from(PathBuf::from("a.png"));
+        let b = Location::from(PathBuf::from("b.mp4"));
         let mut g = Gallery::default();
         g.update(vec![a.clone(), b.clone()], &a);
         assert_eq!(g.counter(), "1 / 2");

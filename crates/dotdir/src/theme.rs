@@ -3,6 +3,7 @@ use gpui_kit::{App, Hsla, rgb};
 
 #[derive(Clone, Copy)]
 pub struct Palette {
+    pub mode: ThemeMode,
     pub bg: Hsla,
     pub fg: Hsla,
     pub secondary: Hsla,
@@ -11,8 +12,10 @@ pub struct Palette {
     pub accent: Hsla,
     pub accent_fg: Hsla,
     pub selected: Hsla,
+    pub selected_fg: Option<Hsla>,
     pub marked: Hsla,
     pub input: Hsla,
+    pub command_bg: Hsla,
     pub folder: Hsla,
     pub error: Hsla,
 }
@@ -47,6 +50,11 @@ impl Palette {
             error,
         ] = colors.map(|v| rgb(v).into());
         Self {
+            mode: if name == "light" {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            },
             bg,
             fg,
             secondary,
@@ -55,39 +63,38 @@ impl Palette {
             accent,
             accent_fg,
             selected,
+            selected_fg: None,
             marked,
             input,
+            command_bg: if name == "light" {
+                input
+            } else {
+                rgb(0x171b24).into()
+            },
             folder,
             error,
         }
     }
-    pub fn apply(self, name: &str, cx: &mut App) {
-        cx.set_window_appearance(Some(if name == "light" {
-            gpui_kit::WindowAppearance::Light
-        } else {
+    pub fn apply(self, cx: &mut App) {
+        cx.set_window_appearance(Some(if self.mode.is_dark() {
             gpui_kit::WindowAppearance::Dark
+        } else {
+            gpui_kit::WindowAppearance::Light
         }));
-        Theme::change(
-            if name == "light" {
-                ThemeMode::Light
-            } else {
-                ThemeMode::Dark
-            },
-            None,
-            cx,
-        );
-        let t = Theme::global_mut(cx);
-        t.font_family = ".AppleSystemUIFont".into();
-        t.colors.background = self.bg;
-        t.colors.foreground = self.fg;
-        t.colors.border = self.border;
-        t.colors.input = self.input;
-        t.colors.primary = self.accent;
-        t.colors.primary_foreground = self.accent_fg;
-        t.colors.accent = self.selected;
-        t.colors.accent_foreground = self.fg;
-        t.colors.muted = self.secondary;
-        t.colors.muted_foreground = self.muted;
-        t.colors.selection = self.selected;
+        Theme::change(self.mode, None, cx);
+        Theme::update(cx, |t| {
+            t.font_family = ".AppleSystemUIFont".into();
+            t.colors.background = self.bg;
+            t.colors.foreground = self.fg;
+            t.colors.border = self.border;
+            t.colors.input = self.input;
+            t.colors.primary = self.accent;
+            t.colors.primary_foreground = self.accent_fg;
+            t.colors.accent = self.selected;
+            t.colors.accent_foreground = self.fg;
+            t.colors.muted = self.secondary;
+            t.colors.muted_foreground = self.muted;
+            t.colors.selection = self.selected;
+        });
     }
 }

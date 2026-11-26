@@ -40,16 +40,25 @@ the file panes and application chrome are custom GPUI elements.
   or quitting checks dirty buffers. An external change detected before a save is
   rejected. The check and write are not an atomic filesystem compare-and-swap.
 - ZIP directory tabs use typed locations carrying an archive and a member path.
-  The app shares pane navigation and selection with local directories, and
-  preview reads work directly on archive entries. An indexed ZIP directory
-  reloads when the archive's metadata changes. Extraction streams entries into
-  temporary destination files and publishes them on success. It uses the copy
-  worker's cancellation, progress, and conflict dialog. Local write commands
-  are disabled for archive selections.
+  Each archive's source is itself a location, so an inner ZIP can be mounted and
+  restored without flattening its path. A seekable virtual file exposes stored
+  entries as bounded slices of the source and inflates compressed entries
+  into capped memory buffers when random access is required. Recent mounted
+  indexes and buffers are cached against local source metadata. Explicit
+  extraction streams entries into temporary destination files and publishes
+  them on success, using the copy worker's cancellation, progress, and conflict
+  dialog. Text saves copy unchanged ZIP entries as compressed data, rebuild
+  nested archives in memory, and atomically replace the outer local ZIP.
+  Concurrent edits to the saved entry are checked before rewriting.
 - TypeScript 7 and rust-analyzer run as background language servers per project
   root. The
   editor sends versioned incremental edits over stdio and converts between
   the server's UTF-16 positions and the editor's Unicode-scalar positions.
+  ZIP documents use a separate TypeScript 7 session for each mounted archive.
+  It translates editor requests to the SDK's native analysis API. File calls
+  read the archive through the VFS, with open editor buffers taking precedence.
+  A synthetic path namespace maps definitions back to archive locations without
+  creating a workspace on disk. Local projects continue to use the LSP host.
   TypeScript pull diagnostics are debounced and both servers' results are
   tied to buffer revisions. Server lifetimes follow open editor buffers.
   DotDir discovers the native executables from the installed extensions.
@@ -74,9 +83,11 @@ the file panes and application chrome are custom GPUI elements.
 - Each DotDir JavaScript extension has a QuickJS runtime on the extension worker.
   The application only receives serializable contributions and UI data.
 - Media viewer entities own their gallery snapshot, file watcher, GPUI image
-  source or native AVKit player. Directory enumeration runs in the background;
-  generation checks reject stale snapshots. Native players pause when hidden or
-  dropped, and are never passed to QuickJS.
+  source or native AVKit player. The gallery uses the same virtual directory
+  listing as the file panels. Virtual images decode from bytes and the AVKit
+  player requests ranges from a seekable virtual file through AVFoundation's
+  resource loader. Directory enumeration and virtual reads run in the
+  background. Native players pause when hidden or dropped, and stay in Rust.
 
 ## Extension API v1
 
@@ -208,7 +219,7 @@ website/demo, account/marketplace integration, full FSS styling language, extern
 WASM filesystem-provider loading and specialized PDF and SQLite surfaces are
 separate remaining porting work. Image/video viewing has a native renderer.
 Video and AVIF currently use macOS APIs. ZIP entry previews cover text, images,
-and hex. Language-server integration covers document sync, diagnostics, completion,
+video, and hex. Language-server integration covers document sync, diagnostics, completion,
 hover, and definition. VS Code workbench features such as task providers,
 debugging, and webviews are separate work.
 

@@ -1,5 +1,6 @@
 mod app;
 mod archive;
+mod archive_typescript;
 mod column_scroll;
 mod commands;
 mod extension_logs;
@@ -7,9 +8,11 @@ mod filesystems;
 mod hover;
 mod icon_theme;
 mod lsp;
+mod marketplace;
 mod media;
 mod media_native;
 mod model;
+mod open_vsx;
 mod operations;
 mod panel_menu;
 mod panels;
@@ -19,6 +22,7 @@ mod theme;
 mod ui;
 mod vscode;
 mod vscode_nls;
+mod vscode_theme;
 
 use gpui_kit::*;
 fn main() {

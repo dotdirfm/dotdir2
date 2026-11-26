@@ -269,7 +269,10 @@ impl DotDir {
         let target = self.hover.target.as_ref()?;
         let editor = self.hover_editor_for_target(target)?.read(cx);
         let trigger = editor.range_to_bounds(&target.symbol)?;
-        let source = self.documents[&target.document].path.local()?.to_path_buf();
+        let source = self.documents[&target.document]
+            .path
+            .local()
+            .map(Path::to_path_buf);
         let view = cx.weak_entity();
         let origin = target.clone();
         let content = if hint.markdown {
@@ -287,7 +290,10 @@ impl DotDir {
                 .code_block_actions(|_, _, _| div().size_0())
                 .selectable(true)
                 .on_link_click(move |href, _, window, cx| {
-                    let Some(link) = hover_link(&source, href.as_ref()) else {
+                    let Some(link) = source
+                        .as_deref()
+                        .and_then(|source| hover_link(source, href.as_ref()))
+                    else {
                         return;
                     };
                     let view = view.clone();

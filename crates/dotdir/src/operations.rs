@@ -1,4 +1,4 @@
-use crate::archive::Archive;
+use crate::{archive::Archive, filesystems::Filesystems};
 use dotdir_core::{
     copy::{self, CancelToken, ConflictResolution, CopyEvent, CopyOptions},
     move_op::{self, MoveOptions},
@@ -103,12 +103,14 @@ impl Operation {
         members: Vec<PathBuf>,
         destination: PathBuf,
         options: CopyOptions,
+        filesystems: Filesystems,
     ) -> Self {
         Self::spawn(id, OperationKind::Extract, move |cancel, emit, conflict| {
             archive.extract(
                 members,
                 &destination,
                 options.conflict_policy,
+                &filesystems,
                 cancel,
                 emit,
                 conflict,

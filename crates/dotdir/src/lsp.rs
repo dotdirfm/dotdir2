@@ -1,5 +1,8 @@
 use crate::{
+    archive::Location,
+    archive_typescript::{self, OpenFiles, Workspace},
     extension_logs::{ExtensionLogs, LogSource},
+    filesystems::Filesystems,
     vscode,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -101,6 +104,8 @@ pub struct LanguageServers {
     config: PathBuf,
     logs: ExtensionLogs,
     sessions: HashMap<(String, Project), Weak<Connection>>,
+    archive_sessions: HashMap<Location, Weak<Connection>>,
+    archive_files: OpenFiles,
     next_session: u64,
     notify: Notify,
 }
@@ -115,6 +120,8 @@ impl LanguageServers {
             config,
             logs,
             sessions: HashMap::new(),
+            archive_sessions: HashMap::new(),
+            archive_files: OpenFiles::default(),
             next_session: 0,
             notify: Arc::new(notify),
         }
@@ -122,6 +129,90 @@ impl LanguageServers {
 
     pub fn forget_extension_sessions(&mut self) {
         self.sessions.clear();
+        self.archive_sessions.clear();
+    }
+
+    pub fn archive_text(&mut self, path: &Location, text: Option<Rope>) {
+        let Some(root) = path.archive_root() else {
+            return;
+        };
+        let mut files = self.archive_files.write().unwrap();
+        let changed = match text {
+            Some(text) => {
+                files.insert(path.clone(), text);
+                true
+            }
+            None => files.remove(path).is_some(),
+        };
+        drop(files);
+        if changed
+            && let Some(connection) = self.archive_sessions.get(&root).and_then(Weak::upgrade)
+            && let Some(file) = connection
+                .archive
+                .as_ref()
+                .and_then(|workspace| workspace.file_path(path))
+        {
+            let _ = connection.send(Event::ArchiveChanged(file));
+        }
+    }
+
+    pub fn attach_archive(
+        &mut self,
+        id: u64,
+        path: &Location,
+        text: Rope,
+        extension: &vscode::Extension,
+        language: &str,
+        settings: &vscode::Settings,
+        filesystems: Filesystems,
+    ) -> Result<Rc<Buffer>> {
+        let root = path.archive_root().context("Expected a ZIP member")?;
+        self.archive_sessions
+            .retain(|_, weak| weak.strong_count() > 0);
+        self.archive_files
+            .write()
+            .unwrap()
+            .insert(path.clone(), text.clone());
+        let connection = if let Some(active) = self
+            .archive_sessions
+            .get(&root)
+            .and_then(Weak::upgrade)
+            .filter(|connection| connection.running.load(Ordering::Relaxed))
+        {
+            active
+        } else {
+            self.next_session += 1;
+            let workspace = Arc::new(Workspace::new(
+                root.clone(),
+                &self.config,
+                self.next_session,
+                filesystems,
+                self.archive_files.clone(),
+            )?);
+            let project = Project {
+                root: workspace.root.clone(),
+                detached: None,
+            };
+            let connection = Connection::start(
+                self.next_session,
+                extension.id.clone(),
+                archive_typescript::launch(extension, settings),
+                project,
+                Some(workspace),
+                self.logs.clone(),
+                self.notify.clone(),
+            );
+            self.archive_sessions
+                .insert(root, Arc::downgrade(&connection));
+            connection
+        };
+        let file = connection
+            .archive
+            .as_ref()
+            .and_then(|workspace| workspace.file_path(path))
+            .and_then(|path| file_uri(&path))
+            .context("Invalid archive document URI")?;
+        Buffer::open(id, file, text, language, connection)
     }
 
     pub fn attach_extension(
@@ -152,27 +243,14 @@ impl LanguageServers {
                 key.0.clone(),
                 launch,
                 key.1.clone(),
+                None,
                 self.logs.clone(),
                 self.notify.clone(),
             );
             self.sessions.insert(key, Arc::downgrade(&connection));
             connection
         };
-        connection
-            .send(Event::Open {
-                id,
-                uri: uri.clone(),
-                language: language.into(),
-                text: text.clone(),
-            })
-            .ok()?;
-        Some(Rc::new(Buffer {
-            id,
-            uri,
-            connection,
-            text: RefCell::new(text),
-            revision: Cell::new(1),
-        }))
+        Buffer::open(id, uri, text, language, connection).ok()
     }
 }
 
@@ -193,6 +271,38 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    fn open(
+        id: u64,
+        uri: String,
+        text: Rope,
+        language: &str,
+        connection: Arc<Connection>,
+    ) -> Result<Rc<Self>> {
+        connection.send(Event::Open {
+            id,
+            uri: uri.clone(),
+            language: language.into(),
+            text: text.clone(),
+        })?;
+        Ok(Rc::new(Self {
+            id,
+            uri,
+            connection,
+            text: RefCell::new(text),
+            revision: Cell::new(1),
+        }))
+    }
+
+    pub fn source_location(&self, uri: &lsp_types::Uri) -> Option<Location> {
+        let path = uri_to_path(uri)?;
+        if let Some(workspace) = &self.connection.archive
+            && path.starts_with(&workspace.root)
+        {
+            return workspace.location(&path);
+        }
+        Some(path.into())
+    }
+
     pub fn session(&self) -> u64 {
         self.connection.id
     }
@@ -497,6 +607,7 @@ struct Connection {
     events: mpsc::Sender<Event>,
     running: Arc<AtomicBool>,
     commands: Arc<RwLock<HashSet<String>>>,
+    archive: Option<Arc<Workspace>>,
 }
 
 impl Connection {
@@ -505,6 +616,7 @@ impl Connection {
         extension: String,
         launch: Launch,
         project: Project,
+        archive: Option<Arc<Workspace>>,
         logs: ExtensionLogs,
         notify: Notify,
     ) -> Arc<Self> {
@@ -519,6 +631,7 @@ impl Connection {
             events: events.clone(),
             running: running.clone(),
             commands: commands.clone(),
+            archive: archive.clone(),
         });
         std::thread::spawn(move || {
             log.append(&format!("Starting in {}", project.root.display()));
@@ -532,6 +645,7 @@ impl Connection {
                         receiver,
                         log.clone(),
                         commands,
+                        archive,
                     )
                 })
                 .and_then(|mut server| server.run(&project, launch.options, &notify));
@@ -565,6 +679,7 @@ impl Drop for Connection {
 type Reply = async_channel::Sender<Result<Value>>;
 
 enum Event {
+    ArchiveChanged(PathBuf),
     Open {
         id: u64,
         uri: String,
@@ -623,6 +738,7 @@ struct Server {
     log: LogSource,
     commands: Arc<RwLock<HashSet<String>>>,
     quick_pick: Option<PendingQuickPick>,
+    archive: Option<Arc<Workspace>>,
 }
 
 impl Drop for Server {
@@ -643,10 +759,13 @@ impl Server {
         receiver: mpsc::Receiver<Event>,
         log: LogSource,
         commands: Arc<RwLock<HashSet<String>>>,
+        archive: Option<Arc<Workspace>>,
     ) -> Result<Self> {
         let program = command.get_program().to_os_string();
+        if archive.is_none() {
+            command.current_dir(root);
+        }
         let mut child = command
-            .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -695,6 +814,7 @@ impl Server {
             log,
             commands,
             quick_pick: None,
+            archive,
         })
     }
 
@@ -793,6 +913,9 @@ impl Server {
 
     fn handle_event(&mut self, event: Event, notify: &Notify) -> Result<()> {
         match event {
+            Event::ArchiveChanged(path) => {
+                self.notify("dotdir/archiveChanged", json!({"uri": file_uri(&path)}))?;
+            }
             Event::Open {
                 id,
                 uri,
@@ -958,6 +1081,15 @@ impl Server {
     fn handle_message(&mut self, message: Value, notify: &Notify) -> Result<()> {
         if let Some(method) = message["method"].as_str() {
             match method {
+                "dotdir/archiveFile" if !message["id"].is_null() => {
+                    let result = self.archive.as_ref().context("No archive workspace")
+                        .and_then(|workspace| workspace.serve(&message["params"]));
+                    match result {
+                        Ok(value) => self.respond(&message, value)?,
+                        Err(error) => self.write(json!({"jsonrpc":"2.0", "id":message["id"],
+                            "error":{"code":-32000, "message":format!("{error:#}")}}))?,
+                    }
+                }
                 "dotdir/showQuickPick" => {
                     let params = &message["params"];
                     if self.quick_pick.is_none()
@@ -1265,6 +1397,126 @@ mod tests {
             reply,
         }).unwrap();
         result.recv_blocking().unwrap().unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires the installed TypeScript 7 Native Preview SDK"]
+    fn typescript_archive_resolves_virtual_files_and_unsaved_edits() {
+        use crate::archive::Archive;
+        use std::io::Write;
+        use zip::{ZipWriter, write::SimpleFileOptions};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project.zip");
+        let config = r#"{"compilerOptions":{"strict":true},"files":["main.ts"]}"#;
+        let lib = "export const count: number = 1;";
+        let main = "import { count } from './lib';\n/* 😀 */ export const value: string = count;\nconst object = { answer: 42 }; object.answer;\n";
+        let mut zip = ZipWriter::new(fs::File::create(&path).unwrap());
+        for (name, text) in [
+            ("project/tsconfig.json", config),
+            ("project/main.ts", main),
+            ("project/lib.ts", lib),
+            ("loose/main.ts", main),
+            ("loose/lib.ts", lib),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let pristine = fs::read(&path).unwrap();
+        let archive = Archive::mount(path.clone());
+        let source = archive.resolve_archive_member("project/main.ts").unwrap();
+        let dependency = archive.resolve_archive_member("project/lib.ts").unwrap();
+        let settings = vscode::Settings {
+            enabled: vec!["typescriptteam.native-preview".into()],
+            ..Default::default()
+        };
+        let extensions = vscode::discover(&installed_extensions_root(), &settings);
+        let (extension, language) =
+            archive_typescript::extension(&source, &extensions, &settings).unwrap();
+        let logs = ExtensionLogs::default();
+        let mut servers = LanguageServers::new(temp.path().into(), logs, |_| {});
+        let fs = Filesystems::new(Default::default());
+        let buffer = servers
+            .attach_archive(
+                1,
+                &source,
+                Rope::from(main),
+                extension,
+                language,
+                &settings,
+                fs.clone(),
+            )
+            .unwrap();
+        let diagnostics = query(&buffer, "textDocument/diagnostic", 0, 0);
+        let items = diagnostics["items"].as_array().unwrap();
+        let assignment = items
+            .iter()
+            .find(|item| item["code"] == 2322)
+            .expect("type mismatch from an imported ZIP entry");
+        assert_eq!(
+            assignment["range"]["start"],
+            json!({"line": 1, "character": 22})
+        );
+        let definition = query(&buffer, "textDocument/definition", 1, 39);
+        let uri: lsp_types::Uri = serde_json::from_value(definition[0]["uri"].clone()).unwrap();
+        assert_eq!(buffer.source_location(&uri), Some(dependency.clone()));
+        let hover = query(&buffer, "textDocument/hover", 1, 39);
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("number")
+        );
+        let completion = query(&buffer, "textDocument/completion", 2, 38);
+        assert!(
+            completion["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["label"] == "answer")
+        );
+
+        let edited = "export const count: string = 'one';";
+        servers.archive_text(&dependency, Some(Rope::from(edited)));
+        let after = query(&buffer, "textDocument/diagnostic", 0, 0);
+        assert!(after["items"].as_array().unwrap().is_empty(), "{after}");
+        servers.archive_text(&dependency, None);
+        assert!(
+            query(&buffer, "textDocument/diagnostic", 0, 0)["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["code"] == 2322)
+        );
+        let loose = archive.resolve_archive_member("loose/main.ts").unwrap();
+        let loose_lib = archive.resolve_archive_member("loose/lib.ts").unwrap();
+        let loose_buffer = servers
+            .attach_archive(
+                2,
+                &loose,
+                Rope::from(main),
+                extension,
+                language,
+                &settings,
+                fs,
+            )
+            .unwrap();
+        assert!(
+            query(&loose_buffer, "textDocument/diagnostic", 0, 0)["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["code"] == 2322)
+        );
+        servers.archive_text(&loose_lib, Some(Rope::from(edited)));
+        let loose_after = query(&loose_buffer, "textDocument/diagnostic", 0, 0);
+        assert!(
+            loose_after["items"].as_array().unwrap().is_empty(),
+            "{loose_after}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), pristine);
+        assert!(!buffer.connection.archive.as_ref().unwrap().root.exists());
     }
 
     #[test]

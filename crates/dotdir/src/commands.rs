@@ -14,6 +14,7 @@ pub struct CommandState {
     pub panels_visible: bool,
     pub directory: bool,
     pub archive: bool,
+    pub archive_editable: bool,
     pub provider: bool,
     pub entry: bool,
     pub real_entry: bool,
@@ -77,7 +78,9 @@ impl Availability {
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
             Self::File => state.directory && state.file,
-            Self::EditableFile => state.directory && state.file && local,
+            Self::EditableFile => {
+                state.directory && state.file && (local || state.archive_editable)
+            }
             Self::Items => state.directory && state.items,
             Self::Copy => {
                 state.directory && state.selection && state.operation_idle && !state.provider

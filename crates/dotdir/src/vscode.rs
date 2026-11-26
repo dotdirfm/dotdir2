@@ -268,7 +268,7 @@ fn command_title(category: Option<&str>, title: &str) -> String {
     }
 }
 
-fn version_key(version: &str) -> (Vec<u32>, bool) {
+pub(crate) fn version_key(version: &str) -> (Vec<u32>, bool) {
     let (stable, prerelease) = version.split_once('-').unwrap_or((version, ""));
     (
         stable
@@ -280,7 +280,6 @@ fn version_key(version: &str) -> (Vec<u32>, bool) {
 }
 
 impl Extension {
-    #[cfg(test)]
     pub fn directory(&self) -> &Path {
         &self.root
     }

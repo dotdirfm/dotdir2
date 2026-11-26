@@ -158,10 +158,10 @@ impl DotDir {
         self.entry_icon_sized(entry, 16.)
     }
     fn themed_file_icon(&self, name: &str, directory: bool, size: f32) -> Option<ImageSource> {
-        let path =
-            self.icon_theme
-                .as_ref()?
-                .icon(name, directory, self.settings.theme == "light")?;
+        let path = self
+            .icon_theme
+            .as_ref()?
+            .icon(name, directory, !self.palette.mode.is_dark())?;
         Some(
             if path
                 .extension()
@@ -236,6 +236,27 @@ impl DotDir {
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        self.styled_button(id, label, f, false, cx)
+    }
+
+    pub(crate) fn primary_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        self.styled_button(id, label, f, true, cx)
+    }
+
+    fn styled_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        primary: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let p = self.palette;
         let label = label.into();
         div()
@@ -247,10 +268,17 @@ impl DotDir {
             .py(px(3.))
             .rounded(px(3.))
             .border_1()
-            .border_color(p.border)
-            .bg(p.input)
+            .border_color(if primary { p.accent } else { p.border })
+            .bg(if primary { p.accent } else { p.input })
+            .when(primary, |s| s.text_color(p.accent_fg))
             .cursor_pointer()
-            .hover(move |s| s.bg(p.selected))
+            .hover(move |s| {
+                s.bg(if primary {
+                    p.accent.opacity(0.86)
+                } else {
+                    p.selected
+                })
+            })
             .child(label)
             .on_click(cx.listener(move |this, _, window, cx| {
                 f(this, window, cx);
@@ -370,6 +398,12 @@ impl DotDir {
                         this.set_tab(pane, index, window, cx);
                         if preview && event.click_count() == 2 {
                             this.run("keep-preview", window, cx);
+                        }
+                    }))
+                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.is_middle_click() {
+                            cx.stop_propagation();
+                            this.request_close_tab(pane, id, window, cx);
                         }
                     }))
                     .child(tab_icon.render(p))
@@ -809,10 +843,8 @@ impl DotDir {
             ),
             Modal::PanelMenu(_) => unreachable!(),
             Modal::Settings => ("Settings".into(), String::new()),
-            Modal::Extensions => (
-                "Extensions".into(),
-                "Installed JavaScript extensions".into(),
-            ),
+            Modal::Extensions => ("Extensions".into(), String::new()),
+            Modal::OpenVsx => ("Extensions".into(), String::new()),
             Modal::ExtensionLogs => ("Extension Logs".into(), String::new()),
             Modal::Search => (
                 "Find Files".into(),
@@ -827,6 +859,7 @@ impl DotDir {
                 format!("{}\n→ {}", source.display(), destination.display()),
             ),
         };
+        let marketplace = matches!(modal, Modal::OpenVsx);
         let mut content = div()
             .id("modal-content")
             .track_focus(&self.modal_focus)
@@ -837,10 +870,10 @@ impl DotDir {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .w(px(620.))
-            .max_w(relative(0.9))
+            .w(px(if marketplace { 1100. } else { 620. }))
+            .max_w(relative(if marketplace { 0.95 } else { 0.9 }))
             .max_h(relative(0.82))
-            .overflow_y_scroll()
+            .when(!marketplace, |s| s.overflow_y_scroll())
             .p(px(20.))
             .rounded(px(7.))
             .bg(p.bg)
@@ -898,13 +931,20 @@ impl DotDir {
                             .h(px(32.))
                             .px(px(8.))
                             .rounded(px(3.))
-                            .when(selected, |s| s.bg(p.selected))
+                            .when(selected, |s| {
+                                s.bg(p.selected)
+                                    .when_some(p.selected_fg, |style, fg| style.text_color(fg))
+                            })
                             .cursor_pointer()
                             .hover(move |s| s.bg(p.selected))
                             .child(text(title).flex_1())
                             .child(
                                 text(key.replace("cmd-", "⌘"))
-                                    .text_color(p.accent)
+                                    .text_color(if selected {
+                                        p.selected_fg.unwrap_or(p.accent)
+                                    } else {
+                                        p.accent
+                                    })
                                     .text_size(px(11.)),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -959,7 +999,10 @@ impl DotDir {
                         .px(px(8.))
                         .py(px(6.))
                         .rounded(px(3.))
-                        .when(cursor == self.palette_cursor, |s| s.bg(p.selected))
+                        .when(cursor == self.palette_cursor, |s| {
+                            s.bg(p.selected)
+                                .when_some(p.selected_fg, |style, fg| style.text_color(fg))
+                        })
                         .cursor_pointer()
                         .hover(move |s| s.bg(p.selected))
                         .child(heading)
@@ -1081,24 +1124,27 @@ impl DotDir {
                         SharedString::from(id),
                         format!(
                             "{}{}",
-                            if self.settings.theme == id {
+                            if self.settings.theme == id && self.color_theme_name.is_none() {
                                 "✓ "
                             } else {
                                 ""
                             },
                             label
                         ),
-                        move |this, _, cx| {
-                            this.settings.theme = id.into();
-                            this.palette = crate::theme::Palette::named(id);
-                            this.palette.apply(id, cx);
-                            this.persist();
-                            cx.notify();
-                        },
+                        move |this, _, cx| this.use_builtin_theme(id, cx),
                         cx,
                     ));
                 }
                 content = content.child(themes);
+                if let Some(name) = &self.color_theme_name {
+                    content = content.child(text(name.clone()));
+                }
+                content = content.child(self.button(
+                    "load-vscode-color-theme",
+                    "Load VS Code Color Theme…",
+                    |this, window, cx| this.prompt_color_theme(window, cx),
+                    cx,
+                ));
                 content = content.child(self.button(
                     "hidden",
                     format!(
@@ -1148,11 +1194,24 @@ impl DotDir {
                 );
                 content=content.child(self.button("keybindings","Edit keybindings.json",|this,window,cx|{let path=this.settings_path.with_file_name("keybindings.json");if !path.exists(){let _=std::fs::write(&path,"[\n  {\"key\": \"cmd-l\", \"command\": \"location\", \"context\": \"DotDir\"}\n]\n");}this.dismiss(window,cx);this.open_document(this.active,path,false,window,cx);},cx));
             }
+            Modal::OpenVsx => {
+                content = content.child(self.render_marketplace(window, cx));
+            }
             Modal::Extensions => {
                 content = content.child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(8.))
+                        .child(
+                            self.button(
+                                "browse-open-vsx",
+                                "Browse Open VSX…",
+                                |this, window, cx| this.open_marketplace(window, cx),
+                                cx,
+                            )
+                            .border_color(p.accent),
+                        )
                         .child(self.button(
                             "extension-logs",
                             "Extension Logs",
@@ -1518,6 +1577,17 @@ impl Render for DotDir {
                         cx.notify();
                         cx.stop_propagation();
                         window.prevent_default();
+                    } else if matches!(this.modal, Some(Modal::OpenVsx))
+                        && matches!(key, "up" | "down")
+                        && this
+                            .dialog_input
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window)
+                    {
+                        this.move_market_selection(key == "down", cx);
+                        cx.stop_propagation();
+                        window.prevent_default();
                     } else if matches!(this.modal, Some(Modal::Search))
                         && matches!(key, "up" | "down")
                     {
@@ -1540,7 +1610,15 @@ impl Render for DotDir {
                         }
                         cx.stop_propagation();
                         window.prevent_default();
-                    } else if key == "enter" && !event.keystroke.modifiers.shift {
+                    } else if key == "enter"
+                        && !event.keystroke.modifiers.shift
+                        && (!matches!(this.modal, Some(Modal::OpenVsx))
+                            || this
+                                .dialog_input
+                                .read(cx)
+                                .focus_handle(cx)
+                                .is_focused(window))
+                    {
                         this.accept_modal(window, cx);
                         cx.stop_propagation();
                         window.prevent_default();
@@ -1612,7 +1690,7 @@ impl Render for DotDir {
                 .items_center()
                 .gap(px(6.))
                 .px(px(6.))
-                .bg(rgb(0x171b24))
+                .bg(p.command_bg)
                 .font_family("Menlo")
                 .text_size(px(12.))
                 .child(text(format!("{path}> ")).font_weight(FontWeight::SEMIBOLD))

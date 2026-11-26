@@ -137,13 +137,39 @@ and file-list bounds limit movement without changing marked entries.
 ## ZIP archives
 
 Select a ZIP and press **Enter** or **F3** to browse it in the current pane.
-Use **F3** to preview text, images, or hex data and **⌘F3** to preview in the
-opposite pane. Previews are limited to 16 MiB per entry. Select files or
-folders and press **F5** to extract them. The destination defaults to the
-opposite local pane. Extraction uses the regular progress and conflict dialogs.
-ZIP panes are read-only and support stored and DEFLATE entries.
+The same keys open ZIPs nested inside an archive, up to eight levels deep.
+Use **F3** to preview text, hex, images, or supported videos, and **⌘F3** to
+preview in the opposite pane. Use **Left/Right** in the media viewer to browse
+images and videos in the same archive folder.
+
+ZIP browsing and previews use no temporary files. Text,
+hex, and image previews are limited to 16 MiB per entry. Video playback and
+nested ZIPs can seek directly within stored entries. For DEFLATE-compressed
+entries they decompress up to 64 MiB per entry in memory. Native video and
+AVIF support are currently available on macOS.
+
+Press **F4** to edit text inside a local ZIP and **⌘S** to save it back.
+Saving checks for external changes and replaces the archive only after the
+rewrite succeeds. Nested saves rebuild inner ZIPs in memory with the same
+64 MiB limit.
+
+With **TypeScript 7** enabled in **F11**, editing TypeScript or JavaScript in
+a ZIP enables diagnostics, completion, hover, and Go to Definition. The
+adapter serves source files and unsaved edits from memory and the archive.
+The workspace is never unpacked to disk.
+
+Select files or folders and press **F5** to extract them. The destination
+defaults to the opposite local pane. Extraction uses the regular progress and
+conflict dialogs.
 
 ## Extensions
+
+Open **F11 → Browse Open VSX…** to browse or search the registry by name,
+extension ID, or Open VSX page URL. Select a result to read its README and
+install a compatible release. Use **Installed** to find local packages,
+enable or disable executable extensions, and apply installed color or file
+icon themes. Extension commands and features depend on DotDir's VS Code API
+support.
 
 **TypeScript 7** runs the JavaScript client from an unpacked
 `TypeScriptTeam.native-preview` VSIX. Enable it through **F11** and set
@@ -226,6 +252,11 @@ controls provide seeking and volume; hidden tabs pause playback. SVG, TIFF and
 system-decoded AVIF are included. Codec availability follows macOS; unsupported
 files show an error and an external-open action. See the
 [media viewer notes](extensions/image-viewer/README.md).
+
+For VS Code colors, open **F9 → Load VS Code Color Theme…** and enter a JSON,
+JSONC, or TextMate theme file, or an unpacked VS Code extension directory.
+Choose a variant when the extension includes several. DotDir restores the
+selected theme on startup and maps its syntax styles to Tree-sitter captures.
 
 For file icons, open **F11 → Load icon theme…** (also available in Settings)
 and enter the directory of a VS Code file-icon extension, such as Material Icon

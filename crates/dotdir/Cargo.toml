@@ -41,9 +41,16 @@ percent-encoding = "2"
 tempfile = "3"
 same-file = "1"
 zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+jsonc-parser = { version = "0.34", features = ["serde"] }
+plist = "1.10"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSError"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSString", "NSURL", "NSError"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "dispatch2", "AVAsset", "AVAssetResourceLoader", "AVPlayerItem"] }
+objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }
+dispatch2 = "0.3"
 
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMTime"] }

@@ -72,7 +72,7 @@ pub fn read_location(
         Location::Local(path) => read_directory(path, hidden, sort),
         Location::Zip { archive, member } => {
             let items = archive
-                .list(member)?
+                .list(member, filesystems)?
                 .into_iter()
                 .filter_map(|(path, member)| {
                     let is_hidden = member.name.starts_with('.');
@@ -575,6 +575,8 @@ impl DirectoryBrowser {
 #[serde(default)]
 pub struct Settings {
     pub theme: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_theme: Option<crate::vscode_theme::ThemeSource>,
     pub icon_theme: Option<PathBuf>,
     pub show_hidden: bool,
     pub brief: bool,
@@ -599,6 +601,7 @@ impl Default for Settings {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         Self {
             theme: "ayu".into(),
+            color_theme: None,
             icon_theme: None,
             show_hidden: true,
             brief: true,

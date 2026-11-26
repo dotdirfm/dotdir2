@@ -48,8 +48,15 @@ impl DotDir {
                     .text_size(px(11.))
                     .cursor_pointer()
                     .bg(if selected == mode { p.selected } else { p.bg })
-                    .text_color(if selected == mode { p.accent } else { p.muted })
-                    .hover(move |s| s.bg(p.selected))
+                    .text_color(if selected == mode {
+                        p.selected_fg.unwrap_or(p.accent)
+                    } else {
+                        p.muted
+                    })
+                    .hover(move |s| match p.selected_fg {
+                        Some(fg) => s.bg(p.selected).text_color(fg),
+                        None => s.bg(p.selected),
+                    })
                     .child(mode.label())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.set_presentation(pane, mode, window, cx)
@@ -95,7 +102,10 @@ impl DotDir {
             .overflow_hidden()
             .cursor_default()
             .when(marked, |s| s.bg(p.marked))
-            .when(cursor, |s| s.bg(p.selected))
+            .when(cursor, |s| {
+                s.bg(p.selected)
+                    .when_some(p.selected_fg, |style, fg| style.text_color(fg))
+            })
             .when(cursor && active, |s| {
                 s.child(
                     div()
