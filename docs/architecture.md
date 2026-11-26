@@ -45,9 +45,9 @@ the file panes and application chrome are custom GPUI elements.
   entries, and can offer direct seeks, batch entry changes, and archive creation.
   The creation schema declares the output suffix and choice, text, or masked
   fields. The host renders those fields and streams selected files to the
-  provider. Register a native
-  format such as TAR or 7z in `crates/dotdir/src/archive_extensions.rs`. ZIP is
-  enabled by default through the `zip-extension` feature.
+  provider. Register native formats in `crates/dotdir/src/archive_extensions.rs`.
+  ZIP, 7z, and TAR are enabled by default. The 7z reader streams the member's
+  compression block and the TAR reader streams compressed tarballs.
 - Archive directory tabs store a format ID, a source location, and a member
   path. The source can itself be an archive entry, so mixed formats can nest.
   Saved ZIP tabs from earlier versions still restore. A seekable virtual file
@@ -62,7 +62,7 @@ the file panes and application chrome are custom GPUI elements.
   source before publication. Cross-container moves remove sources only after
   the destination is committed.
 - Archive providers ask the host to validate passwords when an operation
-  reaches a protected entry. The host negotiates on the archive worker and
+  reaches a protected entry or header. The host negotiates on the archive worker and
   shows a masked prompt in the UI. It retains sealed credentials per structured
   archive location and opens them into zeroizing byte buffers only for use.
   Mounts backed by decrypted nested entries are scoped to the operation.

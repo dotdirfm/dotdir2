@@ -1,5 +1,5 @@
 use crate::{
-    archive_passwords::ArchiveKey,
+    archive_passwords::{ArchiveKey, UnlockCancelled, UnlockRequired},
     filesystems::{Filesystems, ProviderPath},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -636,19 +636,25 @@ impl Archive {
         *cache = None;
         let source = self.source.open_seekable(filesystems, cancel)?;
         let memory_usage = source.memory_usage();
-        let source_protected = source.is_protected();
-        let reader = self
-            .format
-            .open(source)
-            .with_context(|| format!("Open archive {}", self.source.display()))?;
+        let key = ArchiveKey {
+            source: self.source.clone(),
+            format: self.info().id,
+        };
+        let access = filesystems.password_access(&key, cancel);
+        let encrypted_source = source.is_protected();
+        let reader = self.format.open(source, &access).map_err(|error| {
+            if error.is::<UnlockCancelled>() || error.is::<UnlockRequired>() {
+                error
+            } else {
+                error.context(format!("Open archive {}", self.source.display()))
+            }
+        })?;
+        let source_protected = encrypted_source || access.requested.get();
         let mounted = Arc::new(MountedArchive {
             reader,
             index: Mutex::new(None),
             memory_usage,
-            key: ArchiveKey {
-                source: self.source.clone(),
-                format: self.info().id,
-            },
+            key,
             source_protected,
         });
         if let Some(revision) = revision
@@ -1227,7 +1233,11 @@ mod format_tests {
             self.info
         }
 
-        fn open(&self, source: VirtualFile) -> Result<Box<dyn ArchiveReader>> {
+        fn open(
+            &self,
+            source: VirtualFile,
+            _access: &dyn dotdir_archive_api::PasswordAccess,
+        ) -> Result<Box<dyn ArchiveReader>> {
             Ok(Box::new(FixtureReader {
                 source,
                 member: self.member,
@@ -1642,5 +1652,196 @@ mod tests {
                 .is_err()
         );
         assert!(fs::read_dir(outside).unwrap().next().is_none());
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "sevenz-extension",
+    feature = "tar-extension",
+    feature = "zip-extension"
+))]
+mod mixed_format_tests {
+    use super::*;
+    use crate::{archive_extensions::BUNDLED, archive_passwords::ArchivePasswords};
+    use dotdir_archive_api::Password;
+    use sevenz_rust2::{
+        ArchiveEntry, ArchiveWriter, EncoderMethod, encoder_options::AesEncoderOptions,
+    };
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    fn mount(source: Location) -> Location {
+        let format = BUNDLED.for_path(source.name_path()).unwrap();
+        Archive::mount_location(source, format).unwrap()
+    }
+
+    fn member(root: &Location, name: &str) -> Location {
+        root.resolve_archive_member(name).unwrap()
+    }
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = tar::Builder::new(Vec::new());
+        for (path, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            archive.append_data(&mut header, path, *bytes).unwrap();
+        }
+        archive.into_inner().unwrap()
+    }
+
+    #[test]
+    fn mixed_archives_restore_and_preview_through_virtual_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("outer.zip");
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&tar_bytes(&[
+            ("./media/picture.png", b"image fixture"),
+            ("./media/clip.mp4", b"video fixture"),
+        ]))
+        .unwrap();
+        let gzip = gzip.finish().unwrap();
+
+        let mut sevenz = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        sevenz
+            .push_archive_entry(
+                ArchiveEntry::new_file("files.TAR.GZ"),
+                Some(gzip.as_slice()),
+            )
+            .unwrap();
+        let sevenz = sevenz.finish().unwrap().into_inner();
+        let mut zip = ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file("nested.7z", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&sevenz).unwrap();
+        zip.finish().unwrap();
+
+        let filesystems = Filesystems::new(Default::default());
+        let outer = mount(path.into());
+        let archive_7z = mount(member(&outer, "nested.7z"));
+        let archive_tar = mount(member(&archive_7z, "files.TAR.GZ"));
+        assert_eq!(archive_tar.parent(), Some(archive_7z));
+        let media = member(&archive_tar, "media");
+        let serialized = serde_json::to_vec(&SavedLocation::from(&media)).unwrap();
+        let saved: SavedLocation = serde_json::from_slice(&serialized).unwrap();
+        let restored = saved.restore(&BUNDLED).unwrap();
+        assert_eq!(restored, media);
+        let image = member(&restored, "media/picture.png");
+        assert_eq!(image.read_preview(&filesystems).unwrap(), b"image fixture");
+        assert!(!image.editable());
+        let mut video = member(&restored, "media/clip.mp4")
+            .open_seekable(&filesystems, &CancelToken::new())
+            .unwrap();
+        video.seek(SeekFrom::End(-7)).unwrap();
+        let mut tail = Vec::new();
+        video.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, b"fixture");
+
+        let Location::Archive { archive, .. } = restored else {
+            unreachable!()
+        };
+        archive
+            .extract(
+                vec!["media".into()],
+                temp.path(),
+                false,
+                ConflictPolicy::Ask,
+                &filesystems,
+                &CancelToken::new(),
+                &|_| {},
+                &|_, _| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("media/picture.png")).unwrap(),
+            b"image fixture"
+        );
+    }
+
+    #[test]
+    fn plain_tar_and_stored_7z_supply_direct_seek_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut sevenz = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        sevenz.set_content_methods(vec![EncoderMethod::COPY.into()]);
+        sevenz
+            .push_archive_entry(
+                ArchiveEntry::new_file("clip.mp4"),
+                Some(b"0123456789".as_slice()),
+            )
+            .unwrap();
+        let sevenz = sevenz.finish().unwrap().into_inner();
+        let path = temp.path().join("bundle.tar");
+        fs::write(&path, tar_bytes(&[("video.7z", &sevenz)])).unwrap();
+
+        let filesystems = Filesystems::new(Default::default());
+        let root = mount(path.into());
+        let embedded = member(&root, "video.7z");
+        let zip = mount(embedded.clone());
+        let cancel = CancelToken::new();
+        let direct = embedded.open_seekable(&filesystems, &cancel).unwrap();
+        assert_eq!(direct.memory_usage(), 0);
+        let Location::Archive { archive, .. } = zip else {
+            unreachable!()
+        };
+        let mut clip = archive
+            .open_member(Path::new("clip.mp4"), &filesystems, &cancel, 2)
+            .unwrap();
+        assert_eq!(clip.memory_usage(), 0);
+        clip.seek(SeekFrom::Start(5)).unwrap();
+        let mut bytes = Vec::new();
+        clip.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"56789");
+    }
+
+    #[test]
+    fn encrypted_7z_uses_the_shared_password_prompt_and_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        for encrypted_header in [false, true] {
+            let path = temp.path().join(format!("{encrypted_header}.7z"));
+            let mut writer = ArchiveWriter::new(File::create(&path).unwrap()).unwrap();
+            writer.set_content_methods(vec![
+                AesEncoderOptions::new("test-archive-key".into()).into(),
+                EncoderMethod::LZMA2.into(),
+            ]);
+            writer.set_encrypt_header(encrypted_header);
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file("readme.txt"),
+                    Some(b"protected".as_slice()),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+
+            let prompts = Arc::new(AtomicUsize::new(0));
+            let calls = prompts.clone();
+            let mut filesystems = Filesystems::new(Default::default());
+            filesystems.archive_passwords = Arc::new(ArchivePasswords::new(15, move |request| {
+                let count = calls.fetch_add(1, Ordering::Relaxed);
+                assert!(count < 2);
+                assert_eq!(request.incorrect, count == 1);
+                assert_eq!(request.member.as_os_str().is_empty(), encrypted_header);
+                let bytes = if count == 0 {
+                    b"wrong".as_slice()
+                } else {
+                    b"test-archive-key"
+                };
+                request.reply.send(Password::new(bytes.to_vec())).unwrap();
+            }));
+            let root = mount(path.into());
+            let file = member(&root, "readme.txt");
+            assert_eq!(file.read_preview(&filesystems).unwrap(), b"protected");
+            assert_eq!(file.read_preview(&filesystems).unwrap(), b"protected");
+            assert_eq!(prompts.load(Ordering::Relaxed), 2);
+            filesystems.archive_passwords.set_minutes(0);
+            assert!(
+                file.read_preview(&filesystems.without_password_prompts())
+                    .unwrap_err()
+                    .is::<UnlockRequired>()
+            );
+        }
     }
 }

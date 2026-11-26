@@ -227,6 +227,7 @@ impl Filesystems {
             key,
             cancel,
             interactive: self.interactive,
+            requested: Default::default(),
         }
     }
 

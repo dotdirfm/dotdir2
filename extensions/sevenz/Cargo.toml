@@ -1,0 +1,9 @@
+[package]
+name = "dotdir-sevenz"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dotdir-archive-api = { path = "../../crates/dotdir-archive-api" }
+sevenz-rust2 = { version = "0.27", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd"] }

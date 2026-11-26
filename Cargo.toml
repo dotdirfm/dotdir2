@@ -4,6 +4,8 @@ members = [
     "crates/dotdir-archive-api",
     "crates/dotdir-core",
     "crates/dotdir-extension-host",
+    "extensions/sevenz",
+    "extensions/tar",
     "extensions/zip",
 ]
 default-members = ["crates/dotdir"]

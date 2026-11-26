@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["zip-extension"]
+default = ["sevenz-extension", "tar-extension", "zip-extension"]
+sevenz-extension = ["dep:dotdir-sevenz"]
+tar-extension = ["dep:dotdir-tar"]
 zip-extension = ["dep:dotdir-zip"]
 
 [dependencies]
@@ -15,6 +17,8 @@ serde_json.workspace = true
 dotdir-core = { path = "../dotdir-core" }
 dotdir-archive-api = { path = "../dotdir-archive-api" }
 dotdir-extension-host = { path = "../dotdir-extension-host" }
+dotdir-sevenz = { path = "../../extensions/sevenz", optional = true }
+dotdir-tar = { path = "../../extensions/tar", optional = true }
 dotdir-zip = { path = "../../extensions/zip", optional = true }
 gpui-kit = { version = "=0.11.0", features = [
     "tree-sitter",
@@ -52,6 +56,11 @@ jsonc-parser = { version = "0.34", features = ["serde"] }
 plist = "1.10"
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }
 sha2 = "0.10"
+
+[dev-dependencies]
+tar = { version = "0.4.46", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+sevenz-rust2 = { version = "0.27", default-features = false, features = ["compress"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.5"

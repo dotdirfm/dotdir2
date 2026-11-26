@@ -4,10 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{Datelike, Timelike};
 use dotdir_archive_api::{
     ArchiveFormat, ArchiveReader, Changes, Choice, Creation, CreationOptions, Entry, FormatInfo,
-    Input, OptionField, OptionKind, Password, PasswordAccess, VirtualFile, WriteSeek,
+    Input, OptionField, OptionKind, Password, PasswordAccess, VirtualFile, WriteSeek, member_name,
 };
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
@@ -36,7 +35,11 @@ impl ArchiveFormat for ZipFormat {
         &INFO
     }
 
-    fn open(&self, source: VirtualFile) -> Result<Box<dyn ArchiveReader>> {
+    fn open(
+        &self,
+        source: VirtualFile,
+        _access: &dyn PasswordAccess,
+    ) -> Result<Box<dyn ArchiveReader>> {
         Ok(Box::new(ZipReader(ZipArchive::new(source)?)))
     }
 
@@ -357,13 +360,4 @@ fn write_entry(
         writer.add_directory(name, options)?;
     }
     Ok(())
-}
-
-fn member_name(path: &Path) -> Result<Cow<'_, str>> {
-    let name = path.to_str().context("Invalid ZIP path")?;
-    if cfg!(windows) {
-        Ok(name.replace(std::path::MAIN_SEPARATOR, "/").into())
-    } else {
-        Ok(name.into())
-    }
 }

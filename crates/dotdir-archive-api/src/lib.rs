@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail, ensure};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt::Debug,
     fs::File,
@@ -26,7 +27,11 @@ pub struct FormatInfo {
 
 pub trait ArchiveFormat: Debug + Send + Sync {
     fn info(&self) -> &'static FormatInfo;
-    fn open(&self, source: VirtualFile) -> Result<Box<dyn ArchiveReader>>;
+    fn open(
+        &self,
+        source: VirtualFile,
+        access: &dyn PasswordAccess,
+    ) -> Result<Box<dyn ArchiveReader>>;
 
     fn creation(&self) -> Option<&'static Creation> {
         None
@@ -99,11 +104,28 @@ impl DerefMut for Password {
 /// Request access to a protected member. The provider checks the credential
 /// against that member and the host handles prompts, retries and retention.
 pub trait PasswordAccess {
+    fn check_cancelled(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// An empty member path requests the password for the archive header.
     fn unlock(
         &self,
         member: &Path,
         verify: &mut dyn FnMut(&[u8]) -> Result<bool>,
     ) -> Result<Password>;
+}
+
+/// Convert a validated relative member path back to an archive entry name.
+pub fn member_name(path: &Path) -> Result<Cow<'_, str>> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid archive member path"))?;
+    if cfg!(windows) {
+        Ok(path.replace('\\', "/").into())
+    } else {
+        Ok(path.into())
+    }
 }
 
 /// The host validates paths and supplies streams for regular files. Directories
@@ -252,11 +274,35 @@ impl VirtualFile {
         self.protected
     }
 
+    pub fn checked(self, access: &dyn PasswordAccess) -> CheckedFile<'_> {
+        CheckedFile { file: self, access }
+    }
+
     pub fn memory_usage(&self) -> u64 {
         match &self.backing {
             FileBacking::Local(_) => 0,
             FileBacking::Memory(data) => data.len() as u64,
         }
+    }
+}
+
+/// A virtual file cursor that lets long decodes stop when the host cancels.
+pub struct CheckedFile<'a> {
+    file: VirtualFile,
+    access: &'a dyn PasswordAccess,
+}
+
+impl Read for CheckedFile<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.access.check_cancelled().map_err(io::Error::other)?;
+        self.file.read(output)
+    }
+}
+
+impl Seek for CheckedFile<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.access.check_cancelled().map_err(io::Error::other)?;
+        self.file.seek(position)
     }
 }
 

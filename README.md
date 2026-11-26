@@ -134,22 +134,26 @@ Vertical wheel input moves the cursor and viewport together, keeping the cursor
 visible. In Large icons it advances grid rows. Small trackpad deltas accumulate,
 and file-list bounds limit movement without changing marked entries.
 
-## ZIP archives
+## Archives
 
-The bundled **ZIP Archives** extension appears under **F11 → Extensions** and
-uses DotDir's shared native archive API.
+The bundled **ZIP**, **7-Zip**, and **TAR** providers use DotDir's shared archive
+API and appear under **F11 → Extensions**. TAR browsing includes plain TAR and
+gzip, bzip2, xz, and Zstandard tarballs.
 
-Select a ZIP and press **Enter** or **F3** to browse it in the current pane.
-The same keys open ZIPs nested inside an archive, up to eight levels deep.
+Select an archive and press **Enter** or **F3** to browse it in the current pane.
+Formats can be mixed within the same nested path, up to eight levels deep.
 Use **F3** to preview text, hex, images, or supported videos, and **⌘F3** to
 preview in the opposite pane. Use **Left/Right** in the media viewer to browse
 images and videos in the same archive folder.
 
-ZIP browsing and previews use no temporary files. Text,
-hex, and image previews are limited to 16 MiB per entry. Video playback and
-nested ZIPs can seek directly within stored entries. For DEFLATE-compressed
-entries they decompress up to 64 MiB per entry in memory. Native video and
-AVIF support are currently available on macOS.
+Browsing and previews use no temporary files. Text, hex, and image previews are
+limited to 16 MiB per entry. Video and nested archive reads use direct seeks for
+plain TAR and stored ZIP or 7z entries. Other entries that need random access
+use up to 64 MiB each in memory. Native video and AVIF support are currently
+available on macOS.
+
+7-Zip and TAR support browsing, previews, and extraction. ZIP also supports
+writing and creating archives.
 
 Press **F4** to edit text inside a local ZIP and **⌘S** to save it back.
 Saving checks for external changes and replaces the archive only after the
@@ -175,7 +179,8 @@ To pack a selection, open **F1 → Create Archive…** and choose a format and
 local output path. The dialog shows the chosen provider's settings. ZIP offers
 four compression levels and an optional AES-256 password.
 
-DotDir asks for a password when an operation needs encrypted ZIP contents.
+DotDir asks for a password when an operation needs encrypted ZIP or 7z contents,
+or when it opens an encrypted 7z header.
 Passwords are encrypted in memory and remembered for 15 minutes by default.
 Change the duration under **F9 → Archive password cache**, or set
 `archive_password_cache_minutes` in `settings.json`. Set it to 0 to keep a

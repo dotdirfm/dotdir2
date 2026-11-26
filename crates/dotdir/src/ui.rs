@@ -840,7 +840,11 @@ impl DotDir {
             ),
             Modal::ArchivePassword { request, .. } => (
                 "Unlock Archive".into(),
-                format!("{}\n{}", request.archive, request.member.display()),
+                if request.member.as_os_str().is_empty() {
+                    request.archive.clone()
+                } else {
+                    format!("{}\n{}", request.archive, request.member.display())
+                },
             ),
             Modal::QuickPick { request, .. } => (
                 request

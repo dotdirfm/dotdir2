@@ -1,5 +1,5 @@
 use crate::archive::Location;
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use dotdir_archive_api::{Password, PasswordAccess, Zeroizing};
 use dotdir_core::copy::CancelToken;
 use ring::{
@@ -7,6 +7,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
+    cell::Cell,
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
@@ -46,6 +47,17 @@ impl std::fmt::Display for UnlockCancelled {
 }
 
 impl std::error::Error for UnlockCancelled {}
+
+#[derive(Debug)]
+pub(crate) struct UnlockRequired;
+
+impl std::fmt::Display for UnlockRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(PASSWORD_REQUIRED)
+    }
+}
+
+impl std::error::Error for UnlockRequired {}
 
 struct Vault {
     key: Zeroizing<[u8; 32]>,
@@ -230,6 +242,7 @@ pub(crate) struct ArchiveAccess<'a> {
     pub key: &'a ArchiveKey,
     pub cancel: &'a CancelToken,
     pub interactive: bool,
+    pub requested: Cell<bool>,
 }
 
 impl ArchiveAccess<'_> {
@@ -241,7 +254,7 @@ impl ArchiveAccess<'_> {
     fn ask(&self, member: &Path, incorrect: bool) -> Result<Password> {
         self.check_cancelled()?;
         let Some(prompt) = self.service.prompt.as_ref().filter(|_| self.interactive) else {
-            bail!(PASSWORD_REQUIRED);
+            return Err(UnlockRequired.into());
         };
         let (reply, response) = mpsc::channel();
         prompt(PasswordRequest {
@@ -263,11 +276,16 @@ impl ArchiveAccess<'_> {
 }
 
 impl PasswordAccess for ArchiveAccess<'_> {
+    fn check_cancelled(&self) -> Result<()> {
+        ArchiveAccess::check_cancelled(self)
+    }
+
     fn unlock(
         &self,
         member: &Path,
         verify: &mut dyn FnMut(&[u8]) -> Result<bool>,
     ) -> Result<Password> {
+        self.requested.set(true);
         let gate = self.service.gate(self.key);
         let generation = gate.cancelled.load(Ordering::Acquire);
         let _guard = loop {
@@ -281,7 +299,7 @@ impl PasswordAccess for ArchiveAccess<'_> {
                 Err(std::sync::TryLockError::WouldBlock) if self.interactive => {
                     std::thread::sleep(WAIT_INTERVAL)
                 }
-                Err(std::sync::TryLockError::WouldBlock) => bail!(PASSWORD_REQUIRED),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(UnlockRequired.into()),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err(anyhow!("Archive unlock failed"));
                 }
@@ -369,6 +387,7 @@ mod tests {
                 key: &key,
                 cancel: &cancel,
                 interactive: true,
+                requested: Default::default(),
             }
             .unlock(Path::new("file.txt"), &mut |password| {
                 Ok(password == b"fixture-secret")
@@ -419,6 +438,7 @@ mod tests {
             key: &key,
             cancel: &cancel,
             interactive: true,
+            requested: Default::default(),
         }
         .unlock(Path::new("file.txt"), &mut |_| unreachable!())
         .unwrap_err();
