@@ -14,6 +14,8 @@ globset = "0.4"
 regex = "1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+tempfile = "3"
+same-file = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -21,6 +23,3 @@ xattr = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
-
-[dev-dependencies]
-tempfile = "3"

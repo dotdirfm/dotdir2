@@ -56,6 +56,18 @@ pub struct Operation {
     pub fraction: f32,
 }
 impl Operation {
+    pub fn copy(
+        id: u64,
+        sources: Vec<PathBuf>,
+        destinations: Vec<PathBuf>,
+        options: CopyOptions,
+    ) -> Self {
+        Self::spawn(id, OperationKind::Copy, move |cancel, emit, conflict| {
+            copy::copy_to_directories(&sources, &destinations, &options, cancel, emit, conflict)?;
+            Ok(())
+        })
+    }
+
     pub fn start(
         id: u64,
         kind: OperationKind,

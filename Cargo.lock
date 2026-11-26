@@ -1511,6 +1511,7 @@ dependencies = [
  "notify 7.0.0",
  "parking_lot",
  "regex",
+ "same-file",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
@@ -1537,6 +1538,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotdir-archive-api",
+ "getrandom 0.4.3",
  "sevenz-rust2",
 ]
 

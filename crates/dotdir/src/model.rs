@@ -172,6 +172,13 @@ pub struct PanelLayout {
     pub columns: usize,
     pub cell_height: f32,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShiftSelection {
+    directory: u64,
+    mark: bool,
+}
+
 impl PanelLayout {
     pub fn new(presentation: Presentation, width: f32, height: f32) -> Self {
         let cell_height = if presentation == Presentation::Icons {
@@ -200,14 +207,14 @@ impl PanelLayout {
     pub fn delta(self, command: &str) -> isize {
         let row_major = self.presentation == Presentation::Icons;
         match command {
-            "up" | "mark-up" => {
+            "up" => {
                 if row_major {
                     -(self.columns as isize)
                 } else {
                     -1
                 }
             }
-            "down" | "mark-down" => {
+            "down" => {
                 if row_major {
                     self.columns as isize
                 } else {
@@ -265,13 +272,51 @@ impl PanelLayout {
                 directory.top = directory.top.saturating_sub(self.rows).min(max_top);
             }
         }
-        directory.move_cursor(
-            self.delta(command),
-            command.starts_with("mark-"),
-            self.rows,
-            self.columns,
-        );
+        match command {
+            "first" | "last" => {
+                directory.reset_icon_scroll();
+                directory.wheel_remainder = 0.;
+                directory.cursor = if command == "first" {
+                    0
+                } else {
+                    directory.entries.len().saturating_sub(1)
+                };
+            }
+            _ => directory.move_cursor(self.delta(command)),
+        }
         self.ensure_visible(directory);
+    }
+    pub fn extend_selection(
+        self,
+        directory: &mut Directory,
+        command: &str,
+        previous_selection: Option<ShiftSelection>,
+    ) -> Option<ShiftSelection> {
+        let start = directory.cursor;
+        let focused = directory.focused()?;
+        let selection = previous_selection
+            .filter(|selection| selection.directory == directory.id)
+            .unwrap_or_else(|| ShiftSelection {
+                directory: directory.id,
+                mark: !directory.marked.contains(&focused.path),
+            });
+        self.move_cursor(directory, command);
+        let end = directory.cursor;
+        // Single-step arrows mark entries as the cursor passes them. Jumps
+        // also mark their destination, as does an arrow at the list boundary.
+        let exclude_destination = start != end && matches!(command, "up" | "down");
+        for index in start.min(end)..=start.max(end) {
+            let entry = &directory.entries[index];
+            if entry.parent || (exclude_destination && index == end) {
+                continue;
+            }
+            if selection.mark {
+                directory.marked.insert(entry.path.clone());
+            } else {
+                directory.marked.remove(&entry.path);
+            }
+        }
+        Some(selection)
     }
     pub fn scroll_pixels(self, directory: &mut Directory, pixels: f32) -> bool {
         if !pixels.is_finite() {
@@ -424,16 +469,12 @@ impl Directory {
         self.marked.clear();
         self.entries = Arc::new(vec![]);
     }
-    pub fn move_cursor(&mut self, delta: isize, mark: bool, rows: usize, columns: usize) {
+    pub fn move_cursor(&mut self, delta: isize) {
         self.wheel_remainder = 0.;
-        if mark {
-            self.toggle_mark();
-        }
         self.cursor = self
             .cursor
             .saturating_add_signed(delta)
             .min(self.entries.len().saturating_sub(1));
-        self.ensure_visible(rows, columns);
     }
     pub fn icon_scroll_position(
         &mut self,
@@ -779,6 +820,68 @@ mod tests {
     }
 
     #[test]
+    fn shift_arrows_keep_the_first_mark_action_for_mixed_entries() {
+        let layout = PanelLayout::new(Presentation::Brief, 720., 260.);
+        let mut directory = numbered_directory(5);
+        directory.marked.insert(directory.entries[1].path.clone());
+
+        let mut selection = None;
+        for _ in 0..3 {
+            selection = layout.extend_selection(&mut directory, "down", selection);
+        }
+        assert_eq!(directory.cursor, 3);
+        assert_eq!(directory.marked.len(), 3);
+        for entry in &directory.entries[..3] {
+            assert!(directory.marked.contains(&entry.path));
+        }
+
+        // A new gesture starting from a marked entry removes marks throughout.
+        directory.cursor = 2;
+        directory.marked.remove(&directory.entries[1].path);
+        let selection = layout.extend_selection(&mut directory, "up", None);
+        let selection = layout.extend_selection(&mut directory, "up", selection);
+        layout.extend_selection(&mut directory, "up", selection);
+        assert_eq!(directory.cursor, 0);
+        assert!(directory.marked.is_empty());
+    }
+
+    #[test]
+    fn shift_jumps_apply_to_both_endpoints_and_every_entry_between() {
+        let layout = PanelLayout::new(Presentation::Brief, 720., 260.);
+        for (command, destination) in [
+            ("right", 45),
+            ("left", 25),
+            ("first", 0),
+            ("last", 79),
+            ("page-up", 5),
+            ("page-down", 65),
+        ] {
+            let mut directory = numbered_directory(80);
+            Arc::make_mut(&mut directory.entries)[0] = parent_entry(&directory.path).unwrap();
+            let start = 35;
+            directory.cursor = start;
+            directory.top = 20;
+            let expected = start.min(destination)..=start.max(destination);
+
+            layout.extend_selection(&mut directory, command, None);
+            assert_eq!(directory.cursor, destination, "{command}");
+            assert!(directory.top <= destination);
+            assert!(destination < directory.top + layout.rows * layout.columns);
+            for (index, entry) in directory.entries.iter().enumerate() {
+                assert_eq!(
+                    directory.marked.contains(&entry.path),
+                    !entry.parent && expected.contains(&index),
+                    "{command}, entry {index}"
+                );
+            }
+
+            directory.cursor = start;
+            layout.extend_selection(&mut directory, command, None);
+            assert!(directory.marked.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
     fn wheel_moves_cursor_and_viewport_together_without_changing_marks() {
         for presentation in [
             Presentation::Brief,
@@ -1009,7 +1112,7 @@ mod tests {
             .apply(0, read_directory(&child, true, SortOrder::Name));
         assert!(browser.current().entries.iter().all(|e| !e.parent));
         assert_eq!(browser.current().focused().unwrap().name, "empty");
-        browser.current_mut().move_cursor(-1, false, 10, 1);
+        browser.current_mut().move_cursor(-1);
         assert_eq!(browser.current().cursor, 0);
         browser.preview(3);
         browser.active = 2;

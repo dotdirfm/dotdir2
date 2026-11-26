@@ -11,7 +11,7 @@ use dotdir_core::copy::{CancelToken, ConflictPolicy, ConflictResolution, CopyEve
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -55,23 +55,24 @@ impl Source {
         Ok(())
     }
 
-    fn write_to(&self, output: &mut dyn Write, progress: &mut Progress<'_>) -> Result<()> {
+    fn with_reader(
+        &self,
+        ctx: &TransferContext<'_>,
+        read: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+    ) -> Result<()> {
         match &self.origin {
             Origin::Local(_) => {
                 self.check_local()?;
                 let mut input = File::open(self.location.local().unwrap())?;
-                progress.copy(&mut input, output, self.size)?;
+                read(&mut input)?;
                 self.check_local()
             }
-            Origin::Archive(snapshot) => {
-                let ctx = progress.ctx;
-                snapshot.with_member(
-                    self.location.archive_member().unwrap(),
-                    ctx.filesystems,
-                    ctx.cancel,
-                    &mut |input| progress.copy(input, output, self.size),
-                )
-            }
+            Origin::Archive(snapshot) => snapshot.with_member(
+                self.location.archive_member().unwrap(),
+                ctx.filesystems,
+                ctx.cancel,
+                read,
+            ),
         }
     }
 }
@@ -104,36 +105,62 @@ impl<'a> Progress<'a> {
         }
     }
 
-    fn copy(&mut self, input: &mut dyn Read, output: &mut dyn Write, size: u64) -> Result<()> {
-        let mut written = 0u64;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            ensure!(
-                !self.ctx.cancel.is_cancelled(),
-                "Archive operation cancelled"
-            );
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            written = written
-                .checked_add(count as u64)
-                .context("File is too large")?;
-            ensure!(written <= size, "File exceeds its declared size");
-            output.write_all(&buffer[..count])?;
-            self.state.bytes_copied = self.state.bytes_copied.saturating_add(count as u64);
-            if self.last.elapsed() >= Duration::from_millis(50) {
-                self.report();
-            }
-        }
-        ensure!(written == size, "File size does not match its contents");
-        Ok(())
-    }
-
     fn report(&mut self) {
         (self.ctx.emit)(CopyEvent::Progress(self.state.clone()));
         self.last = Instant::now();
     }
+}
+
+struct ProgressReader<'a, 'ctx> {
+    input: &'a mut dyn Read,
+    remaining: u64,
+    progress: &'a std::cell::RefCell<Progress<'ctx>>,
+}
+
+impl Read for ProgressReader<'_, '_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.progress.borrow().ctx.cancel.is_cancelled() {
+            return Err(io::Error::other("Archive operation cancelled"));
+        }
+        let count = self.input.read(buffer)?;
+        if count == 0 && self.remaining != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "File size does not match its contents",
+            ));
+        }
+        self.remaining = self.remaining.checked_sub(count as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "File exceeds its declared size")
+        })?;
+        let mut progress = self.progress.borrow_mut();
+        progress.state.bytes_copied = progress.state.bytes_copied.saturating_add(count as u64);
+        if progress.last.elapsed() >= Duration::from_millis(50) {
+            progress.report();
+        }
+        Ok(count)
+    }
+}
+
+fn with_progress(
+    input: &mut dyn Read,
+    size: u64,
+    progress: &std::cell::RefCell<Progress<'_>>,
+    read: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    let mut stream = ProgressReader {
+        input,
+        remaining: size,
+        progress,
+    };
+    read(&mut stream)?;
+    ensure!(
+        stream.remaining == 0,
+        "Archive provider did not consume the entire file"
+    );
+    Ok(())
 }
 
 fn collect(selections: &[Location], ctx: &TransferContext<'_>) -> Result<Vec<Source>> {
@@ -260,21 +287,30 @@ impl Planned<'_> {
     }
 
     fn input<'a>(&'a self, progress: &'a std::cell::RefCell<Progress<'_>>) -> Input<'a> {
-        let contents: Option<Box<dotdir_archive_api::WriteContents<'a>>> = (!self.source.directory)
+        let contents: Option<Box<dotdir_archive_api::ReadContents<'a>>> = (!self.source.directory)
             .then(|| {
-                Box::new(move |output: &mut dyn Write| {
+                Box::new(move |read: &mut dyn FnMut(&mut dyn Read) -> Result<()>| {
+                    let ctx = progress.borrow().ctx;
+                    progress.borrow_mut().state.current_file = self.target.display().to_string();
+                    self.source.with_reader(ctx, &mut |input| {
+                        with_progress(input, self.source.size, progress, &mut |source| {
+                            if let Some((snapshot, size)) = &self.append {
+                                snapshot.with_member(
+                                    &self.target,
+                                    ctx.filesystems,
+                                    ctx.cancel,
+                                    &mut |old| {
+                                        with_progress(old, *size, progress, &mut |existing| {
+                                            read(&mut existing.chain(&mut *source))
+                                        })
+                                    },
+                                )
+                            } else {
+                                read(source)
+                            }
+                        })
+                    })?;
                     let mut progress = progress.borrow_mut();
-                    progress.state.current_file = self.target.display().to_string();
-                    if let Some((snapshot, size)) = &self.append {
-                        let ctx = progress.ctx;
-                        snapshot.with_member(
-                            &self.target,
-                            ctx.filesystems,
-                            ctx.cancel,
-                            &mut |input| progress.copy(input, output, *size),
-                        )?;
-                    }
-                    self.source.write_to(output, &mut progress)?;
                     progress.state.files_done = progress.state.files_done.saturating_add(1);
                     if progress.state.files_done == progress.state.files_total {
                         progress.report();
@@ -361,7 +397,10 @@ pub(crate) fn create_entry(
         size: 0,
         modified: Some(SystemTime::now()),
         unix_mode: None,
-        contents: (!folder).then(|| Box::new(|_: &mut dyn Write| Ok(())) as Box<_>),
+        contents: (!folder).then(|| {
+            Box::new(|read: &mut dyn FnMut(&mut dyn Read) -> Result<()>| read(&mut io::empty()))
+                as Box<_>
+        }),
     };
     archive.rewrite(
         Changes {
@@ -511,6 +550,7 @@ pub(crate) fn transfer_into(
                     append = Some((archive.mounted(ctx.filesystems, ctx.cancel)?, existing.size));
                     ConflictResolution::Overwrite
                 }
+                ConflictPolicy::Resume => bail!("Resume is available for local copies only"),
             };
             match decision {
                 ConflictResolution::Overwrite => {}
@@ -719,7 +759,7 @@ fn free_name(path: &Path, exists: impl Fn(&Path) -> bool) -> Result<String> {
 mod tests {
     use super::*;
     use dotdir_zip::ZIP;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
     fn context<'a>(filesystems: &'a Filesystems, cancel: &'a CancelToken) -> TransferContext<'a> {
@@ -932,7 +972,12 @@ mod tests {
         let secret = temp.path().join("secret.zip");
         let options = CreationOptions::from([
             ("compression", "maximum".into()),
-            ("password", "unit-test-key".into()),
+            (
+                "password",
+                dotdir_archive_api::OptionValue::Secret(dotdir_archive_api::Password::new(
+                    b"unit-test-key".to_vec(),
+                )),
+            ),
         ]);
         create(std::slice::from_ref(&source), &secret, &ZIP, &options, &ctx).unwrap();
         let mut zip = ZipArchive::new(File::open(&secret).unwrap()).unwrap();
@@ -946,6 +991,166 @@ mod tests {
         assert_eq!(content, b"compressed data".repeat(200));
         assert!(create(&[source], &plain, &ZIP, &options, &ctx).is_err());
         assert_eq!(fs::read(&plain).unwrap(), original);
+    }
+
+    #[test]
+    fn appending_to_zip_streams_existing_and_incoming_contents_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("existing.zip");
+        fs::write(&zip, zip_bytes(&[("note.txt", b"before ")])).unwrap();
+        let source = temp.path().join("note.txt");
+        fs::write(&source, b"after").unwrap();
+        let root = mount(zip);
+        let filesystems = Filesystems::new(Default::default());
+        let cancel = CancelToken::new();
+        transfer_into(
+            &[source.into()],
+            &root,
+            false,
+            ConflictPolicy::Append,
+            &context(&filesystems, &cancel),
+        )
+        .unwrap();
+        assert_eq!(
+            entry(&root, "note.txt").read_preview(&filesystems).unwrap(),
+            b"before after"
+        );
+    }
+
+    #[cfg(all(feature = "tar-extension", feature = "sevenz-extension"))]
+    #[test]
+    fn creates_each_tar_variant_and_streams_it_into_an_encrypted_7z() {
+        use crate::archive_passwords::ArchivePasswords;
+        use dotdir_archive_api::{OptionKind, OptionValue, Password};
+        use sevenz_rust2::{ArchiveReader, EncoderMethod, Error};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("sample");
+        fs::create_dir_all(folder.join("empty")).unwrap();
+        fs::write(folder.join("note.txt"), b"from archive\n").unwrap();
+        fs::write(folder.join("zero.txt"), []).unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let count = prompts.clone();
+        let mut filesystems = Filesystems::new(Default::default());
+        let password = "fixture-🔐";
+        filesystems.archive_passwords = Arc::new(ArchivePasswords::new(15, move |request| {
+            count.fetch_add(1, Ordering::Relaxed);
+            request
+                .reply
+                .send(Password::new(password.as_bytes().to_vec()))
+                .unwrap();
+        }));
+        let cancel = CancelToken::new();
+        let ctx = context(&filesystems, &cancel);
+
+        let tar = &dotdir_tar::TAR;
+        let schema = tar.creation().unwrap();
+        let OptionKind::Choice(choices) = schema.fields[0].kind else {
+            unreachable!()
+        };
+        for choice in choices {
+            let suffix = choice.suffix.unwrap_or(schema.suffix);
+            let output = temp.path().join(format!("packed.{suffix}"));
+            let options = CreationOptions::from([("compression", choice.value.into())]);
+            create(&[folder.clone().into()], &output, tar, &options, &ctx).unwrap();
+            let root = Archive::mount_location(output.into(), tar).unwrap();
+            assert_eq!(
+                entry(&root, "sample/note.txt")
+                    .read_preview(&filesystems)
+                    .unwrap(),
+                b"from archive\n"
+            );
+            assert!(
+                entry(&root, "sample/zero.txt")
+                    .read_preview(&filesystems)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                entry(&root, "sample/empty")
+                    .archive_metadata(&filesystems)
+                    .unwrap()
+                    .unwrap()
+                    .directory
+            );
+        }
+        assert_eq!(choices.len(), 5);
+
+        let tar =
+            Archive::mount_location(temp.path().join("packed.tar.xz").into(), &dotdir_tar::TAR)
+                .unwrap();
+        let output = temp.path().join("secret.7z");
+        let options = CreationOptions::from([
+            ("compression", "fast".into()),
+            (
+                "password",
+                OptionValue::Secret(Password::new(password.as_bytes().to_vec())),
+            ),
+        ]);
+        create(
+            &[entry(&tar, "sample")],
+            &output,
+            &dotdir_sevenz::SEVEN_ZIP,
+            &options,
+            &ctx,
+        )
+        .unwrap();
+        let secure = File::open(&output).unwrap();
+        assert!(matches!(
+            ArchiveReader::new(secure, sevenz_rust2::Password::empty()),
+            Err(Error::PasswordRequired)
+        ));
+        let root =
+            Archive::mount_location(output.clone().into(), &dotdir_sevenz::SEVEN_ZIP).unwrap();
+        assert_eq!(
+            entry(&root, "sample/note.txt")
+                .read_preview(&filesystems)
+                .unwrap(),
+            b"from archive\n"
+        );
+        assert!(
+            entry(&root, "sample/zero.txt")
+                .read_preview(&filesystems)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            entry(&root, "sample/empty")
+                .archive_metadata(&filesystems)
+                .unwrap()
+                .unwrap()
+                .directory
+        );
+        assert_eq!(prompts.load(Ordering::Relaxed), 1);
+
+        let reader = ArchiveReader::new(File::open(output).unwrap(), password.into()).unwrap();
+        let aes: Vec<_> = reader
+            .archive()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.coders)
+            .filter(|coder| coder.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
+            .map(|coder| coder.properties())
+            .collect();
+        assert_eq!(aes.len(), 2);
+        assert_ne!(aes[0], aes[1]);
+
+        let uncompressed = temp.path().join("plain.7z");
+        let note = folder.join("note.txt");
+        create(
+            &[note.into()],
+            &uncompressed,
+            &dotdir_sevenz::SEVEN_ZIP,
+            &CreationOptions::from([("compression", "store".into())]),
+            &ctx,
+        )
+        .unwrap();
+        let root = Archive::mount_location(uncompressed.into(), &dotdir_sevenz::SEVEN_ZIP).unwrap();
+        let bytes = entry(&root, "note.txt")
+            .open_seekable(&filesystems, &cancel)
+            .unwrap();
+        assert_eq!(bytes.memory_usage(), 0);
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl DotDir {
         location: (usize, usize),
         index: usize,
         directory: &Directory,
-        presentation: Presentation,
+        layout: PanelLayout,
         active: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -79,6 +79,7 @@ impl DotDir {
         let entry = &directory.entries[index];
         let cursor = directory.cursor == index;
         let marked = directory.marked.contains(&entry.path);
+        let presentation = layout.presentation;
         let icons = presentation == Presentation::Icons;
         let mut item = div()
             .id(SharedString::from(format!(
@@ -101,18 +102,40 @@ impl DotDir {
             .flex_shrink_0()
             .overflow_hidden()
             .cursor_default()
-            .when(marked, |s| s.bg(p.marked))
-            .when(cursor, |s| {
-                s.bg(p.selected)
-                    .when_some(p.selected_fg, |style, fg| style.text_color(fg))
-            })
-            .when(cursor && active, |s| {
+            .when(marked, |s| {
+                let (round_top, round_bottom) = if icons {
+                    (true, true)
+                } else {
+                    let row = (index - directory.top) % layout.rows;
+                    let is_marked = |index: usize| {
+                        directory
+                            .entries
+                            .get(index)
+                            .is_some_and(|entry| directory.marked.contains(&entry.path))
+                    };
+                    (
+                        row == 0 || !is_marked(index - 1),
+                        row + 1 == layout.rows || !is_marked(index + 1),
+                    )
+                };
                 s.child(
                     div()
                         .absolute()
                         .inset_0()
-                        .border_1()
-                        .border_color(p.accent)
+                        .left(px(4.))
+                        .right(px(4.))
+                        .bg(p.marked)
+                        .when(round_top, |s| s.rounded_t(px(4.)))
+                        .when(round_bottom, |s| s.rounded_b(px(4.))),
+                )
+            })
+            .when(cursor, |s| {
+                s.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(p.accent.alpha(0.1))
+                        .when(active, |s| s.border_1().border_color(p.accent))
                         .when(icons, |s| s.rounded(px(5.))),
                 )
             })
@@ -252,7 +275,7 @@ impl DotDir {
                             (pane, column),
                             index,
                             &directory,
-                            layout.presentation,
+                            layout,
                             active,
                             cx,
                         ));
@@ -289,7 +312,7 @@ impl DotDir {
                             (pane, column),
                             index,
                             &directory,
-                            layout.presentation,
+                            layout,
                             active,
                             cx,
                         ));

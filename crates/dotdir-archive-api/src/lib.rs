@@ -69,9 +69,38 @@ pub enum OptionKind {
 pub struct Choice {
     pub value: &'static str,
     pub label: &'static str,
+    /// Output suffix when this choice changes the archive's on-disk format.
+    pub suffix: Option<&'static str>,
 }
 
-pub type CreationOptions = BTreeMap<&'static str, String>;
+pub type CreationOptions = BTreeMap<&'static str, OptionValue>;
+
+pub enum OptionValue {
+    Text(String),
+    Secret(Password),
+}
+
+impl OptionValue {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Secret(_) => None,
+        }
+    }
+
+    pub fn as_secret(&self) -> Option<&[u8]> {
+        match self {
+            Self::Text(_) => None,
+            Self::Secret(password) => Some(password.as_slice()),
+        }
+    }
+}
+
+impl From<&str> for OptionValue {
+    fn from(text: &str) -> Self {
+        Self::Text(text.into())
+    }
+}
 
 pub struct Password(Zeroizing<Vec<u8>>);
 
@@ -129,16 +158,17 @@ pub fn member_name(path: &Path) -> Result<Cow<'_, str>> {
 }
 
 /// The host validates paths and supplies streams for regular files. Directories
-/// have no stream. A provider invokes each file's stream once while writing it.
+/// have no stream. The provider calls the stream callback once per file and
+/// reads it to EOF before returning from the callback.
 pub struct Input<'a> {
     pub path: PathBuf,
     pub size: u64,
     pub modified: Option<SystemTime>,
     pub unix_mode: Option<u32>,
-    pub contents: Option<Box<WriteContents<'a>>>,
+    pub contents: Option<Box<ReadContents<'a>>>,
 }
 
-pub type WriteContents<'a> = dyn Fn(&mut dyn Write) -> Result<()> + 'a;
+pub type ReadContents<'a> = dyn Fn(&mut dyn FnMut(&mut dyn Read) -> Result<()>) -> Result<()> + 'a;
 
 /// Remove entire subtrees, then write the supplied entries. A file supplied
 /// at an existing path replaces it. Other entries and their metadata survive.

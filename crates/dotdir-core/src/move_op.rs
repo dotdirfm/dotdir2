@@ -112,8 +112,10 @@ pub fn move_tree(
         copy_xattrs: true,
         sparse_files: false,
         use_cow: false,
-        symlink_mode: SymlinkMode::Smart,
+        symlink_mode: SymlinkMode::AlwaysLink,
         disable_write_cache: false,
+        ask_read_only: false,
+        filter: None,
     };
 
     for source in sources {
@@ -188,7 +190,7 @@ pub fn move_tree(
 
         // Cross-device fallback: copy + delete
         if meta.file_type().is_symlink() {
-            copy::copy_symlink(source, &actual_dest, &copy_options)?;
+            copy::copy_symlink(source, &actual_dest)?;
             fs::remove_file(source).map_err(FsError::from_io)?;
             files_done.set(files_done.get() + 1);
         } else if meta.is_dir() {
@@ -282,7 +284,7 @@ fn copy_dir_for_move(
         };
 
         if meta.file_type().is_symlink() {
-            copy::copy_symlink(&src_path, &dest_path, options)?;
+            copy::copy_symlink(&src_path, &dest_path)?;
             files_done.set(files_done.get() + 1);
         } else if meta.is_dir() {
             let canonical = match src_path.canonicalize() {

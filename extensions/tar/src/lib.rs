@@ -2,12 +2,14 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use dotdir_archive_api::{
-    ArchiveFormat, ArchiveReader, Entry, FormatInfo, PasswordAccess, VirtualFile, member_name,
+    ArchiveFormat, ArchiveReader, Choice, Creation, CreationOptions, Entry, FormatInfo, Input,
+    OptionField, OptionKind, OptionValue, PasswordAccess, VirtualFile, WriteSeek, member_name,
 };
 use std::{
     collections::BTreeMap,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    time::SystemTime,
 };
 
 pub static TAR: TarFormat = TarFormat;
@@ -49,6 +51,111 @@ impl ArchiveFormat for TarFormat {
             members,
         }))
     }
+
+    fn creation(&self) -> Option<&'static Creation> {
+        Some(&Creation {
+            name: "TAR",
+            suffix: "tar",
+            fields: &[OptionField {
+                id: "compression",
+                label: "Compression",
+                default: "none",
+                kind: OptionKind::Choice(&[
+                    Choice {
+                        value: "none",
+                        label: "None",
+                        suffix: None,
+                    },
+                    Choice {
+                        value: "gzip",
+                        label: "gzip",
+                        suffix: Some("tar.gz"),
+                    },
+                    Choice {
+                        value: "bzip2",
+                        label: "bzip2",
+                        suffix: Some("tar.bz2"),
+                    },
+                    Choice {
+                        value: "xz",
+                        label: "xz",
+                        suffix: Some("tar.xz"),
+                    },
+                    Choice {
+                        value: "zstd",
+                        label: "Zstandard",
+                        suffix: Some("tar.zst"),
+                    },
+                ]),
+            }],
+        })
+    }
+
+    fn create(
+        &self,
+        entries: &[Input<'_>],
+        options: &CreationOptions,
+        output: &mut dyn WriteSeek,
+    ) -> Result<()> {
+        match options.get("compression").and_then(OptionValue::as_text) {
+            None | Some("none") => {
+                write_tar(entries, output)?;
+            }
+            Some("gzip") => {
+                write_tar(
+                    entries,
+                    flate2::write::GzEncoder::new(output, flate2::Compression::default()),
+                )?
+                .finish()?;
+            }
+            Some("bzip2") => {
+                write_tar(
+                    entries,
+                    bzip2::write::BzEncoder::new(output, bzip2::Compression::default()),
+                )?
+                .finish()?;
+            }
+            Some("xz") => {
+                write_tar(
+                    entries,
+                    lzma_rust2::XzWriter::new(output, lzma_rust2::XzOptions::with_preset(6))?,
+                )?
+                .finish()?;
+            }
+            Some("zstd") => {
+                write_tar(entries, zstd::stream::write::Encoder::new(output, 3)?)?.finish()?;
+            }
+            Some(_) => bail!("Unknown TAR compression setting"),
+        }
+        Ok(())
+    }
+}
+
+fn write_tar<W: Write>(entries: &[Input<'_>], writer: W) -> Result<W> {
+    let mut archive = tar::Builder::new(writer);
+    for input in entries {
+        let mut header = tar::Header::new_gnu();
+        let file = input.contents.is_some();
+        header.set_entry_type(if file {
+            tar::EntryType::Regular
+        } else {
+            tar::EntryType::Directory
+        });
+        header.set_mode(input.unix_mode.unwrap_or(if file { 0o644 } else { 0o755 }) & 0o777);
+        header.set_mtime(
+            input
+                .modified
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |age| age.as_secs()),
+        );
+        header.set_size(if file { input.size } else { 0 });
+        if let Some(contents) = &input.contents {
+            contents(&mut |source| Ok(archive.append_data(&mut header, &input.path, source)?))?;
+        } else {
+            archive.append_data(&mut header, &input.path, io::empty())?;
+        }
+    }
+    Ok(archive.into_inner()?)
 }
 
 #[derive(Clone, Copy, Debug)]

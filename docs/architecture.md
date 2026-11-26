@@ -44,7 +44,8 @@ the file panes and application chrome are custom GPUI elements.
   limits, extraction, and save transactions. Providers enumerate and stream
   entries, and can offer direct seeks, batch entry changes, and archive creation.
   The creation schema declares the output suffix and choice, text, or masked
-  fields. The host renders those fields and streams selected files to the
+  fields. Choices such as TAR compression can supply a different suffix.
+  The host renders the fields and lends each selected file's reader to the
   provider. Register native formats in `crates/dotdir/src/archive_extensions.rs`.
   ZIP, 7z, and TAR are enabled by default. The 7z reader streams the member's
   compression block and the TAR reader streams compressed tarballs.

@@ -21,9 +21,10 @@ use crate::{
     vscode,
     vscode_theme::{ImportedTheme, ThemeSource},
 };
-use dotdir_archive_api::{ArchiveFormat, OptionKind, Password};
+use anyhow::Context as _;
+use dotdir_archive_api::{ArchiveFormat, OptionKind, OptionValue, Password};
 use dotdir_core::{
-    copy::{CancelToken, ConflictResolution, CopyEvent, CopyOptions},
+    copy::{self, CancelToken, ConflictPolicy, ConflictResolution, CopyEvent, CopyOptions},
     search::{FileSearchEvent, FileSearchRequest},
     watch::FsWatcher,
 };
@@ -85,15 +86,63 @@ pub(crate) enum Message {
     Simple(anyhow::Result<()>),
 }
 
+fn read_password(input: &InputState) -> Password {
+    let text = input.text();
+    let mut password = Password::new(Vec::with_capacity(text.len()));
+    for chunk in text.chunks() {
+        password.extend_from_slice(chunk.as_bytes());
+    }
+    password
+}
+
+fn quote_copy_destination(path: &str) -> String {
+    format!("\"{}\"", path.replace('"', "\"\""))
+}
+
+fn parse_copy_destinations(value: &str) -> anyhow::Result<Vec<String>> {
+    let mut rest = value.trim_start();
+    let mut paths = Vec::new();
+    loop {
+        let path = if let Some(quoted) = rest.strip_prefix('"') {
+            rest = quoted;
+            let mut path = String::new();
+            loop {
+                let (part, tail) = rest
+                    .split_once('"')
+                    .context("Close the quoted destination path")?;
+                path.push_str(part);
+                if let Some(escaped) = tail.strip_prefix('"') {
+                    path.push('"');
+                    rest = escaped;
+                } else {
+                    rest = tail.trim_start();
+                    break;
+                }
+            }
+            path
+        } else {
+            let end = rest.find(';').unwrap_or(rest.len());
+            let (path, tail) = rest.split_at(end);
+            rest = tail;
+            path.trim().to_owned()
+        };
+        anyhow::ensure!(!path.is_empty(), "Enter a directory for each destination");
+        paths.push(path);
+        if rest.is_empty() {
+            return Ok(paths);
+        }
+        rest = rest
+            .strip_prefix(';')
+            .context("Separate destination directories with semicolons")?
+            .trim_start();
+    }
+}
+
 impl DotDir {
     pub fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.modal, Some(Modal::ArchivePassword { .. })) {
             if let Some(Modal::ArchivePassword { request, input }) = self.modal.take() {
-                let text = input.read(cx).text();
-                let mut password = Password::new(Vec::with_capacity(text.len()));
-                for chunk in text.chunks() {
-                    password.extend_from_slice(chunk.as_bytes());
-                }
+                let password = read_password(input.read(cx));
                 input.update(cx, |input, cx| input.set_value("", window, cx));
                 let _ = request.reply.send(password);
                 self.focus_pane(self.active, window, cx);
@@ -145,7 +194,12 @@ impl DotDir {
         if !matches!(self.modal, Some(Modal::Prompt { .. })) {
             return;
         }
-        let Some(Modal::Prompt { kind, .. }) = self.modal.take() else {
+        let Some(Modal::Prompt {
+            kind,
+            title,
+            description,
+        }) = self.modal.take()
+        else {
             return;
         };
         let result = (|| -> anyhow::Result<()> {
@@ -250,24 +304,69 @@ impl DotDir {
                     if value.trim().is_empty() {
                         anyhow::bail!("Enter a destination directory");
                     }
-                    let destination = if let Some(path) = archive_destination
-                        && value == path.display()
-                    {
-                        path
-                    } else {
-                        let path = self.resolve_path(value.trim());
-                        anyhow::ensure!(path.is_dir(), "Destination directory does not exist");
-                        path.into()
-                    };
+                    let local_copy = matches!(kind, OperationKind::Copy)
+                        && sources.iter().all(|source| source.local().is_some());
+                    let archive_destination =
+                        archive_destination.filter(|path| value.trim() == path.display());
+                    let mut options = self.copy_options.clone();
                     let id = self.id();
-                    self.operation = Some(Operation::transfer(
-                        id,
-                        kind,
-                        sources,
-                        destination,
-                        self.copy_options.clone(),
-                        self.filesystems.clone(),
-                    ));
+                    self.operation = if local_copy && archive_destination.is_none() {
+                        let values = if self.copy_multiple {
+                            parse_copy_destinations(&value)?
+                        } else {
+                            vec![value.trim().to_owned()]
+                        };
+                        let destinations = values
+                            .iter()
+                            .map(|value| self.resolve_path(value))
+                            .map(|path| {
+                                anyhow::ensure!(
+                                    path.is_dir(),
+                                    "Destination directory does not exist: {}",
+                                    path.display()
+                                );
+                                Ok(path)
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        if self.copy_use_filter {
+                            let pattern = self.copy_filter.read(cx).value();
+                            anyhow::ensure!(
+                                !pattern.trim().is_empty(),
+                                "Enter a file filter pattern"
+                            );
+                            copy::validate_copy_filter(pattern.trim())?;
+                            options.filter = Some(pattern.trim().to_owned());
+                        }
+                        let sources = sources
+                            .into_iter()
+                            .map(|source| source.local().unwrap().to_path_buf())
+                            .collect();
+                        Some(Operation::copy(id, sources, destinations, options))
+                    } else {
+                        let destination = if let Some(path) = archive_destination {
+                            path
+                        } else {
+                            let path = self.resolve_path(value.trim());
+                            anyhow::ensure!(path.is_dir(), "Destination directory does not exist");
+                            path.into()
+                        };
+                        if !self.transfer_supports_policy(
+                            kind,
+                            &sources,
+                            destination.archive_member().is_some(),
+                            options.conflict_policy,
+                        ) {
+                            options.conflict_policy = ConflictPolicy::Ask;
+                        }
+                        Some(Operation::transfer(
+                            id,
+                            kind,
+                            sources,
+                            destination,
+                            options,
+                            self.filesystems.clone(),
+                        ))
+                    };
                 }
                 PromptKind::DeleteArchive(sources) => {
                     anyhow::ensure!(
@@ -309,8 +408,8 @@ impl DotDir {
         if let Err(e) = result {
             self.modal = Some(Modal::Prompt {
                 kind,
-                title: "Check your input".into(),
-                description: String::new(),
+                title,
+                description,
             });
             self.modal_error = Some(e.to_string());
             self.dialog_input.update(cx, |s, cx| s.focus(window, cx));
@@ -386,6 +485,12 @@ impl DotDir {
                         | "last"
                         | "mark-down"
                         | "mark-up"
+                        | "mark-left"
+                        | "mark-right"
+                        | "mark-first"
+                        | "mark-last"
+                        | "mark-page-up"
+                        | "mark-page-down"
                         | "escape"
                 )
             })
@@ -2056,6 +2161,38 @@ impl ArchiveDialog {
         self.sources.len()
     }
 
+    fn output_suffix(&self) -> &'static str {
+        let creation = self.format.creation().unwrap();
+        creation
+            .fields
+            .iter()
+            .zip(&self.options)
+            .find_map(|(field, option)| {
+                let (OptionKind::Choice(choices), ArchiveOption::Choice(value)) =
+                    (&field.kind, option)
+                else {
+                    return None;
+                };
+                choices.iter().find(|choice| choice.value == *value)?.suffix
+            })
+            .unwrap_or(creation.suffix)
+    }
+
+    fn clear_secrets(&self, window: &mut Window, cx: &mut Context<DotDir>) {
+        for (field, option) in self
+            .format
+            .creation()
+            .unwrap()
+            .fields
+            .iter()
+            .zip(&self.options)
+        {
+            if let (OptionKind::Secret, ArchiveOption::Text(input)) = (&field.kind, option) {
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+    }
+
     fn fields(
         format: &'static dyn ArchiveFormat,
         window: &mut Window,
@@ -2076,6 +2213,13 @@ impl ArchiveDialog {
             })
             .collect()
     }
+}
+
+fn strip_archive_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let dot = name.len().checked_sub(suffix.len() + 1)?;
+    (name.as_bytes()[dot] == b'.'
+        && name.as_bytes()[dot + 1..].eq_ignore_ascii_case(suffix.as_bytes()))
+    .then(|| &name[..dot])
 }
 pub(crate) enum QuickPickAction {
     Extension {
@@ -2120,6 +2264,11 @@ pub(crate) struct DotDir {
     pub panel_menu_scroll: ScrollHandle,
     pub operation: Option<Operation>,
     pub copy_options: CopyOptions,
+    pub copy_multiple: bool,
+    pub copy_use_filter: bool,
+    pub copy_filter: Entity<InputState>,
+    pub transfer_dropdown_open: Option<&'static str>,
+    transfer_prompt_id: u64,
     pub terminals: Vec<Terminal>,
     pub terminal_active: usize,
     pub terminal_visible: bool,
@@ -2150,6 +2299,7 @@ pub(crate) struct DotDir {
     pub extension_request: u64,
     pub last_typeahead: Instant,
     pub typeahead: String,
+    shift_selection: Option<ShiftSelection>,
     pub _subscriptions: Vec<Subscription>,
     pub shutting_down: bool,
     pub quit_pending: bool,
@@ -2217,6 +2367,8 @@ impl DotDir {
         focus.focus(window, cx);
         let command_line = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         let dialog_input = cx.new(|cx| InputState::new(window, cx));
+        let copy_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. *.rs or src/**/*.rs"));
         let jump_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type filename…"));
         let search_content =
             cx.new(|cx| InputState::new(window, cx).placeholder("Containing text (optional)"));
@@ -2256,6 +2408,11 @@ impl DotDir {
                     window.refresh();
                 },
             ),
+            cx.observe_window_activation(window, |this, window, _| {
+                if !window.is_window_active() {
+                    this.end_shift_selection();
+                }
+            }),
             cx.on_release(|this, _| {
                 this.persist();
                 if let Some(s) = &this.search {
@@ -2347,6 +2504,11 @@ impl DotDir {
             panel_menu_scroll: ScrollHandle::new(),
             operation: None,
             copy_options: CopyOptions::default(),
+            copy_multiple: false,
+            copy_use_filter: false,
+            copy_filter,
+            transfer_dropdown_open: None,
+            transfer_prompt_id: 0,
             terminals: vec![],
             terminal_active: 0,
             terminal_visible: false,
@@ -2381,6 +2543,7 @@ impl DotDir {
             extension_request: 0,
             last_typeahead: Instant::now(),
             typeahead: String::new(),
+            shift_selection: None,
             settings_path,
             settings,
             _subscriptions: subscriptions,
@@ -2742,6 +2905,7 @@ impl DotDir {
         cx.notify();
     }
     pub fn focus_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_shift_selection();
         self.active = pane;
         if let Some(id) = self.active_document() {
             if let Some(d) = self.documents.get(&id) {
@@ -3282,6 +3446,15 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(&kind, PromptKind::Transfer { .. }) {
+            self.transfer_prompt_id += 1;
+            self.transfer_dropdown_open = None;
+            self.copy_multiple = false;
+            self.copy_use_filter = false;
+            self.copy_options.conflict_policy = ConflictPolicy::Ask;
+            self.copy_filter
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         let has_input = !matches!(
             &kind,
             PromptKind::Trash(_)
@@ -3306,6 +3479,101 @@ impl DotDir {
             self.focus_modal(window, cx);
         }
         cx.notify();
+    }
+
+    pub(crate) fn transfer_supports_policy(
+        &self,
+        kind: OperationKind,
+        sources: &[Location],
+        archive_target: bool,
+        policy: ConflictPolicy,
+    ) -> bool {
+        match policy {
+            ConflictPolicy::Append => !matches!(kind, OperationKind::Move),
+            ConflictPolicy::Resume => {
+                matches!(kind, OperationKind::Copy)
+                    && !archive_target
+                    && sources.iter().all(|source| source.local().is_some())
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn set_copy_multiple(
+        &mut self,
+        multiple: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = self.dialog_input.read(cx).value();
+        let value = if multiple && (value.contains(';') || value.contains('"')) {
+            quote_copy_destination(&value)
+        } else if !multiple {
+            parse_copy_destinations(&value)
+                .ok()
+                .and_then(|paths| paths.into_iter().next())
+                .unwrap_or_else(|| value.to_string())
+        } else {
+            value.to_string()
+        };
+        self.copy_multiple = multiple;
+        self.dialog_input
+            .update(cx, |input, cx| input.set_value(value, window, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn choose_transfer_destination(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.transfer_prompt_id;
+        let multiple = self.copy_multiple;
+        let dialog = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple,
+            prompt: Some("Choose Destination".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(result) = dialog.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.transfer_prompt_id != id
+                    || !matches!(
+                        this.modal,
+                        Some(Modal::Prompt {
+                            kind: PromptKind::Transfer { .. },
+                            ..
+                        })
+                    )
+                {
+                    return;
+                }
+                match result {
+                    Ok(Some(paths)) if !paths.is_empty() => {
+                        let value = if multiple {
+                            paths
+                                .iter()
+                                .map(|path| quote_copy_destination(&path.to_string_lossy()))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        } else {
+                            paths[0].to_string_lossy().into_owned()
+                        };
+                        this.dialog_input.update(cx, |input, cx| {
+                            input.set_value(value, window, cx);
+                            input.focus(window, cx);
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.modal_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn prompt_create_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3361,18 +3629,52 @@ impl DotDir {
         if dialog.format.info().id == format.info().id {
             return;
         }
-        let old_suffix = format!(".{}", dialog.format.creation().unwrap().suffix);
-        let new_suffix = format.creation().unwrap().suffix;
+        let old_suffix = dialog.output_suffix();
+        dialog.clear_secrets(window, cx);
         dialog.format = format;
         dialog.options = ArchiveDialog::fields(format, window, cx);
-        let value = self.dialog_input.read(cx).value().to_string();
-        if let Some(stem) = value.strip_suffix(&old_suffix) {
-            self.dialog_input.update(cx, |input, cx| {
-                input.set_value(format!("{stem}.{new_suffix}"), window, cx);
-            });
-        }
+        let new_suffix = dialog.output_suffix();
+        self.update_archive_suffix(old_suffix, new_suffix, window, cx);
         self.modal_error = None;
         cx.notify();
+    }
+
+    pub(crate) fn select_archive_option(
+        &mut self,
+        index: usize,
+        value: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Modal::CreateArchive(dialog)) = &mut self.modal else {
+            return;
+        };
+        let old_suffix = dialog.output_suffix();
+        let Some(option @ ArchiveOption::Choice(_)) = dialog.options.get_mut(index) else {
+            return;
+        };
+        *option = ArchiveOption::Choice(value);
+        let new_suffix = dialog.output_suffix();
+        self.update_archive_suffix(old_suffix, new_suffix, window, cx);
+        self.modal_error = None;
+        cx.notify();
+    }
+
+    fn update_archive_suffix(
+        &self,
+        old: &str,
+        new: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if old != new
+            && let Some(stem) = strip_archive_suffix(&self.dialog_input.read(cx).value(), old)
+        {
+            let path = format!("{stem}.{new}");
+            self.dialog_input.update(cx, |input, cx| {
+                input.set_value(path, window, cx);
+            });
+        }
     }
 
     fn accept_create_archive(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -3393,17 +3695,19 @@ impl DotDir {
                 "Enter a file name or path for the archive"
             );
             let creation = dialog.format.creation().unwrap();
-            let suffix = format!(".{}", creation.suffix);
+            let suffix = dialog.output_suffix();
             let name = path.file_name().unwrap().to_string_lossy();
-            anyhow::ensure!(
-                !name.eq_ignore_ascii_case(&suffix),
-                "Enter a name before the {suffix} suffix"
-            );
-            if !name
-                .to_ascii_lowercase()
-                .ends_with(&suffix.to_ascii_lowercase())
-            {
-                path.set_file_name(format!("{name}{suffix}"));
+            let stem = dialog
+                .format
+                .info()
+                .suffixes
+                .iter()
+                .filter_map(|ending| strip_archive_suffix(&name, ending))
+                .min_by_key(|stem| stem.len())
+                .unwrap_or(&name);
+            anyhow::ensure!(!stem.is_empty(), "Enter a name before the .{suffix} suffix");
+            if strip_archive_suffix(&name, suffix).is_none() {
+                path.set_file_name(format!("{stem}.{suffix}"));
             }
             anyhow::ensure!(
                 path.parent().is_some_and(Path::is_dir),
@@ -3421,7 +3725,12 @@ impl DotDir {
                 .map(|(field, value)| {
                     let value = match value {
                         ArchiveOption::Choice(value) => (*value).into(),
-                        ArchiveOption::Text(input) => input.read(cx).value().to_string(),
+                        ArchiveOption::Text(input) if matches!(field.kind, OptionKind::Secret) => {
+                            OptionValue::Secret(read_password(input.read(cx)))
+                        }
+                        ArchiveOption::Text(input) => {
+                            OptionValue::Text(input.read(cx).value().to_string())
+                        }
                     };
                     (field.id, value)
                 })
@@ -3514,6 +3823,7 @@ impl DotDir {
                 request.cancel.cancel();
                 input.update(cx, |input, cx| input.set_value("", window, cx));
             }
+            Some(Modal::CreateArchive(dialog)) => dialog.clear_secrets(window, cx),
             _ => {}
         }
         if let Some(search) = &self.search {
@@ -3529,6 +3839,10 @@ impl DotDir {
             .error(&self.status);
         cx.notify();
     }
+    pub(crate) fn end_shift_selection(&mut self) {
+        self.shift_selection = None;
+    }
+
     pub fn run(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let switches_panel_menu = matches!(self.modal, Some(Modal::PanelMenu(_)))
             && matches!(id, "left-panel-menu" | "right-panel-menu");
@@ -3552,7 +3866,15 @@ impl DotDir {
                 return;
             }
         }
-        let (rows, columns) = self.layout(window);
+        let movement = id.strip_prefix("mark-").unwrap_or(id);
+        let is_movement = matches!(
+            movement,
+            "up" | "down" | "left" | "right" | "page-up" | "page-down" | "first" | "last"
+        );
+        let selecting = is_movement && movement != id;
+        if !selecting {
+            self.end_shift_selection();
+        }
         match id {
             "left-panel-menu" => self.open_panel_menu(0, window, cx),
             "right-panel-menu" => self.open_panel_menu(1, window, cx),
@@ -3561,10 +3883,19 @@ impl DotDir {
                     self.panes[pane].tabs[index].make_permanent();
                 }
             }
-            "up" | "down" | "left" | "right" | "page-up" | "page-down" | "mark-down"
-            | "mark-up" => {
+            _ if is_movement => {
                 let layout = self.layout_for(self.active, window);
-                if layout.presentation == Presentation::Columns && matches!(id, "left" | "right") {
+                let horizontal = matches!(movement, "left" | "right");
+                if selecting
+                    && horizontal
+                    && matches!(
+                        layout.presentation,
+                        Presentation::Columns | Presentation::Details
+                    )
+                {
+                    return;
+                }
+                if layout.presentation == Presentation::Columns && horizontal {
                     let pane = self.active;
                     if id == "right" {
                         self.update_column_preview(pane);
@@ -3579,25 +3910,18 @@ impl DotDir {
                     self.reveal_column(pane, false);
                     self.persist();
                 } else {
-                    if let Some(d) = self.directory_mut(self.active) {
-                        layout.move_cursor(d, id);
+                    let selection = self.shift_selection;
+                    if let Some(directory) = self.directory_mut(self.active) {
+                        if selecting {
+                            self.shift_selection =
+                                layout.extend_selection(directory, movement, selection);
+                        } else {
+                            layout.move_cursor(directory, movement);
+                        }
                     }
                     self.update_column_preview(self.active);
                     self.reveal_column(self.active, true);
                 }
-            }
-            "first" | "last" => {
-                if let Some(d) = self.directory_mut(self.active) {
-                    d.reset_icon_scroll();
-                    d.cursor = if id == "first" {
-                        0
-                    } else {
-                        d.entries.len().saturating_sub(1)
-                    };
-                    d.ensure_visible(rows, columns);
-                }
-                self.update_column_preview(self.active);
-                self.reveal_column(self.active, true);
             }
             "switch" => {
                 let pane = 1 - self.active;
@@ -3658,10 +3982,12 @@ impl DotDir {
                 }
             }
             "mark" | "mark-next" => {
+                let layout = self.layout_for(self.active, window);
                 if let Some(d) = self.directory_mut(self.active) {
                     d.toggle_mark();
                     if id == "mark-next" {
-                        d.move_cursor(1, false, rows, columns);
+                        d.move_cursor(1);
+                        layout.ensure_visible(d);
                     }
                 }
             }
@@ -4650,8 +4976,20 @@ Selected entries will be permanently removed from the archive."
 
 #[cfg(test)]
 mod tab_tests {
-    use super::{Pane, Tab, TabContent};
+    use super::{Pane, Tab, TabContent, parse_copy_destinations, quote_copy_destination};
     use std::path::PathBuf;
+
+    #[test]
+    fn copy_destination_paths_allow_quoted_separators_and_quotes() {
+        let path = "/tmp/has; a \"quote\"";
+        let value = format!("folder one; {}", quote_copy_destination(path));
+        assert_eq!(
+            parse_copy_destinations(&value).unwrap(),
+            ["folder one", path]
+        );
+        assert!(parse_copy_destinations("one; ;three").is_err());
+        assert!(parse_copy_destinations("\"one;two").is_err());
+    }
 
     fn preview() -> Tab {
         let mut tab = Tab::new(TabContent::Pending {

@@ -1,13 +1,15 @@
 //! Bundled native provider for 7z archives.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use dotdir_archive_api::{
-    ArchiveFormat, ArchiveReader, CheckedFile, Entry, FormatInfo, PasswordAccess, VirtualFile,
-    member_name,
+    ArchiveFormat, ArchiveReader, CheckedFile, Choice, Creation, CreationOptions, Entry,
+    FormatInfo, Input, OptionField, OptionKind, OptionValue, PasswordAccess, VirtualFile,
+    WriteSeek, member_name,
 };
 use sevenz_rust2::{
-    Archive, ArchiveEntry, BlockDecoder, EncoderMethod, Error, NtTime, Password,
-    SIGNATURE_HEADER_SIZE,
+    Archive, ArchiveEntry, ArchiveWriter, BlockDecoder, EncoderConfiguration, EncoderMethod, Error,
+    NtTime, Password, SIGNATURE_HEADER_SIZE,
+    encoder_options::{AesEncoderOptions, Lzma2Options},
 };
 use std::{
     collections::BTreeMap,
@@ -16,6 +18,7 @@ use std::{
 };
 
 const DECODER_LIMIT_KIB: usize = 128 * 1024;
+const UNIX_ATTRIBUTES: u32 = 0x8000;
 
 pub static SEVEN_ZIP: SevenZipFormat = SevenZipFormat;
 
@@ -78,6 +81,131 @@ impl ArchiveFormat for SevenZipFormat {
             members,
         }))
     }
+
+    fn creation(&self) -> Option<&'static Creation> {
+        Some(&Creation {
+            name: "7z",
+            suffix: "7z",
+            fields: &[
+                OptionField {
+                    id: "compression",
+                    label: "Compression",
+                    default: "normal",
+                    kind: OptionKind::Choice(&[
+                        Choice {
+                            value: "store",
+                            label: "Store",
+                            suffix: None,
+                        },
+                        Choice {
+                            value: "fast",
+                            label: "LZMA2 Fast",
+                            suffix: None,
+                        },
+                        Choice {
+                            value: "normal",
+                            label: "LZMA2 Normal",
+                            suffix: None,
+                        },
+                        Choice {
+                            value: "maximum",
+                            label: "LZMA2 Maximum",
+                            suffix: None,
+                        },
+                    ]),
+                },
+                OptionField {
+                    id: "password",
+                    label: "Password (AES-256, optional)",
+                    default: "",
+                    kind: OptionKind::Secret,
+                },
+            ],
+        })
+    }
+
+    fn create(
+        &self,
+        entries: &[Input<'_>],
+        options: &CreationOptions,
+        output: &mut dyn WriteSeek,
+    ) -> Result<()> {
+        let method: EncoderConfiguration =
+            match options.get("compression").and_then(OptionValue::as_text) {
+                Some("store") => EncoderMethod::COPY.into(),
+                Some("fast") => Lzma2Options::from_level(1).into(),
+                None | Some("normal") => Lzma2Options::from_level(5).into(),
+                Some("maximum") => Lzma2Options::from_level(7).into(),
+                Some(_) => bail!("Unknown 7z compression setting"),
+            };
+        let password = options
+            .get("password")
+            .and_then(OptionValue::as_secret)
+            .filter(|value| !value.is_empty());
+        let mut writer = ArchiveWriter::new(output)?;
+        writer.set_content_methods(vec![method.clone()]);
+        writer.set_encrypt_header(password.is_some());
+        for input in entries {
+            let entry = output_entry(input)?;
+            if let Some(contents) = &input.contents {
+                if let Some(password) = password {
+                    writer.set_content_methods(encrypted_methods(password, &method)?);
+                }
+                contents(&mut |source| {
+                    writer.push_archive_entry(entry.clone(), Some(source))?;
+                    Ok(())
+                })?;
+            } else {
+                writer.push_archive_entry::<io::Empty>(entry, None)?;
+            }
+        }
+        if let Some(password) = password {
+            // The archive header has its own AES parameters, like each file block.
+            writer.set_content_methods(encrypted_methods(password, &method)?);
+        }
+        writer.finish()?;
+        Ok(())
+    }
+}
+
+fn encrypted_methods(
+    password: &[u8],
+    method: &EncoderConfiguration,
+) -> Result<Vec<EncoderConfiguration>> {
+    let mut iv = [0; 16];
+    let mut salt = [0; 16];
+    getrandom::fill(&mut iv)
+        .and_then(|_| getrandom::fill(&mut salt))
+        .map_err(|error| anyhow::anyhow!("Could not initialize 7z encryption: {error}"))?;
+    let aes = AesEncoderOptions {
+        password: decode_password(password)?,
+        iv,
+        salt,
+        num_cycles_power: 19,
+    };
+    Ok(vec![aes.into(), method.clone()])
+}
+
+fn output_entry(input: &Input<'_>) -> Result<ArchiveEntry> {
+    let name = member_name(&input.path)?;
+    let mut entry = if input.contents.is_some() {
+        ArchiveEntry::new_file(&name)
+    } else {
+        ArchiveEntry::new_directory(&name)
+    };
+    if let Some(modified) = input.modified.and_then(|time| NtTime::try_from(time).ok()) {
+        entry.has_last_modified_date = true;
+        entry.last_modified_date = modified;
+    }
+    let (kind, default_mode, dos_attr) = if entry.is_directory {
+        (0o040000, 0o755, 0x10)
+    } else {
+        (0o100000, 0o644, 0x20)
+    };
+    let mode = kind | input.unix_mode.unwrap_or(default_mode) & 0o777;
+    entry.windows_attributes = (mode << 16) | UNIX_ATTRIBUTES | dos_attr;
+    entry.has_windows_attributes = true;
+    Ok(entry)
 }
 
 fn parse(
@@ -308,7 +436,7 @@ fn entry_kind(entry: &ArchiveEntry) -> Option<Kind> {
     } else {
         0
     };
-    let unix_kind = if attrs & 0x8000 != 0 {
+    let unix_kind = if attrs & UNIX_ATTRIBUTES != 0 {
         (attrs >> 16) & 0o170000
     } else {
         0

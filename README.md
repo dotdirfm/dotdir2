@@ -152,8 +152,8 @@ plain TAR and stored ZIP or 7z entries. Other entries that need random access
 use up to 64 MiB each in memory. Native video and AVIF support are currently
 available on macOS.
 
-7-Zip and TAR support browsing, previews, and extraction. ZIP also supports
-writing and creating archives.
+ZIP, 7z, and TAR support browsing, previews, extraction, and creation. ZIP
+also supports editing existing archives.
 
 Press **F4** to edit text inside a local ZIP and **⌘S** to save it back.
 Saving checks for external changes and replaces the archive only after the
@@ -176,8 +176,10 @@ a folder, or **F8** to permanently delete the selected entries. These operations
 also work in nested ZIPs.
 
 To pack a selection, open **F1 → Create Archive…** and choose a format and
-local output path. The dialog shows the chosen provider's settings. ZIP offers
-four compression levels and an optional AES-256 password.
+local output path. ZIP offers storage and three DEFLATE levels. 7z offers
+storage and three LZMA2 presets. Both support optional AES-256 passwords.
+A 7z password protects both file contents and names. TAR offers uncompressed,
+gzip, bzip2, xz, and Zstandard output. The chosen codec sets the filename suffix.
 
 DotDir asks for a password when an operation needs encrypted ZIP or 7z contents,
 or when it opens an encrypted 7z header.

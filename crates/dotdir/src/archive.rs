@@ -386,7 +386,7 @@ fn input_bytes(path: PathBuf, bytes: &[u8]) -> Input<'_> {
         size: bytes.len() as u64,
         modified: None,
         unix_mode: None,
-        contents: Some(Box::new(move |output| Ok(output.write_all(bytes)?))),
+        contents: Some(Box::new(move |read| read(&mut io::Cursor::new(bytes)))),
     }
 }
 
@@ -1181,6 +1181,7 @@ fn extraction_target(
             ConflictResolution::Rename(name)
         }
         ConflictPolicy::Append => return Ok(Some((target, WriteMode::Append))),
+        ConflictPolicy::Resume => bail!("Resume is available for local copies only"),
         ConflictPolicy::OnlyNewer => {
             let modified = metadata
                 .modified()?

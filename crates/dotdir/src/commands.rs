@@ -312,7 +312,7 @@ pub const COMMANDS: &[Command] = &[
         id: "switch",
         title: "Switch Panel",
         key: "tab",
-        context: "FilePane || PreviewTab || (PreviewTab > Input)",
+        context: "FilePane || MediaViewer || PreviewPane || PreviewTab || (PreviewTab > Input)",
         availability: Availability::Panels,
     },
     Command {
@@ -459,6 +459,48 @@ pub const COMMANDS: &[Command] = &[
         id: "mark-up",
         title: "Select Up",
         key: "shift-up",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-left",
+        title: "Select to Previous Column",
+        key: "shift-left",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-right",
+        title: "Select to Next Column",
+        key: "shift-right",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-first",
+        title: "Select to First Entry",
+        key: "shift-home",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-last",
+        title: "Select to Last Entry",
+        key: "shift-end",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-page-up",
+        title: "Select to Previous Page",
+        key: "shift-pageup",
+        context: "FilePane",
+        availability: Availability::Entry,
+    },
+    Command {
+        id: "mark-page-down",
+        title: "Select to Next Page",
+        key: "shift-pagedown",
         context: "FilePane",
         availability: Availability::Entry,
     },
@@ -784,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_out_of_previews_without_overriding_normal_editor_tab() {
+    fn tab_switches_out_of_viewers_and_previews_without_overriding_editor_tab() {
         let mut bindings = vec![KeyBinding::new(
             "tab",
             RunCommand {
@@ -796,6 +838,9 @@ mod tests {
         let keymap = Keymap::new(bindings);
         for (contexts, expected) in [
             (vec!["DotDir", "FilePane"], "switch"),
+            (vec!["DotDir", "MediaViewer"], "switch"),
+            (vec!["DotDir", "MediaViewer", "NativeView"], "switch"),
+            (vec!["DotDir", "PreviewPane"], "switch"),
             (vec!["DotDir", "PreviewTab", "Input"], "switch"),
             (vec!["DotDir", "PreviewTab", "MediaViewer"], "switch"),
             (

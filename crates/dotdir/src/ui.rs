@@ -3,15 +3,19 @@ use crate::{
     archive::Location,
     commands::{COMMANDS, function_key_command},
     model::*,
+    operations::OperationKind,
     terminal,
     theme::Palette,
 };
-use dotdir_core::copy::{ConflictPolicy, ConflictResolution};
+use dotdir_core::copy::{ConflictPolicy, ConflictResolution, SymlinkMode};
 use dotdir_extension_host::PanelNode;
 use gpui_kit::{
     component::{
         Icon, IconName,
+        button::Button,
+        checkbox::Checkbox,
         input::{Editor, Input},
+        menu::{DropdownMenu, PopupMenuItem},
     },
     prelude::FluentBuilder,
     *,
@@ -821,6 +825,236 @@ impl DotDir {
         body.into_any_element()
     }
 
+    fn transfer_dropdown<T: Copy + PartialEq + 'static>(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        selected: T,
+        choices: Vec<(&'static str, T)>,
+        set: fn(&mut Self, T),
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let title = choices
+            .iter()
+            .find_map(|(name, value)| (*value == selected).then_some(*name))
+            .unwrap_or(choices[0].0);
+        let view = cx.weak_entity();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .child(label)
+            .child(
+                Button::new(id)
+                    .accessibility_label(format!("{label}, {title}"))
+                    .label(title)
+                    .icon(IconName::ChevronDown)
+                    .dropdown_menu({
+                        let view = view.clone();
+                        move |mut menu, _, _| {
+                            for &(label, value) in &choices {
+                                let view = view.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label)
+                                        .checked(value == selected)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                set(this, value);
+                                                cx.notify();
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }
+                    })
+                    .on_open_change(move |open, _, cx| {
+                        let _ = view.update(cx, |this, _| {
+                            if *open {
+                                this.transfer_dropdown_open = Some(id);
+                            } else if this.transfer_dropdown_open == Some(id) {
+                                this.transfer_dropdown_open = None;
+                            }
+                        });
+                    }),
+            )
+    }
+
+    fn render_transfer_options(
+        &self,
+        kind: OperationKind,
+        sources: &[Location],
+        archive_destination: Option<&Location>,
+        cx: &Context<Self>,
+    ) -> Div {
+        let p = self.palette;
+        let value = self.dialog_input.read(cx).value();
+        let archive_target = !self.copy_multiple
+            && archive_destination.is_some_and(|path| path.display() == value.trim());
+        let local_copy = matches!(kind, OperationKind::Copy)
+            && !archive_target
+            && sources.iter().all(|source| source.local().is_some());
+        let options = &self.copy_options;
+        let choices = [
+            ("Ask", ConflictPolicy::Ask),
+            ("Overwrite", ConflictPolicy::Overwrite),
+            ("Skip", ConflictPolicy::Skip),
+            ("Rename", ConflictPolicy::Rename),
+            ("Append", ConflictPolicy::Append),
+            ("Resume", ConflictPolicy::Resume),
+            ("Only newer files", ConflictPolicy::OnlyNewer),
+        ]
+        .into_iter()
+        .filter(|(_, policy)| self.transfer_supports_policy(kind, sources, archive_target, *policy))
+        .collect();
+        let mut form = div().flex().flex_col().gap(px(10.))
+            .child(div().flex().flex_col().gap(px(4.))
+                .child(text("Destination").text_color(p.muted))
+                .child(div().flex().items_center().gap(px(8.))
+                    .child(div().flex_1().min_w_0().child(
+                        Input::new(&self.dialog_input).aria_label("Destination")
+                    ))
+                    .child(self.button("transfer-browse", "Browse… (F10)", |this, window, cx| {
+                        this.choose_transfer_destination(window, cx);
+                    }, cx))
+                )
+                .when(self.copy_multiple, |s| s.child(text("Separate paths with semicolons. Quote a path that contains a semicolon.")
+                    .text_color(p.muted).text_size(px(12.))))
+            )
+            .child(self.transfer_dropdown("transfer-policy", "Existing files", options.conflict_policy, choices,
+                |this, policy| this.copy_options.conflict_policy = policy, cx));
+        if !local_copy {
+            return form;
+        }
+        form = form.child(self.transfer_dropdown(
+            "copy-symlinks",
+            "Symbolic links",
+            options.symlink_mode,
+            vec![
+                ("Always copy link", SymlinkMode::AlwaysLink),
+                ("Smart", SymlinkMode::Smart),
+                ("Always copy target", SymlinkMode::AlwaysTarget),
+            ],
+            |this, mode| this.copy_options.symlink_mode = mode,
+            cx,
+        ));
+        if options.symlink_mode == SymlinkMode::Smart {
+            form = form.child(
+                text("Keep links within the selection and copy the contents of external targets.")
+                    .text_color(p.muted)
+                    .text_size(px(12.)),
+            );
+        }
+        form.child(
+            div()
+                .flex()
+                .gap(px(24.))
+                .border_t_1()
+                .border_color(p.border)
+                .pt(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(7.))
+                        .child(
+                            Checkbox::new("copy-multiple")
+                                .label("Multiple destinations")
+                                .checked(self.copy_multiple)
+                                .on_change(cx.listener(|this, checked: &bool, window, cx| {
+                                    this.set_copy_multiple(*checked, window, cx);
+                                })),
+                        )
+                        .child(
+                            Checkbox::new("copy-read-only")
+                                .label("Also ask about read-only files")
+                                .checked(options.ask_read_only)
+                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.copy_options.ask_read_only = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(cfg!(unix), |s| {
+                            s.child(
+                                Checkbox::new("copy-permissions")
+                                    .label("Copy permissions")
+                                    .checked(options.copy_permissions)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.copy_options.copy_permissions = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .when(cfg!(unix), |s| {
+                            s.child(
+                                Checkbox::new("copy-xattrs")
+                                    .label("Copy extended attributes")
+                                    .checked(options.copy_xattrs)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.copy_options.copy_xattrs = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(7.))
+                        .when(cfg!(target_os = "macos"), |s| {
+                            s.child(
+                                Checkbox::new("copy-write-cache")
+                                    .label("Disable write cache")
+                                    .checked(options.disable_write_cache)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.copy_options.disable_write_cache = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .when(cfg!(unix), |s| {
+                            s.child(
+                                Checkbox::new("copy-sparse")
+                                    .label("Produce sparse files")
+                                    .checked(options.sparse_files)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.copy_options.sparse_files = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .when(cfg!(any(target_os = "macos", target_os = "linux")), |s| {
+                            s.child(
+                                Checkbox::new("copy-cow")
+                                    .label("Use copy-on-write if possible")
+                                    .checked(options.use_cow)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.copy_options.use_cow = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            Checkbox::new("copy-filter-enabled")
+                                .label("Use file filter")
+                                .checked(self.copy_use_filter)
+                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.copy_use_filter = *checked;
+                                    this.modal_error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+        .when(self.copy_use_filter, |s| {
+            s.child(Input::new(&self.copy_filter).aria_label("File filter"))
+        })
+    }
+
     fn render_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette;
         let Some(modal) = &self.modal else {
@@ -985,14 +1219,8 @@ impl DotDir {
                                     self.button(
                                         SharedString::from(format!("archive-{}-{value}", field.id)),
                                         choice.label,
-                                        move |this, _, cx| {
-                                            if let Some(Modal::CreateArchive(dialog)) =
-                                                &mut this.modal
-                                            {
-                                                dialog.options[index] =
-                                                    ArchiveOption::Choice(value);
-                                                cx.notify();
-                                            }
+                                        move |this, window, cx| {
+                                            this.select_archive_option(index, value, window, cx)
                                         },
                                         cx,
                                     )
@@ -1142,7 +1370,19 @@ impl DotDir {
                 content = content.child(list);
             }
             Modal::Prompt { kind, .. } => {
-                if !matches!(
+                if let PromptKind::Transfer {
+                    kind,
+                    sources,
+                    archive_destination,
+                } = kind
+                {
+                    content = content.child(self.render_transfer_options(
+                        *kind,
+                        sources,
+                        archive_destination.as_ref(),
+                        cx,
+                    ));
+                } else if !matches!(
                     kind,
                     PromptKind::Trash(_)
                         | PromptKind::DeleteArchive(_)
@@ -1150,72 +1390,6 @@ impl DotDir {
                         | PromptKind::Quit
                 ) {
                     content = content.child(Input::new(&self.dialog_input));
-                }
-                if let PromptKind::Transfer {
-                    sources,
-                    archive_destination,
-                    ..
-                } = kind
-                {
-                    let policies = [
-                        ("Ask", ConflictPolicy::Ask),
-                        ("Overwrite", ConflictPolicy::Overwrite),
-                        ("Skip", ConflictPolicy::Skip),
-                        ("Rename", ConflictPolicy::Rename),
-                        ("Append", ConflictPolicy::Append),
-                        ("Newer", ConflictPolicy::OnlyNewer),
-                    ];
-                    content = content.child(
-                        text("If the destination exists")
-                            .text_color(p.muted)
-                            .text_size(px(12.)),
-                    );
-                    let mut choices = div().flex().gap(px(4.));
-                    for (i, (label, policy)) in policies.into_iter().enumerate() {
-                        let selected = std::mem::discriminant(&policy)
-                            == std::mem::discriminant(&self.copy_options.conflict_policy);
-                        choices = choices.child(self.button(
-                            ("policy", i),
-                            format!("{}{}", if selected { "✓ " } else { "" }, label),
-                            move |this, _, cx| {
-                                this.copy_options.conflict_policy = policy.clone();
-                                cx.notify();
-                            },
-                            cx,
-                        ));
-                    }
-                    content = content.child(choices);
-                    let mut options = div().flex().gap(px(8.));
-                    for (id, label, on) in [
-                        (0, "Permissions", self.copy_options.copy_permissions),
-                        (1, "Extended attributes", self.copy_options.copy_xattrs),
-                        (2, "Copy on write", self.copy_options.use_cow),
-                    ] {
-                        options = options.child(self.button(
-                            ("copy-option", id as usize),
-                            format!("{} {label}", if on { "☑" } else { "☐" }),
-                            move |this, _, cx| {
-                                match id {
-                                    0 => {
-                                        this.copy_options.copy_permissions =
-                                            !this.copy_options.copy_permissions
-                                    }
-                                    1 => {
-                                        this.copy_options.copy_xattrs =
-                                            !this.copy_options.copy_xattrs
-                                    }
-                                    _ => this.copy_options.use_cow = !this.copy_options.use_cow,
-                                }
-                                cx.notify();
-                            },
-                            cx,
-                        ));
-                    }
-                    if archive_destination.is_none()
-                        && sources.first().is_some_and(|path| path.local().is_some())
-                    {
-                        content = content.child(options);
-                    }
                 }
                 let confirm = match kind {
                     PromptKind::Trash(_) => "Move to Trash",
@@ -1700,10 +1874,15 @@ impl Render for DotDir {
             .text_size(px(self.settings.font_size))
             .font_family(".AppleSystemUIFont")
             .on_action(cx.listener(Self::on_command))
-            .on_modifiers_changed(cx.listener(|_, _, window, cx| {
-                cx.notify();
-                window.refresh();
-            }))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    if !event.shift {
+                        this.end_shift_selection();
+                    }
+                    cx.notify();
+                    window.refresh();
+                }),
+            )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.handle_panel_menu_key(event, window, cx) {
                     cx.stop_propagation();
@@ -1721,7 +1900,21 @@ impl Render for DotDir {
                 }
                 if this.modal.is_some() {
                     let key = event.keystroke.key.as_str();
-                    if key == "escape" {
+                    let transfer = matches!(
+                        this.modal,
+                        Some(Modal::Prompt {
+                            kind: PromptKind::Transfer { .. },
+                            ..
+                        })
+                    );
+                    if transfer && this.transfer_dropdown_open.is_some() {
+                        return;
+                    }
+                    if transfer && key == "f10" && !event.keystroke.modifiers.modified() {
+                        this.choose_transfer_destination(window, cx);
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    } else if key == "escape" {
                         this.dismiss(window, cx);
                         cx.stop_propagation();
                         window.prevent_default();
@@ -1790,6 +1983,18 @@ impl Render for DotDir {
                         window.prevent_default();
                     } else if key == "enter"
                         && !event.keystroke.modifiers.shift
+                        && (!transfer
+                            || this
+                                .dialog_input
+                                .read(cx)
+                                .focus_handle(cx)
+                                .is_focused(window)
+                            || this.copy_use_filter
+                                && this
+                                    .copy_filter
+                                    .read(cx)
+                                    .focus_handle(cx)
+                                    .is_focused(window))
                         && (!matches!(this.modal, Some(Modal::OpenVsx))
                             || this
                                 .dialog_input

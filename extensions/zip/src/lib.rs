@@ -4,11 +4,12 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{Datelike, Timelike};
 use dotdir_archive_api::{
     ArchiveFormat, ArchiveReader, Changes, Choice, Creation, CreationOptions, Entry, FormatInfo,
-    Input, OptionField, OptionKind, Password, PasswordAccess, VirtualFile, WriteSeek, member_name,
+    Input, OptionField, OptionKind, OptionValue, Password, PasswordAccess, VirtualFile, WriteSeek,
+    member_name,
 };
 use std::{
     collections::BTreeMap,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 use zip::{
@@ -56,18 +57,22 @@ impl ArchiveFormat for ZipFormat {
                         Choice {
                             value: "store",
                             label: "Store",
+                            suffix: None,
                         },
                         Choice {
                             value: "fast",
                             label: "Fast",
+                            suffix: None,
                         },
                         Choice {
                             value: "normal",
                             label: "Normal",
+                            suffix: None,
                         },
                         Choice {
                             value: "maximum",
                             label: "Maximum",
+                            suffix: None,
                         },
                     ]),
                 },
@@ -87,14 +92,17 @@ impl ArchiveFormat for ZipFormat {
         options: &CreationOptions,
         output: &mut dyn WriteSeek,
     ) -> Result<()> {
-        let (method, level) = match options.get("compression").map(String::as_str) {
+        let (method, level) = match options.get("compression").and_then(OptionValue::as_text) {
             Some("store") => (CompressionMethod::Stored, None),
             Some("fast") => (CompressionMethod::Deflated, Some(1)),
             None | Some("normal") => (CompressionMethod::Deflated, Some(6)),
             Some("maximum") => (CompressionMethod::Deflated, Some(9)),
             Some(_) => bail!("Unknown ZIP compression setting"),
         };
-        let password = options.get("password").filter(|value| !value.is_empty());
+        let password = options
+            .get("password")
+            .and_then(OptionValue::as_secret)
+            .filter(|value| !value.is_empty());
         let mut writer = ZipWriter::new(output);
         for input in entries {
             let options = SimpleFileOptions::default()
@@ -102,7 +110,7 @@ impl ArchiveFormat for ZipFormat {
                 .compression_level(level);
             let options = match password {
                 Some(password) if input.contents.is_some() => {
-                    options.with_aes_encryption(AesMode::Aes256, password)
+                    options.with_aes_encryption_bytes(AesMode::Aes256, password)
                 }
                 _ => options,
             };
@@ -355,7 +363,7 @@ fn write_entry(
     let name = member_name(&input.path)?;
     if let Some(contents) = &input.contents {
         writer.start_file(name, options.large_file(input.size >= u32::MAX as u64))?;
-        contents(writer)?;
+        contents(&mut |input| Ok(io::copy(input, writer).map(|_| ())?))?;
     } else {
         writer.add_directory(name, options)?;
     }
