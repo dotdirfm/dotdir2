@@ -1,11 +1,17 @@
-use crate::{archive::Archive, filesystems::Filesystems};
+use crate::{
+    archive::Location,
+    archive_ops::{self, TransferContext},
+    filesystems::Filesystems,
+};
+use anyhow::{Context, bail};
+use dotdir_archive_api::{ArchiveFormat, CreationOptions};
 use dotdir_core::{
     copy::{self, CancelToken, ConflictResolution, CopyEvent, CopyOptions},
     move_op::{self, MoveOptions},
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::mpsc,
     time::Duration,
 };
 
@@ -15,6 +21,9 @@ pub enum OperationKind {
     Move,
     Trash,
     Extract,
+    DeleteEntries,
+    CreateEntry,
+    CreateArchive,
 }
 impl OperationKind {
     pub fn title(self) -> &'static str {
@@ -22,7 +31,10 @@ impl OperationKind {
             Self::Copy => "Copy",
             Self::Move => "Move",
             Self::Trash => "Move to Trash",
-            Self::Extract => "Extract ZIP",
+            Self::Extract => "Extract Archive",
+            Self::DeleteEntries => "Delete Archive Entries",
+            Self::CreateEntry => "Create Archive Entry",
+            Self::CreateArchive => "Create Archive",
         }
     }
 }
@@ -76,7 +88,6 @@ impl Operation {
                         conflict,
                     )?;
                 }
-                OperationKind::Extract => anyhow::bail!("ZIP extraction needs an archive source"),
                 OperationKind::Trash => {
                     for (i, path) in sources.iter().enumerate() {
                         if cancel.is_cancelled() {
@@ -92,30 +103,142 @@ impl Operation {
                         }));
                     }
                 }
+                _ => bail!("This operation needs an archive"),
             }
             Ok(())
         })
     }
 
-    pub fn extract(
+    pub fn transfer(
         id: u64,
-        archive: Arc<Archive>,
-        members: Vec<PathBuf>,
-        destination: PathBuf,
+        kind: OperationKind,
+        sources: Vec<Location>,
+        destination: Location,
         options: CopyOptions,
         filesystems: Filesystems,
     ) -> Self {
-        Self::spawn(id, OperationKind::Extract, move |cancel, emit, conflict| {
-            archive.extract(
-                members,
-                &destination,
-                options.conflict_policy,
-                &filesystems,
+        if let Location::Local(directory) = &destination
+            && sources.iter().all(|source| source.local().is_some())
+        {
+            let paths = sources
+                .into_iter()
+                .map(|source| source.local().unwrap().to_path_buf())
+                .collect();
+            return Self::start(id, kind, paths, directory.clone(), options);
+        }
+        let moving = matches!(kind, OperationKind::Move);
+        let kind = if !moving && destination.local().is_some() {
+            OperationKind::Extract
+        } else {
+            kind
+        };
+        Self::spawn(id, kind, move |cancel, emit, conflict| {
+            let filesystems = filesystems.archive_operation();
+            let ctx = TransferContext {
+                filesystems: &filesystems,
                 cancel,
                 emit,
                 conflict,
-            )
+            };
+            match destination {
+                Location::Archive { .. } => archive_ops::transfer_into(
+                    &sources,
+                    &destination,
+                    moving,
+                    options.conflict_policy,
+                    &ctx,
+                ),
+                Location::Local(path) => {
+                    let Some(Location::Archive { archive, .. }) = sources.first() else {
+                        bail!("Expected an archive source");
+                    };
+                    let members = sources
+                        .iter()
+                        .map(|source| {
+                            source
+                                .archive_member()
+                                .map(Path::to_path_buf)
+                                .context("Expected an archive entry")
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    archive_ops::extract(
+                        archive,
+                        members,
+                        &path,
+                        moving,
+                        options.conflict_policy,
+                        &ctx,
+                    )
+                }
+                Location::Provider(_) => bail!("Destination filesystem is read-only"),
+            }
         })
+    }
+
+    pub fn delete_entries(id: u64, sources: Vec<Location>, filesystems: Filesystems) -> Self {
+        Self::spawn(id, OperationKind::DeleteEntries, move |cancel, _, _| {
+            let filesystems = filesystems.archive_operation();
+            let Some(Location::Archive { archive, .. }) = sources.first() else {
+                bail!("Expected an archive source");
+            };
+            let members = sources
+                .iter()
+                .map(|source| {
+                    source
+                        .archive_member()
+                        .map(Path::to_path_buf)
+                        .context("Expected an archive entry")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            archive_ops::delete(archive, &members, &filesystems, cancel)
+        })
+    }
+
+    pub fn create_entry(
+        id: u64,
+        directory: Location,
+        name: String,
+        folder: bool,
+        filesystems: Filesystems,
+        opened: impl FnOnce(Location) + Send + 'static,
+    ) -> Self {
+        Self::spawn(id, OperationKind::CreateEntry, move |cancel, _, _| {
+            let path = archive_ops::create_entry(
+                &directory,
+                &name,
+                folder,
+                &filesystems.archive_operation(),
+                cancel,
+            )?;
+            if !folder && !cancel.is_cancelled() {
+                opened(path);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_archive(
+        id: u64,
+        sources: Vec<Location>,
+        destination: PathBuf,
+        format: &'static dyn ArchiveFormat,
+        options: CreationOptions,
+        filesystems: Filesystems,
+    ) -> Self {
+        Self::spawn(
+            id,
+            OperationKind::CreateArchive,
+            move |cancel, emit, conflict| {
+                let filesystems = filesystems.archive_operation();
+                let ctx = TransferContext {
+                    filesystems: &filesystems,
+                    cancel,
+                    emit,
+                    conflict,
+                };
+                archive_ops::create(&sources, &destination, format, &options, &ctx)
+            },
+        )
     }
 
     fn spawn(

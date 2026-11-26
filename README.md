@@ -136,6 +136,9 @@ and file-list bounds limit movement without changing marked entries.
 
 ## ZIP archives
 
+The bundled **ZIP Archives** extension appears under **F11 → Extensions** and
+uses DotDir's shared native archive API.
+
 Select a ZIP and press **Enter** or **F3** to browse it in the current pane.
 The same keys open ZIPs nested inside an archive, up to eight levels deep.
 Use **F3** to preview text, hex, images, or supported videos, and **⌘F3** to
@@ -158,9 +161,25 @@ a ZIP enables diagnostics, completion, hover, and Go to Definition. The
 adapter serves source files and unsaved edits from memory and the archive.
 The workspace is never unpacked to disk.
 
-Select files or folders and press **F5** to extract them. The destination
-defaults to the opposite local pane. Extraction uses the regular progress and
-conflict dialogs.
+Use **F5** to copy and **F6** to move files or folders between a local directory
+and a writable archive, or between archive directories. Open the destination
+in the opposite pane before transferring. **F5 → Extract** also works from
+read-only archives. A move removes a source only after its destination has
+been written. A folder with skipped conflicts stays at the source.
+
+Inside a writable ZIP, use **Shift+F4** to open or create a file, **F7** to make
+a folder, or **F8** to permanently delete the selected entries. These operations
+also work in nested ZIPs.
+
+To pack a selection, open **F1 → Create Archive…** and choose a format and
+local output path. The dialog shows the chosen provider's settings. ZIP offers
+four compression levels and an optional AES-256 password.
+
+DotDir asks for a password when an operation needs encrypted ZIP contents.
+Passwords are encrypted in memory and remembered for 15 minutes by default.
+Change the duration under **F9 → Archive password cache**, or set
+`archive_password_cache_minutes` in `settings.json`. Set it to 0 to keep a
+password only for the operation in progress. Passwords are never stored on disk.
 
 ## Extensions
 

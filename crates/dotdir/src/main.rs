@@ -1,5 +1,8 @@
 mod app;
 mod archive;
+mod archive_extensions;
+mod archive_ops;
+mod archive_passwords;
 mod archive_typescript;
 mod column_scroll;
 mod commands;

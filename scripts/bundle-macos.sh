@@ -8,10 +8,14 @@ case "$mode" in
   *) printf '%s\n' 'Usage: scripts/bundle-macos.sh [debug|release]' >&2; exit 1 ;;
 esac
 bundle="dist/DotDir Native.app"
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources/extensions"
 cp "target/$mode/dotdir" "$bundle/Contents/MacOS/dotdir.new"
 mv "$bundle/Contents/MacOS/dotdir.new" "$bundle/Contents/MacOS/dotdir"
-cp -R extensions "$bundle/Contents/Resources/"
+for extension in extensions/*; do
+  if [ -f "$extension/extension.json" ]; then
+    cp -R "$extension" "$bundle/Contents/Resources/extensions/"
+  fi
+done
 cp assets/icon.icns "$bundle/Contents/Resources/icon.icns"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -39,22 +39,38 @@ the file panes and application chrome are custom GPUI elements.
   saved snapshot on completion, so edits made during a save remain dirty. Closing
   or quitting checks dirty buffers. An external change detected before a save is
   rejected. The check and write are not an atomic filesystem compare-and-swap.
-- ZIP directory tabs use typed locations carrying an archive and a member path.
-  Each archive's source is itself a location, so an inner ZIP can be mounted and
-  restored without flattening its path. A seekable virtual file exposes stored
-  entries as bounded slices of the source and inflates compressed entries
+- Archive formats implement `ArchiveFormat` and `ArchiveReader` from
+  `dotdir-archive-api`. The host supplies a seekable source and owns the VFS,
+  limits, extraction, and save transactions. Providers enumerate and stream
+  entries, and can offer direct seeks, batch entry changes, and archive creation.
+  The creation schema declares the output suffix and choice, text, or masked
+  fields. The host renders those fields and streams selected files to the
+  provider. Register a native
+  format such as TAR or 7z in `crates/dotdir/src/archive_extensions.rs`. ZIP is
+  enabled by default through the `zip-extension` feature.
+- Archive directory tabs store a format ID, a source location, and a member
+  path. The source can itself be an archive entry, so mixed formats can nest.
+  Saved ZIP tabs from earlier versions still restore. A seekable virtual file
+  exposes stored entries as bounded slices of the source and inflates compressed entries
   into capped memory buffers when random access is required. Recent mounted
   indexes and buffers are cached against local source metadata. Explicit
   extraction streams entries into temporary destination files and publishes
   them on success, using the copy worker's cancellation, progress, and conflict
-  dialog. Text saves copy unchanged ZIP entries as compressed data, rebuild
+  dialog. Archive changes copy unchanged ZIP entries as compressed data, rebuild
   nested archives in memory, and atomically replace the outer local ZIP.
-  Concurrent edits to the saved entry are checked before rewriting.
+  Editor saves and archive mutations share a write lock and check the local
+  source before publication. Cross-container moves remove sources only after
+  the destination is committed.
+- Archive providers ask the host to validate passwords when an operation
+  reaches a protected entry. The host negotiates on the archive worker and
+  shows a masked prompt in the UI. It retains sealed credentials per structured
+  archive location and opens them into zeroizing byte buffers only for use.
+  Mounts backed by decrypted nested entries are scoped to the operation.
 - TypeScript 7 and rust-analyzer run as background language servers per project
   root. The
   editor sends versioned incremental edits over stdio and converts between
   the server's UTF-16 positions and the editor's Unicode-scalar positions.
-  ZIP documents use a separate TypeScript 7 session for each mounted archive.
+  Archive documents use a separate TypeScript 7 session for each mounted archive.
   It translates editor requests to the SDK's native analysis API. File calls
   read the archive through the VFS, with open editor buffers taking precedence.
   A synthetic path namespace maps definitions back to archive locations without

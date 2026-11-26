@@ -166,7 +166,7 @@ impl LanguageServers {
         settings: &vscode::Settings,
         filesystems: Filesystems,
     ) -> Result<Rc<Buffer>> {
-        let root = path.archive_root().context("Expected a ZIP member")?;
+        let root = path.archive_root().context("Expected an archive member")?;
         self.archive_sessions
             .retain(|_, weak| weak.strong_count() > 0);
         self.archive_files
@@ -1400,6 +1400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zip-extension")]
     #[ignore = "requires the installed TypeScript 7 Native Preview SDK"]
     fn typescript_archive_resolves_virtual_files_and_unsaved_edits() {
         use crate::archive::Archive;
@@ -1424,7 +1425,7 @@ mod tests {
         }
         zip.finish().unwrap();
         let pristine = fs::read(&path).unwrap();
-        let archive = Archive::mount(path.clone());
+        let archive = Archive::mount_location(path.clone().into(), &dotdir_zip::ZIP).unwrap();
         let source = archive.resolve_archive_member("project/main.ts").unwrap();
         let dependency = archive.resolve_archive_member("project/lib.ts").unwrap();
         let settings = vscode::Settings {

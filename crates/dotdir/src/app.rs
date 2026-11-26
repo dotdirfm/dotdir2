@@ -1,5 +1,7 @@
 use crate::{
-    archive::{Archive, Location, SavedLocation, is_zip},
+    archive::{Archive, Location, SavedLocation},
+    archive_extensions::BUNDLED as ARCHIVE_FORMATS,
+    archive_passwords::{ArchivePasswords, PASSWORD_REQUIRED, PasswordRequest, UnlockCancelled},
     archive_typescript,
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
@@ -19,6 +21,7 @@ use crate::{
     vscode,
     vscode_theme::{ImportedTheme, ThemeSource},
 };
+use dotdir_archive_api::{ArchiveFormat, OptionKind, Password};
 use dotdir_core::{
     copy::{CancelToken, ConflictResolution, CopyEvent, CopyOptions},
     search::{FileSearchEvent, FileSearchRequest},
@@ -32,7 +35,7 @@ use gpui_kit::{
 use serde_json::json;
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, atomic::Ordering, mpsc},
@@ -49,6 +52,7 @@ pub(crate) enum Message {
     MountedRoots(Vec<PathBuf>),
     Directory(u64, u64, anyhow::Result<Vec<Entry>>),
     Watch(u64),
+    ArchivePassword(PasswordRequest),
     Opened {
         request: u64,
         pane: usize,
@@ -61,6 +65,11 @@ pub(crate) enum Message {
         id: u64,
         text: String,
         result: anyhow::Result<()>,
+    },
+    ArchiveFileCreated {
+        pane: usize,
+        directory: Location,
+        path: Location,
     },
     Search(u64, FileSearchEvent),
     Extension(anyhow::Result<LoadedExtension>),
@@ -78,7 +87,25 @@ pub(crate) enum Message {
 
 impl DotDir {
     pub fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(Modal::ArchivePassword { .. })) {
+            if let Some(Modal::ArchivePassword { request, input }) = self.modal.take() {
+                let text = input.read(cx).text();
+                let mut password = Password::new(Vec::with_capacity(text.len()));
+                for chunk in text.chunks() {
+                    password.extend_from_slice(chunk.as_bytes());
+                }
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+                let _ = request.reply.send(password);
+                self.focus_pane(self.active, window, cx);
+                cx.notify();
+            }
+            return;
+        }
         let value = self.dialog_input.read(cx).value().to_string();
+        if matches!(self.modal, Some(Modal::CreateArchive(_))) {
+            self.accept_create_archive(&value, window, cx);
+            return;
+        }
         if matches!(self.modal, Some(Modal::OpenVsx)) {
             self.search_marketplace(&value, 0, cx);
             return;
@@ -133,11 +160,48 @@ impl DotDir {
                     );
                     self.choose_color_theme(self.resolve_path(value.trim()), window, cx)?;
                 }
+                PromptKind::ArchiveCache => {
+                    let minutes = value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| anyhow::anyhow!("Enter a whole number of minutes, or 0"))?;
+                    self.settings.archive_password_cache_minutes = minutes;
+                    self.filesystems.archive_passwords.set_minutes(minutes);
+                    self.persist();
+                }
                 PromptKind::Location => {
                     let location = self.resolve_directory(&value, true)?;
                     self.navigate(self.active, location, window, cx);
                 }
-                PromptKind::Mkdir => {
+                PromptKind::Mkdir(directory) | PromptKind::NewFile(directory)
+                    if matches!(directory, Location::Archive { .. }) =>
+                {
+                    let name = value.trim();
+                    let folder = matches!(kind, PromptKind::Mkdir(_));
+                    crate::archive_ops::entry_path(name, folder)?;
+                    anyhow::ensure!(
+                        self.operation.is_none(),
+                        "Wait for the current operation to finish"
+                    );
+                    let tx = self.tx.clone();
+                    let pane = self.active;
+                    let owner = directory.clone();
+                    self.operation = Some(Operation::create_entry(
+                        self.id(),
+                        directory,
+                        name.into(),
+                        folder,
+                        self.filesystems.clone(),
+                        move |path| {
+                            let _ = tx.send(Message::ArchiveFileCreated {
+                                pane,
+                                directory: owner,
+                                path,
+                            });
+                        },
+                    ));
+                }
+                PromptKind::Mkdir(_) => {
                     if !valid_name(value.trim()) {
                         anyhow::bail!("Enter one valid directory name");
                     }
@@ -161,7 +225,7 @@ impl DotDir {
                         let _ = tx.send(Message::Simple(result));
                     });
                 }
-                PromptKind::NewFile => {
+                PromptKind::NewFile(_) => {
                     if value.trim().is_empty() {
                         anyhow::bail!("Enter a file path");
                     }
@@ -174,38 +238,45 @@ impl DotDir {
                     }
                     self.open_document(self.active, path, false, window, cx);
                 }
-                PromptKind::Transfer(kind, sources) => {
+                PromptKind::Transfer {
+                    kind,
+                    sources,
+                    archive_destination,
+                } => {
+                    anyhow::ensure!(
+                        self.operation.is_none(),
+                        "Wait for the current operation to finish"
+                    );
                     if value.trim().is_empty() {
-                        anyhow::bail!("Enter a local destination directory");
+                        anyhow::bail!("Enter a destination directory");
                     }
-                    let destination = self.resolve_path(&value);
-                    if !destination.is_dir() {
-                        anyhow::bail!("Destination directory does not exist");
-                    }
+                    let destination = if let Some(path) = archive_destination
+                        && value == path.display()
+                    {
+                        path
+                    } else {
+                        let path = self.resolve_path(value.trim());
+                        anyhow::ensure!(path.is_dir(), "Destination directory does not exist");
+                        path.into()
+                    };
                     let id = self.id();
-                    self.operation = Some(Operation::start(
+                    self.operation = Some(Operation::transfer(
                         id,
                         kind,
                         sources,
                         destination,
                         self.copy_options.clone(),
+                        self.filesystems.clone(),
                     ));
                 }
-                PromptKind::Extract(archive, members) => {
-                    if value.trim().is_empty() {
-                        anyhow::bail!("Enter a local destination directory");
-                    }
-                    let destination = self.resolve_path(value.trim());
-                    if !destination.is_dir() {
-                        anyhow::bail!("Destination directory does not exist");
-                    }
-                    let id = self.id();
-                    self.operation = Some(Operation::extract(
-                        id,
-                        archive,
-                        members,
-                        destination,
-                        self.copy_options.clone(),
+                PromptKind::DeleteArchive(sources) => {
+                    anyhow::ensure!(
+                        self.operation.is_none(),
+                        "Wait for the current operation to finish"
+                    );
+                    self.operation = Some(Operation::delete_entries(
+                        self.id(),
+                        sources,
                         self.filesystems.clone(),
                     ));
                 }
@@ -266,7 +337,7 @@ impl DotDir {
     pub(crate) fn resolve_directory(
         &self,
         value: &str,
-        allow_zip: bool,
+        allow_archive: bool,
     ) -> anyhow::Result<Location> {
         if let Some(path) = ProviderPath::parse(value)? {
             self.filesystems.check(&path)?;
@@ -283,11 +354,14 @@ impl DotDir {
         let path = self.resolve_path(value);
         if path.is_dir() {
             Ok(path.into())
-        } else if allow_zip && path.is_file() && is_zip(&path) {
-            Ok(Archive::mount(path))
+        } else if allow_archive
+            && path.is_file()
+            && let Some(format) = ARCHIVE_FORMATS.for_path(&path)
+        {
+            Archive::mount_location(path.into(), format)
         } else {
-            anyhow::bail!(if allow_zip {
-                "Directory or ZIP archive does not exist"
+            anyhow::bail!(if allow_archive {
+                "Directory or supported archive does not exist"
             } else {
                 "Directory does not exist"
             });
@@ -364,10 +438,13 @@ impl DotDir {
         CommandState {
             panels_visible: self.panels_visible,
             directory: directory.is_some(),
-            archive: matches!(location, Location::Zip { .. }),
+            archive: matches!(location, Location::Archive { .. }),
             archive_editable: entry.is_some_and(|entry| {
                 entry.path.archive_member().is_some() && entry.path.editable() && !entry.symlink
             }),
+            archive_writable: matches!(location, Location::Archive { .. }) && location.editable(),
+            opposite_archive_writable: self.opposite_archive_destination().is_some(),
+            archive_creation: ARCHIVE_FORMATS.creators().next().is_some(),
             provider: matches!(location, Location::Provider(_)),
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
@@ -483,7 +560,9 @@ impl DotDir {
         }
     }
     pub fn load_extensions(&mut self) {
-        let mut filesystems = Filesystems::new(self.extension_logs.clone());
+        let mut filesystems = self
+            .filesystems
+            .rebuild_providers(self.extension_logs.clone());
         let mut roots = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions")];
         if let Some(bundle) = std::env::current_exe()
             .ok()
@@ -1243,6 +1322,7 @@ impl DotDir {
                 Message::Watch(id) => {
                     self.pending_watch.entry(id).or_insert_with(Instant::now);
                 }
+                Message::ArchivePassword(request) => self.password_requests.push_back(request),
                 Message::Opened {
                     request,
                     pane,
@@ -1282,6 +1362,8 @@ impl DotDir {
                                 {
                                     *error = Some(e.to_string());
                                 }
+                            } else if e.is::<UnlockCancelled>() {
+                                self.status = e.to_string();
                             } else {
                                 self.error(e, cx);
                             }
@@ -1555,6 +1637,15 @@ impl DotDir {
                         }
                     }
                 }
+                Message::ArchiveFileCreated {
+                    pane,
+                    directory,
+                    path,
+                } => {
+                    if self.pane_location(pane) == directory {
+                        self.open_document_into(pane, path, false, None, window, cx);
+                    }
+                }
                 Message::Simple(result) => {
                     if let Err(e) = result {
                         self.error(e, cx);
@@ -1571,12 +1662,14 @@ impl DotDir {
             .collect::<Vec<_>>();
         for id in ready {
             self.pending_watch.remove(&id);
-            self.reload(id);
+            self.reload_directory(id, false);
             changed = true;
         }
         let mut settled = None;
         let mut focus_conflict = false;
-        if let Some(op) = &mut self.operation {
+        if let Some(op) = &mut self.operation
+            && !matches!(self.modal, Some(Modal::ArchivePassword { .. }))
+        {
             for _ in 0..100 {
                 let Ok(event) = op.events.try_recv() else {
                     break;
@@ -1647,6 +1740,25 @@ impl DotDir {
                 window.remove_window();
                 cx.quit();
                 return;
+            }
+        }
+        self.filesystems.archive_passwords.expire();
+        if matches!(self.modal.as_ref(), Some(Modal::ArchivePassword { request, .. }) if request.cancel.is_cancelled())
+        {
+            self.dismiss(window, cx);
+            changed = true;
+        }
+        if self.modal.is_none() && !self.quit_pending {
+            while let Some(request) = self.password_requests.pop_front() {
+                if request.cancel.is_cancelled() {
+                    continue;
+                }
+                let input = cx.new(|cx| InputState::new(window, cx).masked(true));
+                self.modal = Some(Modal::ArchivePassword { request, input });
+                self.modal_error = None;
+                self.focus_modal(window, cx);
+                changed = true;
+                break;
             }
         }
         self.sync_previews(window, cx);
@@ -1881,14 +1993,22 @@ impl Pane {
 pub(crate) enum PromptKind {
     IconTheme,
     ColorTheme,
+    ArchiveCache,
     Location,
-    Mkdir,
+    Mkdir(Location),
     Rename(PathBuf),
-    NewFile,
-    Transfer(OperationKind, Vec<PathBuf>),
-    Extract(Arc<Archive>, Vec<PathBuf>),
+    NewFile(Location),
+    Transfer {
+        kind: OperationKind,
+        sources: Vec<Location>,
+        archive_destination: Option<Location>,
+    },
     Trash(Vec<PathBuf>),
-    CloseTab { pane: usize, id: u64 },
+    DeleteArchive(Vec<Location>),
+    CloseTab {
+        pane: usize,
+        id: u64,
+    },
     Quit,
 }
 pub(crate) enum Modal {
@@ -1898,6 +2018,11 @@ pub(crate) enum Modal {
         description: String,
     },
     Palette,
+    CreateArchive(ArchiveDialog),
+    ArchivePassword {
+        request: PasswordRequest,
+        input: Entity<InputState>,
+    },
     QuickPick {
         request: vscode::QuickPick,
         action: QuickPickAction,
@@ -1913,6 +2038,44 @@ pub(crate) enum Modal {
         destination: PathBuf,
         reply: mpsc::Sender<ConflictResolution>,
     },
+}
+
+pub(crate) struct ArchiveDialog {
+    sources: Vec<Location>,
+    pub format: &'static dyn ArchiveFormat,
+    pub options: Vec<ArchiveOption>,
+}
+
+pub(crate) enum ArchiveOption {
+    Choice(&'static str),
+    Text(Entity<InputState>),
+}
+
+impl ArchiveDialog {
+    pub fn selection_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    fn fields(
+        format: &'static dyn ArchiveFormat,
+        window: &mut Window,
+        cx: &mut Context<DotDir>,
+    ) -> Vec<ArchiveOption> {
+        format
+            .creation()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|field| match field.kind {
+                OptionKind::Choice(_) => ArchiveOption::Choice(field.default),
+                OptionKind::Text | OptionKind::Secret => ArchiveOption::Text(cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(matches!(field.kind, OptionKind::Secret))
+                        .default_value(field.default)
+                })),
+            })
+            .collect()
+    }
 }
 pub(crate) enum QuickPickAction {
     Extension {
@@ -1972,6 +2135,7 @@ pub(crate) struct DotDir {
     pub extension_errors: Vec<String>,
     pub extension_logs: ExtensionLogs,
     filesystems: Filesystems,
+    password_requests: VecDeque<PasswordRequest>,
     pub extension_log_scroll: ScrollHandle,
     pub(crate) market: open_vsx::Market,
     pub(crate) market_search_task: Option<Task<()>>,
@@ -1997,7 +2161,7 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut settings = Settings::load(&settings_path);
+        let mut settings = Settings::load(&settings_path, &ARCHIVE_FORMATS);
         if let Some(path) = initial {
             if let Some(path) = path
                 .to_str()
@@ -2009,17 +2173,26 @@ impl DotDir {
             } else if path.is_dir() {
                 settings.left = vec![SavedLocation::Local(path.clone())];
                 settings.right = vec![SavedLocation::Local(path)];
-            } else if path.is_file() && is_zip(&path) {
+            } else if path.is_file()
+                && let Some(format) = ARCHIVE_FORMATS.for_path(&path)
+            {
                 let path = path.canonicalize().unwrap_or(path);
                 if let Some(parent) = path.parent() {
                     settings.right = vec![SavedLocation::Local(parent.into())];
                 }
-                settings.left = vec![SavedLocation::from(&Archive::mount(path))];
+                if let Ok(root) = Archive::mount_location(path.into(), format) {
+                    settings.left = vec![SavedLocation::from(&root)];
+                }
             }
         }
         let palette = Palette::named(&settings.theme);
         palette.apply(cx);
         let (tx, rx) = mpsc::channel();
+        let password_tx = tx.clone();
+        let passwords =
+            ArchivePasswords::new(settings.archive_password_cache_minutes, move |request| {
+                let _ = password_tx.send(Message::ArchivePassword(request));
+            });
         let lsp_tx = tx.clone();
         let extension_logs =
             ExtensionLogs::with_error_file(&settings_path.with_file_name(ERROR_LOG_NAME));
@@ -2091,16 +2264,29 @@ impl DotDir {
             }),
         ];
         let mut next_id = 1;
-        let panes = [settings.left.clone(), settings.right.clone()].map(|paths| Pane {
-            tabs: paths
+        let panes = [settings.left.clone(), settings.right.clone()].map(|paths| {
+            let mut locations: Vec<_> = paths
                 .into_iter()
-                .map(|path| {
-                    let d = DirectoryBrowser::new(next_id, path.into());
-                    next_id += 1;
-                    Tab::new(TabContent::Directory(d))
-                })
-                .collect(),
-            active: 0,
+                .filter_map(|path| path.restore(&ARCHIVE_FORMATS))
+                .collect();
+            if locations.is_empty() {
+                locations.push(
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/"))
+                        .into(),
+                );
+            }
+            Pane {
+                tabs: locations
+                    .into_iter()
+                    .map(|path| {
+                        let d = DirectoryBrowser::new(next_id, path);
+                        next_id += 1;
+                        Tab::new(TabContent::Directory(d))
+                    })
+                    .collect(),
+                active: 0,
+            }
         });
         let cache = dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -2174,7 +2360,12 @@ impl DotDir {
             hover: HoverHints::default(),
             source_jump: [None, None],
             extension_errors: vec![],
-            filesystems: Filesystems::new(extension_logs.clone()),
+            filesystems: {
+                let mut filesystems = Filesystems::new(extension_logs.clone());
+                filesystems.archive_passwords = Arc::new(passwords);
+                filesystems
+            },
+            password_requests: VecDeque::new(),
             extension_logs,
             extension_log_scroll: ScrollHandle::new(),
             market: open_vsx::Market::default(),
@@ -2204,8 +2395,9 @@ impl DotDir {
             .iter()
             .flat_map(|p| p.tabs.iter().map(Tab::id))
             .collect::<Vec<_>>();
+        let active_directory = this.directory(this.active).map(|dir| dir.id);
         for id in ids {
-            this.reload(id);
+            this.reload_directory(id, Some(id) == active_directory);
         }
         if let Some(path) = this.settings.icon_theme.clone() {
             this.load_icon_theme(path, cx);
@@ -2406,8 +2598,10 @@ impl DotDir {
                 .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().into()),
         }
     }
-    pub fn archive_active(&self, pane: usize) -> bool {
-        matches!(self.pane_location(pane), Location::Zip { .. })
+    fn opposite_archive_destination(&self) -> Option<&Location> {
+        self.directory(1 - self.active)
+            .map(|dir| &dir.path)
+            .filter(|path| matches!(path, Location::Archive { .. }) && path.editable())
     }
     pub fn cwd(&self, pane: usize) -> PathBuf {
         let location = self.pane_location(pane);
@@ -2432,8 +2626,18 @@ impl DotDir {
         }
     }
     pub fn reload(&mut self, id: u64) {
+        self.reload_directory(id, true);
+    }
+
+    fn reload_directory(&mut self, id: u64, interactive: bool) {
         let hidden = self.settings.show_hidden;
-        let filesystems = self.filesystems.clone();
+        let filesystems = if interactive {
+            self.filesystems.archive_operation()
+        } else {
+            self.filesystems
+                .without_password_prompts()
+                .archive_operation()
+        };
         if let Some(d) = self.directory_by_id(id) {
             d.generation += 1;
             d.loading = true;
@@ -2475,7 +2679,7 @@ impl DotDir {
             .map(|d| d.id)
             .collect::<Vec<_>>();
         for id in ids {
-            self.reload(id);
+            self.reload_directory(id, false);
         }
     }
     pub fn navigate(
@@ -2626,11 +2830,20 @@ impl DotDir {
                     this.jump_input.update(cx, |s, cx| s.focus(window, cx));
                     return;
                 }
+                if let Some(Modal::ArchivePassword { input, .. }) = &this.modal {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    return;
+                }
                 let input = match &this.modal {
-                    Some(Modal::Palette | Modal::Search | Modal::OpenVsx) => true,
+                    Some(
+                        Modal::Palette | Modal::Search | Modal::OpenVsx | Modal::CreateArchive(_),
+                    ) => true,
                     Some(Modal::Prompt { kind, .. }) => !matches!(
                         kind,
-                        PromptKind::Trash(_) | PromptKind::CloseTab { .. } | PromptKind::Quit
+                        PromptKind::Trash(_)
+                            | PromptKind::DeleteArchive(_)
+                            | PromptKind::CloseTab { .. }
+                            | PromptKind::Quit
                     ),
                     None => return,
                     _ => false,
@@ -2652,6 +2865,11 @@ impl DotDir {
     ) {
         self.open_request[pane] += 1;
         self.panes[pane].active = index.min(self.panes[pane].tabs.len() - 1);
+        if let Some(directory) = self.directory(pane)
+            && directory.error.as_deref() == Some(PASSWORD_REQUIRED)
+        {
+            self.reload(directory.id);
+        }
         self.focus_pane(pane, window, cx);
         self.persist();
     }
@@ -3066,7 +3284,10 @@ impl DotDir {
     ) {
         let has_input = !matches!(
             &kind,
-            PromptKind::Trash(_) | PromptKind::CloseTab { .. } | PromptKind::Quit
+            PromptKind::Trash(_)
+                | PromptKind::DeleteArchive(_)
+                | PromptKind::CloseTab { .. }
+                | PromptKind::Quit
         );
         self.modal_error = None;
         self.modal = Some(Modal::Prompt {
@@ -3086,6 +3307,144 @@ impl DotDir {
         }
         cx.notify();
     }
+
+    fn prompt_create_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = self.directory(self.active) else {
+            return;
+        };
+        let Some(format) = ARCHIVE_FORMATS.creators().next() else {
+            return;
+        };
+        let sources: Vec<_> = directory
+            .selected()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        let name = if sources.len() == 1 {
+            sources[0].label()
+        } else {
+            directory.path.label()
+        };
+        let name = if valid_name(&name) {
+            name
+        } else {
+            "Archive".into()
+        };
+        let filename = format!("{name}.{}", format.creation().unwrap().suffix);
+        let path = self.cwd(self.active).join(filename);
+        self.show_modal(
+            Modal::CreateArchive(ArchiveDialog {
+                sources,
+                format,
+                options: ArchiveDialog::fields(format, window, cx),
+            }),
+            window,
+            cx,
+        );
+        self.dialog_input.update(cx, |input, cx| {
+            input.set_value(path.to_string_lossy().into_owned(), window, cx);
+        });
+    }
+
+    pub(crate) fn select_archive_format(
+        &mut self,
+        format: &'static dyn ArchiveFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Modal::CreateArchive(dialog)) = &mut self.modal else {
+            return;
+        };
+        if dialog.format.info().id == format.info().id {
+            return;
+        }
+        let old_suffix = format!(".{}", dialog.format.creation().unwrap().suffix);
+        let new_suffix = format.creation().unwrap().suffix;
+        dialog.format = format;
+        dialog.options = ArchiveDialog::fields(format, window, cx);
+        let value = self.dialog_input.read(cx).value().to_string();
+        if let Some(stem) = value.strip_suffix(&old_suffix) {
+            self.dialog_input.update(cx, |input, cx| {
+                input.set_value(format!("{stem}.{new_suffix}"), window, cx);
+            });
+        }
+        self.modal_error = None;
+        cx.notify();
+    }
+
+    fn accept_create_archive(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Modal::CreateArchive(dialog)) = &self.modal else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<_> {
+            anyhow::ensure!(
+                self.operation.is_none(),
+                "Wait for the current operation to finish"
+            );
+            let mut path = self.resolve_path(value.trim());
+            anyhow::ensure!(
+                !value.trim().is_empty()
+                    && !value.trim().ends_with(std::path::is_separator)
+                    && path.file_name().is_some()
+                    && !path.is_dir(),
+                "Enter a file name or path for the archive"
+            );
+            let creation = dialog.format.creation().unwrap();
+            let suffix = format!(".{}", creation.suffix);
+            let name = path.file_name().unwrap().to_string_lossy();
+            anyhow::ensure!(
+                !name.eq_ignore_ascii_case(&suffix),
+                "Enter a name before the {suffix} suffix"
+            );
+            if !name
+                .to_ascii_lowercase()
+                .ends_with(&suffix.to_ascii_lowercase())
+            {
+                path.set_file_name(format!("{name}{suffix}"));
+            }
+            anyhow::ensure!(
+                path.parent().is_some_and(Path::is_dir),
+                "Destination directory does not exist"
+            );
+            match path.symlink_metadata() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => anyhow::bail!("Archive already exists: {}", path.display()),
+            }
+            let options = creation
+                .fields
+                .iter()
+                .zip(&dialog.options)
+                .map(|(field, value)| {
+                    let value = match value {
+                        ArchiveOption::Choice(value) => (*value).into(),
+                        ArchiveOption::Text(input) => input.read(cx).value().to_string(),
+                    };
+                    (field.id, value)
+                })
+                .collect();
+            Ok((path, dialog.format, dialog.sources.clone(), options))
+        })();
+        match result {
+            Ok((path, format, sources, options)) => {
+                self.dismiss(window, cx);
+                self.operation = Some(Operation::create_archive(
+                    self.id(),
+                    sources,
+                    path,
+                    format,
+                    options,
+                    self.filesystems.clone(),
+                ));
+            }
+            Err(error) => self.modal_error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
     pub fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
         let placeholder = if matches!(&modal, Modal::OpenVsx) {
             "Search Open VSX"
@@ -3094,7 +3453,11 @@ impl DotDir {
         };
         let has_input = matches!(
             &modal,
-            Modal::Palette | Modal::Search | Modal::OpenVsx | Modal::QuickPick { .. }
+            Modal::Palette
+                | Modal::Search
+                | Modal::OpenVsx
+                | Modal::QuickPick { .. }
+                | Modal::CreateArchive(_)
         );
         self.modal = Some(modal);
         self.modal_error = None;
@@ -3140,11 +3503,18 @@ impl DotDir {
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(Modal::Conflict { reply, .. }) = self.modal.take() {
-            let _ = reply.send(ConflictResolution::Cancel);
-            if let Some(op) = &self.operation {
-                op.token.cancel();
+        match self.modal.take() {
+            Some(Modal::Conflict { reply, .. }) => {
+                let _ = reply.send(ConflictResolution::Cancel);
+                if let Some(op) = &self.operation {
+                    op.token.cancel();
+                }
             }
+            Some(Modal::ArchivePassword { request, input }) => {
+                request.cancel.cancel();
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            _ => {}
         }
         if let Some(search) = &self.search {
             search.token.cancel();
@@ -3324,28 +3694,29 @@ impl DotDir {
                 self.prompt(
                     PromptKind::Location,
                     "Go to directory",
-                    "Enter a directory, ZIP archive, or filesystem URI.".into(),
+                    "Enter a directory, archive, or filesystem URI.".into(),
                     path,
                     window,
                     cx,
                 );
             }
             "mkdir" => self.prompt(
-                PromptKind::Mkdir,
+                PromptKind::Mkdir(self.pane_location(self.active)),
                 "Make directory",
-                self.cwd(self.active).display().to_string(),
+                self.pane_location(self.active).display(),
                 String::new(),
                 window,
                 cx,
             ),
             "new-file" => self.prompt(
-                PromptKind::NewFile,
+                PromptKind::NewFile(self.pane_location(self.active)),
                 "Open / Create File",
-                self.cwd(self.active).display().to_string(),
+                self.pane_location(self.active).display(),
                 String::new(),
                 window,
                 cx,
             ),
+            "create-archive" => self.prompt_create_archive(window, cx),
             "rename" if self.active_document().is_none() => {
                 if let Some(e) = self
                     .directory(self.active)
@@ -3410,7 +3781,7 @@ impl DotDir {
                             self.reload(id);
                         }
                     }
-                    if id == "view" && is_zip(e.path.name_path()) {
+                    if id == "view" && ARCHIVE_FORMATS.for_path(e.path.name_path()).is_some() {
                         self.open_entry(pane, e, false, window, cx);
                     } else {
                         self.open_document_into(pane, e.path, id == "view", None, window, cx);
@@ -3418,56 +3789,76 @@ impl DotDir {
                 }
             }
             "copy" | "move" | "trash" => {
-                if self.operation.is_some() {
-                    self.error("Wait for the current operation to finish", cx);
-                    return;
-                }
                 let Some(directory) = self.directory(self.active) else {
                     return;
                 };
-                let selected = directory.selected();
+                let sources: Vec<_> = directory
+                    .selected()
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect();
+                if sources.is_empty() {
+                    return;
+                }
+                let from_archive = matches!(directory.path, Location::Archive { .. });
                 let description = format!(
                     "{} item(s) from {}",
-                    selected.len(),
+                    sources.len(),
                     directory.path.display()
                 );
-                let destination = if self.pane_location(1 - self.active).local().is_none() {
-                    String::new()
-                } else {
-                    self.cwd(1 - self.active).display().to_string()
-                };
-                if let Location::Zip { archive, .. } = &directory.path {
-                    let members = selected
-                        .into_iter()
-                        .filter_map(|entry| match entry.path {
-                            Location::Zip { member, .. } => Some(member),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    if !members.is_empty() {
-                        self.prompt(
-                            PromptKind::Extract(archive.clone(), members),
-                            "Extract ZIP",
+                if id == "trash" {
+                    let (kind, title, description) = if from_archive {
+                        (
+                            PromptKind::DeleteArchive(sources),
+                            "Delete Archive Entries",
+                            format!(
+                                "{description}
+Selected entries will be permanently removed from the archive."
+                            ),
+                        )
+                    } else {
+                        (
+                            PromptKind::Trash(
+                                sources
+                                    .into_iter()
+                                    .filter_map(|path| path.local().map(Path::to_path_buf))
+                                    .collect(),
+                            ),
+                            "Move to Trash",
                             description,
-                            destination,
-                            window,
-                            cx,
-                        );
-                    }
-                } else {
-                    let paths = selected
-                        .into_iter()
-                        .filter_map(|entry| entry.path.local().map(PathBuf::from))
-                        .collect::<Vec<_>>();
-                    if paths.is_empty() {
-                        return;
-                    }
-                    let (kind, title) = match id {
-                        "trash" => (PromptKind::Trash(paths), "Move to Trash"),
-                        "move" => (PromptKind::Transfer(OperationKind::Move, paths), "Move"),
-                        _ => (PromptKind::Transfer(OperationKind::Copy, paths), "Copy"),
+                        )
                     };
-                    self.prompt(kind, title, description, destination, window, cx);
+                    self.prompt(kind, title, description, String::new(), window, cx);
+                } else {
+                    let archive_destination = self.opposite_archive_destination().cloned();
+                    let destination = archive_destination
+                        .as_ref()
+                        .map(Location::display)
+                        .or_else(|| {
+                            self.pane_location(1 - self.active)
+                                .local()
+                                .map(|path| path.display().to_string())
+                        })
+                        .unwrap_or_default();
+                    let kind = match id {
+                        "move" => OperationKind::Move,
+                        _ if from_archive && archive_destination.is_none() => {
+                            OperationKind::Extract
+                        }
+                        _ => OperationKind::Copy,
+                    };
+                    self.prompt(
+                        PromptKind::Transfer {
+                            kind,
+                            sources,
+                            archive_destination,
+                        },
+                        kind.title(),
+                        description,
+                        destination,
+                        window,
+                        cx,
+                    );
                 }
             }
             "sync" => {
@@ -3749,8 +4140,8 @@ impl DotDir {
     ) {
         if entry.directory {
             self.navigate(pane, entry.path, window, cx);
-        } else if is_zip(entry.path.name_path()) {
-            match Archive::mount_location(entry.path) {
+        } else if let Some(format) = ARCHIVE_FORMATS.for_path(entry.path.name_path()) {
+            match Archive::mount_location(entry.path, format) {
                 Ok(root) => self.navigate(pane, root, window, cx),
                 Err(error) => self.error(error, cx),
             }

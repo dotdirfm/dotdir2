@@ -15,6 +15,9 @@ pub struct CommandState {
     pub directory: bool,
     pub archive: bool,
     pub archive_editable: bool,
+    pub archive_writable: bool,
+    pub opposite_archive_writable: bool,
+    pub archive_creation: bool,
     pub provider: bool,
     pub entry: bool,
     pub real_entry: bool,
@@ -44,7 +47,8 @@ pub enum Availability {
     Always,
     Panels,
     Directory,
-    LocalDirectory,
+    WritableDirectory,
+    NewFile,
     LocalLocation,
     Entry,
     RealEntry,
@@ -52,7 +56,8 @@ pub enum Availability {
     EditableFile,
     Items,
     Copy,
-    LocalTransfer,
+    MutateSelection,
+    CreateArchive,
     Parent,
     RenameOrSave,
     Save,
@@ -73,7 +78,12 @@ impl Availability {
             Self::Always => true,
             Self::Panels => state.panels_visible,
             Self::Directory => state.directory,
-            Self::LocalDirectory => state.directory && local,
+            Self::WritableDirectory => {
+                state.directory && (local || state.archive_writable && state.operation_idle)
+            }
+            Self::NewFile => {
+                local || state.directory && state.archive_writable && state.operation_idle
+            }
             Self::LocalLocation => local,
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
@@ -85,7 +95,8 @@ impl Availability {
             Self::Copy => {
                 state.directory && state.selection && state.operation_idle && !state.provider
             }
-            Self::LocalTransfer => Self::Copy.matches(state) && local,
+            Self::MutateSelection => Self::Copy.matches(state) && (local || state.archive_writable),
+            Self::CreateArchive => Self::Copy.matches(state) && state.archive_creation,
             Self::Parent => state.directory && state.parent,
             Self::RenameOrSave => {
                 (state.directory && local && state.real_entry && state.operation_idle)
@@ -119,7 +130,8 @@ impl Command {
 
     pub fn title(&self, state: &CommandState) -> &'static str {
         match self.id {
-            "copy" if state.archive => "Extract ZIP",
+            "copy" if state.archive && !state.opposite_archive_writable => "Extract Archive",
+            "trash" if state.archive => "Delete Archive Entries",
             "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
             "toggle-line-wrap" if state.line_wrap == Some(false) => "Enable Line Wrap",
             _ => self.title,
@@ -136,7 +148,7 @@ impl Command {
         })
     }
 
-    pub fn keybar_label(&self, editor: bool, archive: bool) -> &str {
+    pub fn keybar_label(&self, editor: bool, state: &CommandState) -> &str {
         match self.id {
             "palette" => "Commands",
             "left-panel-menu" => "Left Menu",
@@ -145,10 +157,11 @@ impl Command {
             "rename" => "Rename",
             "view" => "View",
             "edit" => "Edit",
-            "copy" if archive => "Extract",
+            "copy" if state.archive && !state.opposite_archive_writable => "Extract",
             "copy" => "Copy",
             "move" => "Move",
             "mkdir" => "Mkdir",
+            "trash" if state.archive => "Delete",
             "trash" => "Trash",
             "quit" => "Quit",
             "extensions" => "Plugins",
@@ -251,21 +264,21 @@ pub const COMMANDS: &[Command] = &[
         title: "Move to Opposite Panel",
         key: "f6",
         context: "FilePane",
-        availability: Availability::LocalTransfer,
+        availability: Availability::MutateSelection,
     },
     Command {
         id: "mkdir",
         title: "Make Directory",
         key: "f7",
         context: "FilePane",
-        availability: Availability::LocalDirectory,
+        availability: Availability::WritableDirectory,
     },
     Command {
         id: "trash",
         title: "Move to Trash",
         key: "f8",
         context: "FilePane",
-        availability: Availability::LocalTransfer,
+        availability: Availability::MutateSelection,
     },
     Command {
         id: "settings",
@@ -468,7 +481,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Open / Create File",
         key: "shift-f4",
         context: "DotDir",
-        availability: Availability::LocalLocation,
+        availability: Availability::NewFile,
+    },
+    Command {
+        id: "create-archive",
+        title: "Create Archive…",
+        key: "",
+        context: "FilePane",
+        availability: Availability::CreateArchive,
     },
     Command {
         id: "save",
@@ -705,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn zip_panes_allow_preview_and_extraction_and_reject_mutation() {
+    fn archive_commands_follow_format_write_and_create_capabilities() {
         let state = CommandState {
             panels_visible: true,
             directory: true,
@@ -728,8 +748,26 @@ mod tests {
             "mkdir",
             "rename",
             "new-file",
+            "create-archive",
         ] {
             assert!(!available(id, &state), "{id}");
+        }
+        let writable = CommandState {
+            archive_writable: true,
+            archive_editable: true,
+            archive_creation: true,
+            ..state
+        };
+        for id in [
+            "copy",
+            "edit",
+            "move",
+            "trash",
+            "mkdir",
+            "new-file",
+            "create-archive",
+        ] {
+            assert!(available(id, &writable), "{id}");
         }
     }
 

@@ -3,13 +3,19 @@ name = "dotdir"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["zip-extension"]
+zip-extension = ["dep:dotdir-zip"]
+
 [dependencies]
 anyhow.workspace = true
 schemars = "1"
 serde.workspace = true
 serde_json.workspace = true
 dotdir-core = { path = "../dotdir-core" }
+dotdir-archive-api = { path = "../dotdir-archive-api" }
 dotdir-extension-host = { path = "../dotdir-extension-host" }
+dotdir-zip = { path = "../../extensions/zip", optional = true }
 gpui-kit = { version = "=0.11.0", features = [
     "tree-sitter",
     "tree-sitter-bash",
@@ -40,7 +46,8 @@ url = "2"
 percent-encoding = "2"
 tempfile = "3"
 same-file = "1"
-zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+ring = "0.17"
+zip.workspace = true
 jsonc-parser = { version = "0.34", features = ["serde"] }
 plist = "1.10"
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }

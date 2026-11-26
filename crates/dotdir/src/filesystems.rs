@@ -1,5 +1,10 @@
-use crate::{extension_logs::ExtensionLogs, vscode};
+use crate::{
+    archive_passwords::{ArchiveAccess, ArchiveKey, ArchivePasswords, PasswordScope},
+    extension_logs::ExtensionLogs,
+    vscode,
+};
 use anyhow::{Context, Result, bail, ensure};
+use dotdir_core::copy::CancelToken;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -166,18 +171,67 @@ trait Provider: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct Filesystems(Arc<HashMap<String, Arc<dyn Provider>>>);
+pub struct Filesystems {
+    providers: Arc<HashMap<String, Arc<dyn Provider>>>,
+    pub(crate) archive_passwords: Arc<ArchivePasswords>,
+    password_scope: Option<Arc<PasswordScope>>,
+    interactive: bool,
+}
 
 impl Filesystems {
     pub fn new(logs: ExtensionLogs) -> Self {
-        Self(Arc::new(HashMap::from([(
+        Self {
+            providers: Self::builtin_providers(logs),
+            archive_passwords: Arc::new(ArchivePasswords::unattended()),
+            password_scope: None,
+            interactive: true,
+        }
+    }
+
+    fn builtin_providers(logs: ExtensionLogs) -> Arc<HashMap<String, Arc<dyn Provider>>> {
+        Arc::new(HashMap::from([(
             LOG_SCHEME.into(),
             Arc::new(logs) as Arc<dyn Provider>,
-        )])))
+        )]))
+    }
+
+    pub(crate) fn rebuild_providers(&self, logs: ExtensionLogs) -> Self {
+        Self {
+            providers: Self::builtin_providers(logs),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn archive_operation(&self) -> Self {
+        let mut filesystems = self.clone();
+        filesystems
+            .password_scope
+            .get_or_insert_with(Default::default);
+        filesystems
+    }
+
+    pub(crate) fn without_password_prompts(&self) -> Self {
+        let mut filesystems = self.clone();
+        filesystems.interactive = false;
+        filesystems
+    }
+
+    pub(crate) fn password_access<'a>(
+        &'a self,
+        key: &'a ArchiveKey,
+        cancel: &'a CancelToken,
+    ) -> ArchiveAccess<'a> {
+        ArchiveAccess {
+            service: &self.archive_passwords,
+            scope: self.password_scope.as_deref(),
+            key,
+            cancel,
+            interactive: self.interactive,
+        }
     }
 
     fn provider(&self, path: &ProviderPath) -> Result<&dyn Provider> {
-        self.0
+        self.providers
             .get(&path.scheme)
             .map(Arc::as_ref)
             .with_context(|| format!("No filesystem provider for {}://", path.scheme))
@@ -245,7 +299,7 @@ impl Filesystems {
                 "Invalid filesystem protocol: {scheme}"
             );
             ensure!(
-                schemes.insert(scheme) && !self.0.contains_key(scheme),
+                schemes.insert(scheme) && !self.providers.contains_key(scheme),
                 "Filesystem protocol is already registered: {scheme}"
             );
         }
@@ -257,7 +311,7 @@ impl Filesystems {
             node,
             logs,
         });
-        let providers = Arc::make_mut(&mut self.0);
+        let providers = Arc::make_mut(&mut self.providers);
         for scheme in package.filesystems {
             providers.insert(scheme, provider.clone());
         }
@@ -450,7 +504,10 @@ mod tests {
         }
         let location = Location::Provider(path);
         let json = serde_json::to_string(&SavedLocation::from(&location)).unwrap();
-        let restored = Location::from(serde_json::from_str::<SavedLocation>(&json).unwrap());
+        let restored = serde_json::from_str::<SavedLocation>(&json)
+            .unwrap()
+            .restore(&crate::archive_extensions::BUNDLED)
+            .unwrap();
         assert_eq!(restored, location);
         assert!(restored.local().is_none());
         assert!(restored.host_path().is_none());

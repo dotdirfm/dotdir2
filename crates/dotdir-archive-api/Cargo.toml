@@ -1,0 +1,8 @@
+[package]
+name = "dotdir-archive-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+zeroize = "1"

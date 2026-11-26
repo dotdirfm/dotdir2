@@ -29,10 +29,10 @@ pub(crate) fn extension<'a>(
 pub(crate) fn launch(extension: &vscode::Extension, settings: &vscode::Settings) -> Launch {
     let configured_node = settings.node.clone();
     Launch {
-        name: "TypeScript 7 (ZIP)".into(),
+        name: "TypeScript 7 (Archive)".into(),
         command: Box::new(move || {
             let node = vscode::node_path(configured_node.as_deref())
-                .context("Node.js 22.15 or newer is required for TypeScript in ZIPs")?;
+                .context("Node.js 22.15 or newer is required for TypeScript in archives")?;
             let mut command = Command::new(node);
             command
                 .args(["--input-type=module", "--eval", HOST])
@@ -90,6 +90,10 @@ impl Workspace {
     }
 
     pub fn serve(&self, params: &Value) -> Result<Value> {
+        let filesystems = self
+            .filesystems
+            .without_password_prompts()
+            .archive_operation();
         let path = params["path"].as_str().context("Missing archive path")?;
         let location = self
             .archive
@@ -98,7 +102,7 @@ impl Workspace {
         let metadata = if path.is_empty() {
             None
         } else {
-            location.archive_metadata(&self.filesystems)?
+            location.archive_metadata(&filesystems)?
         };
         let regular = metadata
             .as_ref()
@@ -111,8 +115,8 @@ impl Workspace {
             "getAccessibleEntries" => {
                 let mut files = Vec::new();
                 let mut directories = Vec::new();
-                if directory && let Location::Zip { archive, member } = &location {
-                    for (_, entry) in archive.list(member, &self.filesystems)? {
+                if directory && let Location::Archive { archive, member } = &location {
+                    for (_, entry) in archive.list(member, &filesystems)? {
                         if entry.directory {
                             directories.push(entry.name);
                         } else if !entry.symlink {
@@ -127,7 +131,7 @@ impl Workspace {
                 if let Some(text) = open {
                     json!(text.to_string())
                 } else {
-                    json!(String::from_utf8(location.read_preview(&self.filesystems)?).ok())
+                    json!(String::from_utf8(location.read_preview(&filesystems)?).ok())
                 }
             }
             "readFile" => Value::Null,

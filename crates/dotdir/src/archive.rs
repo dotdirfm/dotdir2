@@ -1,5 +1,10 @@
-use crate::filesystems::{Filesystems, ProviderPath};
+use crate::{
+    archive_passwords::ArchiveKey,
+    filesystems::{Filesystems, ProviderPath},
+};
 use anyhow::{Context, Result, bail, ensure};
+pub use dotdir_archive_api::VirtualFile;
+use dotdir_archive_api::{ArchiveFormat, ArchiveReader, Changes, FormatInfo, Input, WriteSeek};
 use dotdir_core::copy::{CancelToken, ConflictPolicy, ConflictResolution, CopyEvent, CopyProgress};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,21 +12,62 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     hash::{Hash, Hasher},
-    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::{Instant, SystemTime},
 };
-use zip::{ZipArchive, ZipWriter};
 
 pub const PREVIEW_LIMIT: u64 = 16 * 1024 * 1024;
 pub const SEEKABLE_LIMIT: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_DEPTH: usize = 8;
+pub(crate) static ARCHIVE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+pub struct ArchiveFormats(&'static [&'static dyn ArchiveFormat]);
+
+impl ArchiveFormats {
+    pub const fn new(formats: &'static [&'static dyn ArchiveFormat]) -> Self {
+        Self(formats)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &'static FormatInfo> + '_ {
+        self.0.iter().map(|format| format.info())
+    }
+
+    pub fn creators(&self) -> impl Iterator<Item = &'static dyn ArchiveFormat> + '_ {
+        self.0
+            .iter()
+            .copied()
+            .filter(|format| format.creation().is_some())
+    }
+
+    pub fn for_path(&self, path: &Path) -> Option<&'static dyn ArchiveFormat> {
+        let name = path.file_name()?.to_string_lossy();
+        let bytes = name.as_bytes();
+        self.0
+            .iter()
+            .flat_map(|&format| {
+                format.info().suffixes.iter().filter_map(move |suffix| {
+                    let prefix = bytes.len().checked_sub(suffix.len() + 1)?;
+                    (prefix > 0
+                        && bytes[prefix] == b'.'
+                        && bytes[prefix + 1..].eq_ignore_ascii_case(suffix.as_bytes()))
+                    .then_some((suffix.len(), format))
+                })
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, format)| format)
+    }
+
+    fn by_id(&self, id: &str) -> Option<&'static dyn ArchiveFormat> {
+        self.0.iter().copied().find(|format| format.info().id == id)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local(PathBuf),
-    Zip {
+    Archive {
         archive: Arc<Archive>,
         member: PathBuf,
     },
@@ -32,54 +78,58 @@ pub enum Location {
 #[serde(untagged)]
 pub enum SavedLocation {
     Local(PathBuf),
-    Zip {
-        archive: PathBuf,
+    Archive {
+        format: String,
+        source: Box<SavedLocation>,
         member: PathBuf,
     },
     Provider {
         uri: ProviderPath,
     },
-    NestedZip {
+    LegacyZip {
+        archive: PathBuf,
+        member: PathBuf,
+    },
+    LegacyNestedZip {
         source: Box<SavedLocation>,
         member: PathBuf,
     },
 }
 
 impl SavedLocation {
-    pub fn available(&self) -> bool {
-        let mut depth = 0;
-        let mut source = self;
-        loop {
-            match source {
-                Self::Local(path) => return path.is_dir(),
-                Self::Zip { archive, .. } => return depth < MAX_ARCHIVE_DEPTH && archive.is_file(),
-                Self::Provider { .. } => return true,
-                Self::NestedZip { source: parent, .. } => {
-                    depth += 1;
-                    if depth > MAX_ARCHIVE_DEPTH {
-                        return false;
-                    }
-                    source = parent;
-                }
-            }
-        }
+    pub fn restore(self, formats: &ArchiveFormats) -> Option<Location> {
+        self.restore_at(formats, 0)
     }
-}
 
-impl From<SavedLocation> for Location {
-    fn from(saved: SavedLocation) -> Self {
-        match saved {
-            SavedLocation::Local(path) => Self::Local(path),
-            SavedLocation::Zip { archive, member } => Self::Zip {
-                archive: Arc::new(Archive::new(archive.into())),
+    fn restore_at(self, formats: &ArchiveFormats, depth: usize) -> Option<Location> {
+        const LEGACY_ZIP_ID: &str = "dotdir.zip";
+        let (format, source, member) = match self {
+            Self::Local(path) => {
+                let available = if depth == 0 {
+                    path.is_dir()
+                } else {
+                    path.is_file()
+                };
+                return available.then_some(Location::Local(path));
+            }
+            Self::Provider { uri } => return Some(Location::Provider(uri)),
+            Self::Archive {
+                format,
+                source,
                 member,
-            },
-            SavedLocation::Provider { uri } => Self::Provider(uri),
-            SavedLocation::NestedZip { source, member } => Self::Zip {
-                archive: Arc::new(Archive::new(Self::from(*source))),
-                member,
-            },
+            } => (formats.by_id(&format)?, *source, member),
+            Self::LegacyZip { archive, member } => {
+                (formats.by_id(LEGACY_ZIP_ID)?, Self::Local(archive), member)
+            }
+            Self::LegacyNestedZip { source, member } => {
+                (formats.by_id(LEGACY_ZIP_ID)?, *source, member)
+            }
+        };
+        if depth >= MAX_ARCHIVE_DEPTH {
+            return None;
         }
+        let source = source.restore_at(formats, depth + 1)?;
+        Some(Arc::new(Archive::new(source, format)).location(member))
     }
 }
 
@@ -87,15 +137,10 @@ impl From<&Location> for SavedLocation {
     fn from(location: &Location) -> Self {
         match location {
             Location::Local(path) => Self::Local(path.clone()),
-            Location::Zip { archive, member } => match &archive.source {
-                Location::Local(path) => Self::Zip {
-                    archive: path.clone(),
-                    member: member.clone(),
-                },
-                source => Self::NestedZip {
-                    source: Box::new(Self::from(source)),
-                    member: member.clone(),
-                },
+            Location::Archive { archive, member } => Self::Archive {
+                format: archive.info().id.into(),
+                source: Box::new(Self::from(&archive.source)),
+                member: member.clone(),
             },
             Location::Provider(uri) => Self::Provider { uri: uri.clone() },
         }
@@ -116,25 +161,44 @@ impl From<&Path> for Location {
 
 impl Location {
     pub fn editable(&self) -> bool {
-        self.local().is_some() || (self.archive_root().is_some() && self.host_path().is_some())
+        match self {
+            Self::Local(_) => true,
+            Self::Archive { archive, .. } => archive.writable(),
+            Self::Provider(_) => false,
+        }
+    }
+
+    pub(crate) fn is_within(&self, ancestor: &Self) -> bool {
+        match (self, ancestor) {
+            (Self::Local(path), Self::Local(parent)) => path.starts_with(parent),
+            (
+                Self::Archive { archive, member },
+                Self::Archive {
+                    archive: parent,
+                    member: prefix,
+                },
+            ) if archive == parent => member.starts_with(prefix),
+            (Self::Archive { archive, .. }, _) => archive.source.is_within(ancestor),
+            _ => self == ancestor,
+        }
     }
 
     pub fn archive_root(&self) -> Option<Self> {
         match self {
-            Self::Zip { archive, .. } => Some(archive.location(PathBuf::new())),
+            Self::Archive { archive, .. } => Some(archive.location(PathBuf::new())),
             _ => None,
         }
     }
 
     pub fn archive_member(&self) -> Option<&Path> {
         match self {
-            Self::Zip { member, .. } => Some(member),
+            Self::Archive { member, .. } => Some(member),
             _ => None,
         }
     }
 
     pub fn resolve_archive_member(&self, path: &str) -> Option<Self> {
-        let Self::Zip { archive, .. } = self else {
+        let Self::Archive { archive, .. } = self else {
             return None;
         };
         if path.is_empty() {
@@ -146,7 +210,7 @@ impl Location {
     }
 
     pub fn archive_metadata(&self, filesystems: &Filesystems) -> Result<Option<Member>> {
-        let Self::Zip { archive, member } = self else {
+        let Self::Archive { archive, member } = self else {
             return Ok(None);
         };
         Ok(archive.index(filesystems)?.get(member).cloned())
@@ -162,14 +226,14 @@ impl Location {
     pub fn host_path(&self) -> Option<&Path> {
         match self {
             Self::Local(path) => Some(path),
-            Self::Zip { archive, .. } => archive.source.host_path(),
+            Self::Archive { archive, .. } => archive.source.host_path(),
             Self::Provider(_) => None,
         }
     }
 
     pub fn name_path(&self) -> &Path {
         match self {
-            Self::Zip { archive, member } => {
+            Self::Archive { archive, member } => {
                 if member.as_os_str().is_empty() {
                     archive.source.name_path()
                 } else {
@@ -206,10 +270,10 @@ impl Location {
 
     pub fn parent(&self) -> Option<Self> {
         match self {
-            Self::Zip { archive, member } if !member.as_os_str().is_empty() => {
+            Self::Archive { archive, member } if !member.as_os_str().is_empty() => {
                 Some(archive.location(member.parent()?.into()))
             }
-            Self::Zip { archive, .. } => archive.source.parent(),
+            Self::Archive { archive, .. } => archive.source.parent(),
             Self::Provider(path) => Some(Self::Provider(path.parent()?)),
             Self::Local(path) => Some(path.parent()?.into()),
         }
@@ -218,7 +282,7 @@ impl Location {
     pub fn display(&self) -> String {
         match self {
             Self::Local(path) => path.display().to_string(),
-            Self::Zip { archive, member } => {
+            Self::Archive { archive, member } => {
                 format!("{}!/{}", archive.source.display(), member.display())
             }
             Self::Provider(path) => path.to_string(),
@@ -247,8 +311,8 @@ impl Location {
                 );
                 read_exact_bytes(file, size, cancel)
             }
-            Self::Zip { archive, member } => {
-                archive.read_member(member, filesystems, limit, cancel)
+            Self::Archive { archive, member } => {
+                archive.read_member(member, &filesystems.archive_operation(), limit, cancel)
             }
             Self::Provider(path) => filesystems.read_file(path, limit as usize),
         }
@@ -262,9 +326,12 @@ impl Location {
         ensure!(!cancel.is_cancelled(), "File read cancelled");
         match self {
             Self::Local(path) => VirtualFile::local(path),
-            Self::Zip { archive, member } => {
-                archive.open_member(member, filesystems, cancel, SEEKABLE_LIMIT)
-            }
+            Self::Archive { archive, member } => archive.open_member(
+                member,
+                &filesystems.archive_operation(),
+                cancel,
+                SEEKABLE_LIMIT,
+            ),
             Self::Provider(path) => Ok(VirtualFile::memory(
                 filesystems.read_file(path, SEEKABLE_LIMIT as usize)?,
             )),
@@ -273,7 +340,7 @@ impl Location {
 
     fn archive_depth(&self) -> usize {
         match self {
-            Self::Zip { archive, .. } => archive.depth,
+            Self::Archive { archive, .. } => archive.depth,
             _ => 0,
         }
     }
@@ -284,64 +351,77 @@ impl Location {
         text: &str,
         filesystems: &Filesystems,
     ) -> Result<()> {
-        static SAVE_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = SAVE_LOCK.lock().unwrap();
-        let outer = self
-            .host_path()
-            .context("The archive has no writable local source")?;
-        let original = fs::metadata(outer)?;
-        ensure!(
-            !original.permissions().readonly(),
-            "The ZIP archive is read-only"
-        );
-        let identity = same_file::Handle::from_path(outer)?;
+        let Self::Archive { archive, member } = self else {
+            bail!("Expected an archive file entry");
+        };
+        let filesystems = &filesystems.archive_operation();
+        let _guard = ARCHIVE_WRITE_LOCK.lock().unwrap();
+        let stamp = archive.stamp()?;
         ensure!(
             text.len() as u64 <= PREVIEW_LIMIT,
-            "ZIP text entries are limited to 16 MiB"
+            "Archive text entries are limited to 16 MiB"
         );
         ensure!(
             self.read_preview(filesystems)? == expected,
-            "ZIP entry changed on disk. Your edits are still open."
+            "Archive entry changed on disk. Your edits are still open."
         );
 
-        let mut location = self;
-        let mut compressed_archive = None;
-        let cancel = CancelToken::new();
-        while let Self::Zip { archive, member } = location {
-            let mut reader = archive.mounted(filesystems, &cancel)?.reader.clone();
-            let contents = compressed_archive.as_deref().unwrap_or(text.as_bytes());
-            if archive.source.local().is_some() {
-                let parent = outer.parent().context("Missing archive directory")?;
-                let mut output = tempfile::NamedTempFile::new_in(parent)?;
-                rewrite_member(&mut reader, output.as_file_mut(), member, contents)?;
-                output.as_file().set_permissions(original.permissions())?;
-                output.as_file().sync_all()?;
-                let current = fs::metadata(outer)?;
-                ensure!(
-                    current.len() == original.len()
-                        && current.modified()? == original.modified()?
-                        && same_file::Handle::from_path(outer)? == identity,
-                    "ZIP archive changed while saving. Your edits are still open."
-                );
-                output.persist(outer)?;
-                return Ok(());
-            }
-            let output = rewrite_member(&mut reader, NestedZipOutput::default(), member, contents)?;
-            compressed_archive = Some(output.0.into_inner());
-            location = &archive.source;
+        let input = input_bytes(member.clone(), text.as_bytes());
+        archive.rewrite(
+            Changes {
+                remove: &[],
+                write: &[input],
+            },
+            &stamp,
+            filesystems,
+            &CancelToken::new(),
+        )?;
+        Ok(())
+    }
+}
+
+fn input_bytes(path: PathBuf, bytes: &[u8]) -> Input<'_> {
+    Input {
+        path,
+        size: bytes.len() as u64,
+        modified: None,
+        unix_mode: None,
+        contents: Some(Box::new(move |output| Ok(output.write_all(bytes)?))),
+    }
+}
+
+pub(crate) struct CancellableOutput<'a> {
+    pub output: &'a mut dyn WriteSeek,
+    pub cancel: &'a CancelToken,
+}
+
+impl Write for CancellableOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::other("Archive operation cancelled"));
         }
-        bail!("Expected a ZIP file entry")
+        self.output.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+impl Seek for CancellableOutput<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.output.seek(position)
     }
 }
 
 #[derive(Default)]
-struct NestedZipOutput(io::Cursor<Vec<u8>>);
+struct NestedArchiveOutput(io::Cursor<Vec<u8>>);
 
-impl Write for NestedZipOutput {
+impl Write for NestedArchiveOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if (bytes.len() as u64).saturating_add(self.0.position()) > SEEKABLE_LIMIT {
             return Err(io::Error::other(
-                "The updated nested ZIP exceeds the 64 MiB memory limit",
+                "The updated nested archive exceeds the 64 MiB memory limit",
             ));
         }
         self.0.write(bytes)
@@ -352,157 +432,9 @@ impl Write for NestedZipOutput {
     }
 }
 
-impl Seek for NestedZipOutput {
+impl Seek for NestedArchiveOutput {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         self.0.seek(from)
-    }
-}
-
-fn rewrite_member<W: Write + Seek>(
-    reader: &mut Reader,
-    output: W,
-    member: &Path,
-    contents: &[u8],
-) -> Result<W> {
-    ensure!(
-        reader.offset() == 0 && !reader.has_duplicate_names(),
-        "ZIPs with a prepended payload or duplicate entry names cannot be edited"
-    );
-    let name = member_name(member)?;
-    let replaced = reader
-        .index_for_name(&name)
-        .context("The ZIP entry is missing")?;
-    let mut writer = ZipWriter::new(output);
-    writer.set_raw_comment(reader.comment().into())?;
-    for index in 0..reader.len() {
-        let entry = reader.by_index_raw(index)?;
-        if index == replaced {
-            ensure!(
-                entry.is_file() && !entry.is_symlink() && !entry.encrypted(),
-                "Only regular, unencrypted ZIP files can be edited"
-            );
-            let options = entry.options();
-            writer.start_file(name.as_ref(), options)?;
-            writer.write_all(contents)?;
-        } else {
-            writer.raw_copy_file(entry)?;
-        }
-    }
-    Ok(writer.finish()?)
-}
-
-#[derive(Debug, Clone)]
-enum FileBacking {
-    Local(Arc<Mutex<BufReader<File>>>),
-    Memory(Arc<Vec<u8>>),
-}
-
-/// An independent cursor over an entire file or a bounded subrange of it.
-#[derive(Clone)]
-pub struct VirtualFile {
-    backing: FileBacking,
-    start: u64,
-    length: u64,
-    position: u64,
-}
-
-impl std::fmt::Debug for VirtualFile {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("VirtualFile")
-            .field("start", &self.start)
-            .field("length", &self.length)
-            .finish_non_exhaustive()
-    }
-}
-
-impl VirtualFile {
-    fn local(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
-        ensure!(metadata.is_file(), "Expected a regular file");
-        Ok(Self {
-            backing: FileBacking::Local(Arc::new(Mutex::new(BufReader::new(file)))),
-            start: 0,
-            length: metadata.len(),
-            position: 0,
-        })
-    }
-
-    fn memory(data: Vec<u8>) -> Self {
-        Self {
-            length: data.len() as u64,
-            backing: FileBacking::Memory(Arc::new(data)),
-            start: 0,
-            position: 0,
-        }
-    }
-
-    fn slice(self, start: u64, length: u64) -> Result<Self> {
-        ensure!(
-            start <= self.length && length <= self.length - start,
-            "ZIP entry extends beyond the archive"
-        );
-        Ok(Self {
-            backing: self.backing,
-            start: self.start + start,
-            length,
-            position: 0,
-        })
-    }
-
-    pub fn len(&self) -> u64 {
-        self.length
-    }
-
-    fn memory_usage(&self) -> u64 {
-        match &self.backing {
-            FileBacking::Local(_) => 0,
-            FileBacking::Memory(data) => data.len() as u64,
-        }
-    }
-}
-
-impl Read for VirtualFile {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let count = self
-            .length
-            .saturating_sub(self.position)
-            .min(bytes.len() as u64) as usize;
-        if count == 0 {
-            return Ok(0);
-        }
-        let offset = self.start + self.position;
-        let output = &mut bytes[..count];
-        let read = match &self.backing {
-            FileBacking::Local(file) => {
-                let mut file = file.lock().unwrap();
-                if file.stream_position()? != offset {
-                    file.seek(SeekFrom::Start(offset))?;
-                }
-                file.read(output)?
-            }
-            FileBacking::Memory(data) => {
-                let offset = offset as usize;
-                output.copy_from_slice(&data[offset..offset + count]);
-                count
-            }
-        };
-        self.position += read as u64;
-        Ok(read)
-    }
-}
-
-impl Seek for VirtualFile {
-    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        let position = match from {
-            SeekFrom::Start(offset) => Some(offset),
-            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
-            SeekFrom::End(offset) => self.length.checked_add_signed(offset),
-        };
-        self.position = position
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file offset"))?;
-        Ok(self.position)
     }
 }
 
@@ -530,18 +462,10 @@ fn read_exact_bytes(reader: impl Read, size: u64, cancel: &CancelToken) -> Resul
     Ok(bytes)
 }
 
-fn member_name(path: &Path) -> Result<std::borrow::Cow<'_, str>> {
-    let name = path.to_str().context("Invalid ZIP path")?;
-    if cfg!(windows) {
-        Ok(name.replace(std::path::MAIN_SEPARATOR, "/").into())
-    } else {
-        Ok(name.into())
-    }
-}
-
 #[derive(Debug)]
 pub struct Archive {
     source: Location,
+    format: &'static dyn ArchiveFormat,
     depth: usize,
     cache: Mutex<Option<CachedArchive>>,
 }
@@ -553,12 +477,40 @@ struct CachedArchive {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ArchiveRevision {
+pub(crate) struct ArchiveRevision {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
     #[cfg(unix)]
     identity: (u64, u64),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceStamp {
+    revision: ArchiveRevision,
+    identity: same_file::Handle,
+}
+
+impl SourceStamp {
+    pub(crate) fn from_path(path: &Path) -> Result<Self> {
+        Self::from_file(&File::open(path)?)
+    }
+
+    pub(crate) fn from_file(file: &File) -> Result<Self> {
+        Ok(Self {
+            revision: file.metadata()?.into(),
+            identity: same_file::Handle::from_file(file.try_clone()?)?,
+        })
+    }
+
+    pub(crate) fn check(&self, path: &Path) -> Result<()> {
+        ensure!(
+            *self == Self::from_path(path)?,
+            "Source changed during the operation: {}",
+            path.display()
+        );
+        Ok(())
+    }
 }
 
 impl From<fs::Metadata> for ArchiveRevision {
@@ -576,10 +528,12 @@ impl From<fs::Metadata> for ArchiveRevision {
 }
 
 #[derive(Debug)]
-struct MountedArchive {
-    reader: Reader,
+pub(crate) struct MountedArchive {
+    reader: Box<dyn ArchiveReader>,
     index: Mutex<Option<Arc<Index>>>,
     memory_usage: u64,
+    key: ArchiveKey,
+    source_protected: bool,
 }
 
 // Directory history keeps locations alive. Limit how much of their decompressed
@@ -600,70 +554,70 @@ pub struct Member {
     pub name: String,
     pub directory: bool,
     pub symlink: bool,
+    encrypted: bool,
     pub size: u64,
     pub modified: f64,
 }
 
-type Reader = ZipArchive<VirtualFile>;
-type Index = BTreeMap<PathBuf, Member>;
+pub(crate) type Index = BTreeMap<PathBuf, Member>;
 
 impl PartialEq for Archive {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
+        self.info().id == other.info().id && self.source == other.source
     }
 }
 impl Eq for Archive {}
 impl Hash for Archive {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.info().id.hash(state);
         self.source.hash(state);
     }
 }
 
-pub fn is_zip(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-}
-
 impl Archive {
-    fn new(source: Location) -> Self {
+    fn new(source: Location, format: &'static dyn ArchiveFormat) -> Self {
         Self {
             depth: source.archive_depth() + 1,
             source,
+            format,
             cache: Mutex::new(None),
         }
     }
 
-    pub fn mount(path: PathBuf) -> Location {
-        Arc::new(Self::new(path.into())).location(PathBuf::new())
+    pub fn info(&self) -> &'static FormatInfo {
+        self.format.info()
     }
 
-    pub fn mount_location(source: Location) -> Result<Location> {
+    pub fn mount_location(
+        source: Location,
+        format: &'static dyn ArchiveFormat,
+    ) -> Result<Location> {
         ensure!(
             source.archive_depth() < MAX_ARCHIVE_DEPTH,
-            "ZIP nesting is limited to {MAX_ARCHIVE_DEPTH} archives"
+            "Archive nesting is limited to {MAX_ARCHIVE_DEPTH} layers"
         );
         let source = match source {
             Location::Local(path) => Location::Local(path.canonicalize().unwrap_or(path)),
             source => source,
         };
-        Ok(Arc::new(Self::new(source)).location(PathBuf::new()))
+        Ok(Arc::new(Self::new(source, format)).location(PathBuf::new()))
     }
 
-    fn location(self: &Arc<Self>, member: PathBuf) -> Location {
-        Location::Zip {
+    pub(crate) fn location(self: &Arc<Self>, member: PathBuf) -> Location {
+        Location::Archive {
             archive: self.clone(),
             member,
         }
     }
 
-    fn mounted(
+    pub(crate) fn mounted(
         &self,
         filesystems: &Filesystems,
         cancel: &CancelToken,
     ) -> Result<Arc<MountedArchive>> {
         ensure!(
             self.depth <= MAX_ARCHIVE_DEPTH,
-            "ZIP nesting is limited to {MAX_ARCHIVE_DEPTH} archives"
+            "Archive nesting is limited to {MAX_ARCHIVE_DEPTH} layers"
         );
         let revision = self
             .source
@@ -682,14 +636,24 @@ impl Archive {
         *cache = None;
         let source = self.source.open_seekable(filesystems, cancel)?;
         let memory_usage = source.memory_usage();
-        let reader = ZipArchive::new(source)
-            .with_context(|| format!("Open ZIP archive {}", self.source.display()))?;
+        let source_protected = source.is_protected();
+        let reader = self
+            .format
+            .open(source)
+            .with_context(|| format!("Open archive {}", self.source.display()))?;
         let mounted = Arc::new(MountedArchive {
             reader,
             index: Mutex::new(None),
             memory_usage,
+            key: ArchiveKey {
+                source: self.source.clone(),
+                format: self.info().id,
+            },
+            source_protected,
         });
-        if let Some(revision) = revision {
+        if let Some(revision) = revision
+            && !source_protected
+        {
             *cache = Some(CachedArchive {
                 revision,
                 mounted: Arc::downgrade(&mounted),
@@ -699,15 +663,77 @@ impl Archive {
         Ok(mounted)
     }
 
-    fn index(&self, filesystems: &Filesystems) -> Result<Arc<Index>> {
-        let mounted = self.mounted(filesystems, &CancelToken::new())?;
-        let mut index = mounted.index.lock().unwrap();
-        if let Some(entries) = &*index {
-            return Ok(entries.clone());
+    pub(crate) fn index(&self, filesystems: &Filesystems) -> Result<Arc<Index>> {
+        self.mounted(filesystems, &CancelToken::new())?.index()
+    }
+
+    pub(crate) fn writable(&self) -> bool {
+        self.info().writable && self.source.editable()
+    }
+
+    pub(crate) fn stamp(&self) -> Result<SourceStamp> {
+        SourceStamp::from_path(
+            self.source
+                .host_path()
+                .context("The archive has no local source")?,
+        )
+    }
+
+    /// The caller holds ARCHIVE_WRITE_LOCK across validation and publication.
+    pub(crate) fn rewrite(
+        &self,
+        changes: Changes<'_>,
+        stamp: &SourceStamp,
+        filesystems: &Filesystems,
+        cancel: &CancelToken,
+    ) -> Result<SourceStamp> {
+        ensure!(self.writable(), "This archive is read-only");
+        let outer = self
+            .source
+            .host_path()
+            .context("The archive has no writable local source")?;
+        stamp.check(outer)?;
+        let permissions = fs::metadata(outer)?.permissions();
+        ensure!(!permissions.readonly(), "The archive file is read-only");
+        let snapshot = self.mounted(filesystems, cancel)?;
+        let passwords = filesystems.password_access(&snapshot.key, cancel);
+        let rewrite = |output: &mut dyn WriteSeek| {
+            snapshot.reader.rewrite(
+                changes,
+                &passwords,
+                &mut CancellableOutput { output, cancel },
+            )
+        };
+        match &self.source {
+            Location::Local(_) => {
+                let parent = outer.parent().context("Missing archive directory")?;
+                let mut output = tempfile::NamedTempFile::new_in(parent)?;
+                rewrite(output.as_file_mut())?;
+                output.as_file().set_permissions(permissions)?;
+                output.as_file().sync_all()?;
+                let written = SourceStamp::from_file(output.as_file())?;
+                stamp.check(outer)?;
+                ensure!(!cancel.is_cancelled(), "Archive operation cancelled");
+                output.persist(outer)?;
+                Ok(written)
+            }
+            Location::Archive { archive, member } => {
+                let mut output = NestedArchiveOutput::default();
+                rewrite(&mut output)?;
+                let bytes = output.0.into_inner();
+                let input = input_bytes(member.clone(), &bytes);
+                archive.rewrite(
+                    Changes {
+                        remove: &[],
+                        write: &[input],
+                    },
+                    stamp,
+                    filesystems,
+                    cancel,
+                )
+            }
+            Location::Provider(_) => bail!("This archive is read-only"),
         }
-        let entries = Arc::new(build_index(&mut mounted.reader.clone())?);
-        *index = Some(entries.clone());
-        Ok(entries)
     }
 
     pub fn list(
@@ -719,7 +745,7 @@ impl Archive {
         if !dir.as_os_str().is_empty() {
             ensure!(
                 entries.get(dir).is_some_and(|entry| entry.directory),
-                "ZIP directory is missing"
+                "Archive directory is missing"
             );
         }
         Ok(entries
@@ -737,19 +763,8 @@ impl Archive {
         limit: u64,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>> {
-        let mut zip = self.mounted(filesystems, cancel)?.reader.clone();
-        let entry = zip.by_name(member_name(path)?.as_ref())?;
-        ensure!(
-            entry.is_file() && !entry.is_symlink(),
-            "ZIP entry is not a regular file"
-        );
-        let size = entry.size();
-        ensure!(
-            size <= limit,
-            "ZIP previews are limited to {} MiB",
-            limit / (1024 * 1024)
-        );
-        read_exact_bytes(entry, size, cancel)
+        self.mounted(filesystems, cancel)?
+            .read_member(path, limit, filesystems, cancel)
     }
 
     fn open_member(
@@ -759,44 +774,45 @@ impl Archive {
         cancel: &CancelToken,
         limit: u64,
     ) -> Result<VirtualFile> {
-        let mut zip = self.mounted(filesystems, cancel)?.reader.clone();
-        let entry = zip.by_name(member_name(path)?.as_ref())?;
-        ensure!(
-            entry.is_file() && !entry.is_symlink() && !entry.encrypted(),
-            "ZIP entry is not a readable regular file"
-        );
-        let size = entry.size();
-        if entry.compression() == zip::CompressionMethod::Stored {
+        let mounted = self.mounted(filesystems, cancel)?;
+        let (size, encrypted) = mounted.regular_entry(path)?;
+        if let Some(file) = mounted.reader.seekable_member(path)? {
             ensure!(
-                entry.compressed_size() == size,
-                "Stored ZIP entry has inconsistent sizes"
+                file.len() == size,
+                "Archive entry size does not match its contents"
             );
-            let start = entry
-                .data_start()
-                .context("Missing ZIP entry data offset")?;
-            drop(entry);
-            return zip.into_inner().slice(start, size);
+            return Ok(if encrypted || mounted.source_protected {
+                file.mark_protected()
+            } else {
+                file
+            });
         }
         ensure!(
             size <= limit,
-            "Compressed ZIP entries over {} MiB cannot be opened in memory",
+            "Compressed or encrypted archive entries over {} MiB cannot be opened in memory",
             limit / (1024 * 1024)
         );
-        Ok(VirtualFile::memory(read_exact_bytes(entry, size, cancel)?))
+        let file = VirtualFile::memory(mounted.read_member(path, limit, filesystems, cancel)?);
+        Ok(if encrypted || mounted.source_protected {
+            file.mark_protected()
+        } else {
+            file
+        })
     }
 
     pub fn extract(
         &self,
         members: Vec<PathBuf>,
         destination: &Path,
+        moving: bool,
         mut policy: ConflictPolicy,
         filesystems: &Filesystems,
         cancel: &CancelToken,
         emit: &dyn Fn(CopyEvent),
         conflict: &dyn Fn(&Path, &Path) -> ConflictResolution,
-    ) -> Result<()> {
-        let mut zip = self.mounted(filesystems, cancel)?.reader.clone();
-        let entries = build_index(&mut zip)?;
+    ) -> Result<Vec<PathBuf>> {
+        let mounted = self.mounted(filesystems, cancel)?;
+        let entries = mounted.index()?;
         let base = destination.canonicalize()?;
         let archive_path = self
             .source
@@ -804,13 +820,17 @@ impl Archive {
             .map(Path::canonicalize)
             .transpose()?;
         let mut jobs = BTreeMap::new();
+        let mut completed = members.iter().cloned().collect::<BTreeSet<_>>();
+        let mut published = Vec::new();
         for member in members.iter().collect::<BTreeSet<_>>() {
             ensure!(
                 entries.contains_key(member),
-                "ZIP entry is missing: {}",
+                "Archive entry is missing: {}",
                 member.display()
             );
-            let parent = member.parent().context("Select a ZIP entry to extract")?;
+            let parent = member
+                .parent()
+                .context("Select an archive entry to extract")?;
             for (path, entry) in entries
                 .range(member.clone()..)
                 .take_while(|(path, _)| path.starts_with(member))
@@ -818,13 +838,13 @@ impl Archive {
                 let relative = path.strip_prefix(parent)?;
                 ensure!(
                     !entry.symlink,
-                    "ZIP contains a symbolic link: {}",
+                    "Archive contains a symbolic link: {}",
                     path.display()
                 );
                 if let Some(previous) = jobs.insert(relative, (path, entry)) {
                     ensure!(
                         previous.0 == path,
-                        "Selected ZIP entries have the same extraction path"
+                        "Selected archive entries have the same extraction path"
                     );
                 }
             }
@@ -872,7 +892,7 @@ impl Archive {
                         let mut original = File::open(&target)?;
                         loop {
                             if cancel.is_cancelled() {
-                                return Ok(());
+                                return Ok(Vec::new());
                             }
                             let count = original.read(&mut buffer)?;
                             if count == 0 {
@@ -881,38 +901,52 @@ impl Archive {
                             file.write_all(&buffer[..count])?;
                         }
                     }
-                    let mut input = zip.by_name(member_name(path)?.as_ref())?;
-                    let mut written = 0u64;
-                    loop {
-                        if cancel.is_cancelled() {
-                            return Ok(());
+                    mounted.with_member(path, filesystems, cancel, &mut |input| {
+                        let mut written = 0u64;
+                        loop {
+                            if cancel.is_cancelled() {
+                                return Ok(());
+                            }
+                            let count = input.read(&mut buffer)?;
+                            if count == 0 {
+                                break;
+                            }
+                            written += count as u64;
+                            ensure!(
+                                written <= entry.size,
+                                "Archive entry exceeds its declared size"
+                            );
+                            file.write_all(&buffer[..count])?;
+                            if last_progress.elapsed().as_millis() >= 50 {
+                                let mut snapshot = progress.clone();
+                                snapshot.bytes_copied =
+                                    snapshot.bytes_copied.saturating_add(written);
+                                emit(CopyEvent::Progress(snapshot));
+                                last_progress = Instant::now();
+                            }
                         }
-                        let count = input.read(&mut buffer)?;
-                        if count == 0 {
-                            break;
-                        }
-                        written += count as u64;
-                        ensure!(written <= entry.size, "ZIP entry exceeds its declared size");
-                        file.write_all(&buffer[..count])?;
-                        if last_progress.elapsed().as_millis() >= 50 {
-                            let mut snapshot = progress.clone();
-                            snapshot.bytes_copied = snapshot.bytes_copied.saturating_add(written);
-                            emit(CopyEvent::Progress(snapshot));
-                            last_progress = Instant::now();
-                        }
-                    }
-                    ensure!(
-                        written == entry.size,
-                        "ZIP entry size does not match its contents"
-                    );
+                        ensure!(
+                            written == entry.size,
+                            "Archive entry size does not match its contents"
+                        );
+                        Ok(())
+                    })?;
                     if cancel.is_cancelled() {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
-                    if matches!(mode, WriteMode::New) {
-                        file.persist_noclobber(target)?;
+                    if moving {
+                        file.as_file().sync_all()?;
+                    }
+                    let written = if matches!(mode, WriteMode::New) {
+                        file.persist_noclobber(&target)?
                     } else {
-                        file.persist(target)?;
+                        file.persist(&target)?
+                    };
+                    if moving {
+                        published.push((target, ArchiveRevision::from(written.metadata()?)));
                     }
+                } else {
+                    completed.retain(|root| !path.starts_with(root));
                 }
             }
             progress.bytes_copied = progress.bytes_copied.saturating_add(entry.size);
@@ -924,50 +958,97 @@ impl Archive {
                 last_progress = Instant::now();
             }
         }
-        Ok(())
+        for (path, revision) in published {
+            ensure!(
+                ArchiveRevision::from(path.symlink_metadata()?) == revision,
+                "Extraction destination changed during the move: {}",
+                path.display()
+            );
+        }
+        Ok(if cancel.is_cancelled() {
+            Vec::new()
+        } else {
+            completed.into_iter().collect()
+        })
     }
 }
 
-fn build_index(zip: &mut Reader) -> Result<Index> {
+impl MountedArchive {
+    pub(crate) fn with_member(
+        &self,
+        path: &Path,
+        filesystems: &Filesystems,
+        cancel: &CancelToken,
+        read: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+    ) -> Result<()> {
+        self.reader
+            .with_member(path, &filesystems.password_access(&self.key, cancel), read)
+    }
+
+    pub(crate) fn index(&self) -> Result<Arc<Index>> {
+        let mut cached = self.index.lock().unwrap();
+        if let Some(entries) = &*cached {
+            return Ok(entries.clone());
+        }
+        let entries = Arc::new(build_index(&*self.reader)?);
+        *cached = Some(entries.clone());
+        Ok(entries)
+    }
+
+    fn regular_entry(&self, path: &Path) -> Result<(u64, bool)> {
+        let entries = self.index()?;
+        let entry = entries.get(path).context("Archive entry is missing")?;
+        ensure!(
+            !entry.directory && !entry.symlink,
+            "Archive entry is not a regular file"
+        );
+        Ok((entry.size, entry.encrypted))
+    }
+
+    fn read_member(
+        &self,
+        path: &Path,
+        limit: u64,
+        filesystems: &Filesystems,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>> {
+        let (size, _) = self.regular_entry(path)?;
+        ensure!(
+            size <= limit,
+            "Archive previews are limited to {} MiB",
+            limit / (1024 * 1024)
+        );
+        let mut bytes = None;
+        self.with_member(path, filesystems, cancel, &mut |input| {
+            bytes = Some(read_exact_bytes(input, size, cancel)?);
+            Ok(())
+        })?;
+        bytes.context("Archive extension did not return entry data")
+    }
+}
+
+fn build_index(reader: &dyn ArchiveReader) -> Result<Index> {
     let mut entries = Index::new();
-    for index in 0..zip.len() {
-        let file = zip.by_index_raw(index)?;
-        let name = file.name()?;
-        let clean = name.strip_suffix('/').unwrap_or(&name);
+    reader.visit_entries(&mut |file| {
+        let clean = file.path.strip_suffix('/').unwrap_or(&file.path);
         if clean.is_empty() || !clean.split('/').all(valid_component) {
-            continue;
+            return Ok(());
         }
         let path = PathBuf::from(clean);
-        let is_directory = file.is_dir();
-        let modified = file
-            .last_modified()
-            .and_then(|date| {
-                chrono::NaiveDate::from_ymd_opt(
-                    date.year().into(),
-                    date.month().into(),
-                    date.day().into(),
-                )?
-                .and_hms_opt(
-                    date.hour().into(),
-                    date.minute().into(),
-                    date.second().into(),
-                )
-                .and_then(|time| time.and_local_timezone(chrono::Local).earliest())
-                .map(|time| time.timestamp_millis() as f64)
-            })
-            .unwrap_or_default();
+        let is_directory = file.directory;
         let entry = Member {
             name: clean.rsplit('/').next().unwrap_or_default().into(),
             directory: is_directory,
-            symlink: file.is_symlink(),
-            size: if is_directory { 0 } else { file.size() },
-            modified,
+            symlink: file.symlink,
+            encrypted: file.encrypted,
+            size: if is_directory { 0 } else { file.size },
+            modified: file.modified,
         };
         ensure!(
             entries
                 .get(&path)
                 .is_none_or(|old| old.directory && is_directory),
-            "Conflicting ZIP entries: {}",
+            "Conflicting archive entries: {}",
             path.display()
         );
         entries.insert(path.clone(), entry);
@@ -984,20 +1065,22 @@ fn build_index(zip: &mut Reader) -> Result<Index> {
                     .into_owned(),
                 directory: true,
                 symlink: false,
+                encrypted: false,
                 size: 0,
                 modified: 0.,
             });
             ensure!(
                 entry.directory && !entry.symlink,
-                "Conflicting ZIP entries: {}",
+                "Conflicting archive entries: {}",
                 parent.display()
             );
         }
-    }
+        Ok(())
+    })?;
     Ok(entries)
 }
 
-fn valid_component(name: &str) -> bool {
+pub(crate) fn valid_component(name: &str) -> bool {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['\\', ':', '\0']) {
         return false;
     }
@@ -1129,10 +1212,129 @@ fn extraction_target(
 }
 
 #[cfg(test)]
+mod format_tests {
+    use super::*;
+    use dotdir_archive_api::Entry;
+
+    #[derive(Debug)]
+    struct FixtureFormat {
+        info: &'static FormatInfo,
+        member: &'static str,
+    }
+
+    impl ArchiveFormat for FixtureFormat {
+        fn info(&self) -> &'static FormatInfo {
+            self.info
+        }
+
+        fn open(&self, source: VirtualFile) -> Result<Box<dyn ArchiveReader>> {
+            Ok(Box::new(FixtureReader {
+                source,
+                member: self.member,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixtureReader {
+        source: VirtualFile,
+        member: &'static str,
+    }
+
+    impl ArchiveReader for FixtureReader {
+        fn visit_entries(&self, visit: &mut dyn FnMut(Entry) -> Result<()>) -> Result<()> {
+            visit(Entry {
+                path: self.member.into(),
+                directory: false,
+                symlink: false,
+                encrypted: false,
+                size: self.source.len(),
+                modified: 0.,
+            })
+        }
+
+        fn with_member(
+            &self,
+            path: &Path,
+            _passwords: &dyn dotdir_archive_api::PasswordAccess,
+            read: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+        ) -> Result<()> {
+            ensure!(path == Path::new(self.member), "Unknown fixture entry");
+            read(&mut self.source.clone())
+        }
+    }
+
+    static FIXTURES: [FormatInfo; 2] = [
+        FormatInfo {
+            id: "fixture.outer",
+            name: "Outer fixture",
+            version: "1",
+            suffixes: &["bundle"],
+            writable: false,
+        },
+        FormatInfo {
+            id: "fixture.inner",
+            name: "Inner fixture",
+            version: "1",
+            suffixes: &["data.bundle"],
+            writable: false,
+        },
+    ];
+
+    #[test]
+    fn registered_formats_can_nest_and_restore_without_zip() {
+        static FORMATS: ArchiveFormats = ArchiveFormats::new(&[
+            &FixtureFormat {
+                info: &FIXTURES[0],
+                member: "inner.DATA.BUNDLE",
+            },
+            &FixtureFormat {
+                info: &FIXTURES[1],
+                member: "src/code.ts",
+            },
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("outer.bundle");
+        fs::write(&path, b"source").unwrap();
+        let format = FORMATS.for_path(&path).unwrap();
+        assert_eq!(format.info().id, "fixture.outer");
+        let outer = Archive::mount_location(path.into(), format).unwrap();
+        let filesystems = Filesystems::new(Default::default());
+        let Location::Archive { archive, member } = &outer else {
+            panic!("expected an archive location");
+        };
+        let entries = archive.list(member, &filesystems).unwrap();
+        let nested = &entries[0].0;
+        let format = FORMATS.for_path(nested.name_path()).unwrap();
+        assert_eq!(format.info().id, "fixture.inner");
+        let inner = Archive::mount_location(nested.clone(), format).unwrap();
+        let saved = serde_json::to_vec(&SavedLocation::from(&inner)).unwrap();
+        let saved: SavedLocation = serde_json::from_slice(&saved).unwrap();
+        assert!(saved.clone().restore(&ArchiveFormats::new(&[])).is_none());
+        let restored = saved.restore(&FORMATS).unwrap();
+        assert_eq!(restored, inner);
+        assert_eq!(restored.parent(), Some(outer));
+        let code = restored.resolve_archive_member("src/code.ts").unwrap();
+        assert_eq!(code.read_preview(&filesystems).unwrap(), b"source");
+        assert!(!code.editable());
+        assert!(
+            code.save_archive_member(b"source", "edit", &filesystems)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "zip-extension"))]
 mod tests {
     use super::*;
+    use crate::archive_extensions::BUNDLED;
+    use dotdir_zip::ZIP;
     use std::io::Cursor;
-    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+    use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+    fn mount_zip(path: PathBuf) -> Location {
+        Archive::mount_location(path.into(), &ZIP).unwrap()
+    }
 
     fn fixture(path: &Path) {
         let mut zip = ZipWriter::new(File::create(path).unwrap());
@@ -1170,9 +1372,10 @@ mod tests {
         outer.finish().unwrap();
 
         let fs = Filesystems::new(Default::default());
-        let root = Archive::mount(path.clone());
+        let root = mount_zip(path.clone());
         let inner =
-            Archive::mount_location(root.resolve_archive_member("inner.zip").unwrap()).unwrap();
+            Archive::mount_location(root.resolve_archive_member("inner.zip").unwrap(), &ZIP)
+                .unwrap();
         let file = inner.resolve_archive_member("main.ts").unwrap();
         assert_eq!(file.read_preview(&fs).unwrap(), b"const count = 1;");
         file.save_archive_member(b"const count = 1;", "const count = 2;", &fs)
@@ -1224,7 +1427,7 @@ mod tests {
             zip.write_all(b"0123456789").unwrap();
         }
         zip.finish().unwrap();
-        let Location::Zip { archive, .. } = Archive::mount(path) else {
+        let Location::Archive { archive, .. } = mount_zip(path) else {
             panic!()
         };
         let fs = Filesystems::new(Default::default());
@@ -1232,11 +1435,11 @@ mod tests {
         let stored = archive
             .open_member(Path::new("stored.mp4"), &fs, &cancel, 4)
             .unwrap();
-        assert!(matches!(&stored.backing, FileBacking::Local(_)));
+        assert_eq!(stored.memory_usage(), 0);
         let compressed = archive
             .open_member(Path::new("compressed.mp4"), &fs, &cancel, 10)
             .unwrap();
-        assert!(matches!(&compressed.backing, FileBacking::Memory(_)));
+        assert_eq!(compressed.memory_usage(), 10);
         for mut reader in [stored, compressed] {
             assert_eq!(reader.len(), 10);
             reader.seek(SeekFrom::End(-3)).unwrap();
@@ -1278,20 +1481,35 @@ mod tests {
             zip.write_all(&child).unwrap();
         }
         zip.finish().unwrap();
-        let Location::Zip { archive, .. } = Archive::mount(path.canonicalize().unwrap()) else {
+        let path = path.canonicalize().unwrap();
+        let Location::Archive { archive, .. } = mount_zip(path.clone()) else {
             panic!()
         };
         let fs = Filesystems::new(Default::default());
         let folder = archive.location("folder".into());
+        let legacy: SavedLocation = serde_json::from_value(serde_json::json!({
+            "source": { "archive": path, "member": "folder/inner-stored.zip" },
+            "member": "images"
+        }))
+        .unwrap();
+        let legacy = legacy.restore(&BUNDLED).unwrap();
+        assert_eq!(
+            legacy
+                .resolve_archive_member("images/photo.png")
+                .unwrap()
+                .read_preview(&fs)
+                .unwrap(),
+            b"picture"
+        );
         for (entry, _) in archive.list(Path::new("folder"), &fs).unwrap() {
-            let inner = Archive::mount_location(entry).unwrap();
+            let inner = Archive::mount_location(entry, &ZIP).unwrap();
             assert_eq!(inner.parent(), Some(folder.clone()));
             let expected = SavedLocation::from(&inner);
             let saved: SavedLocation =
                 serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
-            assert!(saved.available());
-            assert_eq!(Location::from(saved.clone()), inner);
-            let Location::Zip { archive, .. } = Location::from(saved) else {
+            let restored = saved.restore(&BUNDLED).unwrap();
+            assert_eq!(restored, inner);
+            let Location::Archive { archive, .. } = restored else {
                 panic!()
             };
             let files = archive.list(Path::new("images"), &fs).unwrap();
@@ -1302,14 +1520,15 @@ mod tests {
 
     #[test]
     fn archive_nesting_has_a_depth_limit() {
-        let mut location = Archive::mount("outer.zip".into());
+        let mut location = mount_zip("outer.zip".into());
         for _ in 1..MAX_ARCHIVE_DEPTH {
-            let Location::Zip { archive, .. } = location else {
+            let Location::Archive { archive, .. } = location else {
                 panic!()
             };
-            location = Archive::mount_location(archive.location("nested.zip".into())).unwrap();
+            location =
+                Archive::mount_location(archive.location("nested.zip".into()), &ZIP).unwrap();
         }
-        assert!(Archive::mount_location(location).is_err());
+        assert!(Archive::mount_location(location, &ZIP).is_err());
     }
 
     #[test]
@@ -1317,9 +1536,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.ZIP");
         fixture(&path);
-        let root = Archive::mount(path);
-        assert_eq!(root.parent(), Some(temp.path().into()));
-        let Location::Zip { archive, member } = &root else {
+        let root = mount_zip(path);
+        assert_eq!(
+            root.parent(),
+            Some(temp.path().canonicalize().unwrap().into())
+        );
+        let Location::Archive { archive, member } = &root else {
             panic!()
         };
         let fs = Filesystems::new(Default::default());
@@ -1343,9 +1565,12 @@ mod tests {
         let restored: SavedLocation =
             serde_json::from_slice(&serde_json::to_vec(&SavedLocation::from(file)).unwrap())
                 .unwrap();
-        assert_eq!(Location::from(restored), *file);
+        assert_eq!(restored.restore(&BUNDLED).unwrap(), *file);
         let previous: SavedLocation = serde_json::from_str(r#""/tmp""#).unwrap();
-        assert_eq!(Location::from(previous).local(), Some(Path::new("/tmp")));
+        assert_eq!(
+            previous.restore(&BUNDLED).unwrap().local(),
+            Some(Path::new("/tmp"))
+        );
     }
 
     #[test]
@@ -1355,7 +1580,7 @@ mod tests {
         let dest = temp.path().join("dest");
         fs::create_dir(&dest).unwrap();
         fixture(&path);
-        let Location::Zip { archive, .. } = Archive::mount(path.clone()) else {
+        let Location::Archive { archive, .. } = mount_zip(path.clone()) else {
             panic!()
         };
         let extract = |policy, conflict: &dyn Fn(&Path, &Path) -> ConflictResolution| {
@@ -1363,6 +1588,7 @@ mod tests {
                 .extract(
                     vec!["docs".into(), "empty".into()],
                     &dest,
+                    false,
                     policy,
                     &Filesystems::new(Default::default()),
                     &CancelToken::new(),
@@ -1398,7 +1624,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, dest.join("docs")).unwrap();
         fixture(&path);
-        let Location::Zip { archive, .. } = Archive::mount(path) else {
+        let Location::Archive { archive, .. } = mount_zip(path) else {
             panic!()
         };
         assert!(
@@ -1406,6 +1632,7 @@ mod tests {
                 .extract(
                     vec!["docs".into()],
                     &dest,
+                    false,
                     ConflictPolicy::Overwrite,
                     &Filesystems::new(Default::default()),
                     &CancelToken::new(),

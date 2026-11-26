@@ -1,4 +1,4 @@
-use crate::archive::{Location, SavedLocation};
+use crate::archive::{ArchiveFormats, Location, SavedLocation};
 use crate::filesystems::Filesystems;
 use dotdir_core::ops::{EntryInfo, EntryKind};
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ pub fn read_location(
 ) -> anyhow::Result<Vec<Entry>> {
     match path {
         Location::Local(path) => read_directory(path, hidden, sort),
-        Location::Zip { archive, member } => {
+        Location::Archive { archive, member } => {
             let items = archive
                 .list(member, filesystems)?
                 .into_iter()
@@ -588,6 +588,7 @@ pub struct Settings {
     pub right_active: usize,
     pub active_pane: usize,
     pub terminal_height: f32,
+    pub archive_password_cache_minutes: u64,
     #[serde(
         rename = "pathAliases",
         alias = "path_aliases",
@@ -613,6 +614,7 @@ impl Default for Settings {
             right_active: 0,
             active_pane: 0,
             terminal_height: 240.,
+            archive_password_cache_minutes: crate::archive_passwords::DEFAULT_MINUTES,
             path_aliases: BTreeMap::new(),
             vscode: Default::default(),
         }
@@ -628,7 +630,7 @@ impl Settings {
                 Presentation::Details
             })
     }
-    pub fn load(path: &Path) -> Self {
+    pub fn load(path: &Path, formats: &ArchiveFormats) -> Self {
         let mut s = std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
@@ -645,7 +647,7 @@ impl Settings {
             }; 2],
         );
         for pane in [&mut s.left, &mut s.right] {
-            pane.retain(SavedLocation::available);
+            pane.retain(|location| location.clone().restore(formats).is_some());
             if pane.is_empty() {
                 pane.push(SavedLocation::Local(
                     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
@@ -885,12 +887,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut settings = Settings::load(&settings_path);
+        let mut settings = Settings::load(&settings_path, &crate::archive_extensions::BUNDLED);
         assert_eq!(settings.presentation(0), Presentation::Details);
         assert_eq!(settings.presentation(1), Presentation::Details);
         settings.presentations = Some([Presentation::Icons, Presentation::Columns]);
         settings.save(&settings_path).unwrap();
-        let restored = Settings::load(&settings_path);
+        let restored = Settings::load(&settings_path, &crate::archive_extensions::BUNDLED);
         assert_eq!(restored.presentation(0), Presentation::Icons);
         assert_eq!(restored.presentation(1), Presentation::Columns);
     }

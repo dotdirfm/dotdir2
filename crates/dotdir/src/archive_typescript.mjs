@@ -122,10 +122,10 @@ async function analyze() {
     const signal = new Int32Array(new SharedArrayBuffer(4));
     port.postMessage({ operation, path: relative, signal });
     if (Atomics.wait(signal, 0, 0, 12_000) === 'timed-out') {
-      throw new Error('ZIP filesystem request timed out');
+      throw new Error('Archive filesystem request timed out');
     }
     const response = receiveMessageOnPort(port)?.message;
-    if (!response) throw new Error('ZIP filesystem response is missing');
+    if (!response) throw new Error('Archive filesystem response is missing');
     if (response.error) throw new Error(response.error.message);
     return response.result;
   }

@@ -319,7 +319,7 @@ impl DotDir {
             let (label, tab_icon) = match &tab.content {
                 TabContent::Directory(browser) => {
                     let path = &browser.current().path;
-                    let archive_root = matches!(path, Location::Zip { member, .. } if member.as_os_str().is_empty());
+                    let archive_root = matches!(path, Location::Archive { member, .. } if member.as_os_str().is_empty());
                     let label = path.label();
                     self.file_tab_label(OsStr::new(&label), !archive_root)
                 }
@@ -834,6 +834,14 @@ impl DotDir {
                 title, description, ..
             } => (title.clone(), description.clone()),
             Modal::Palette => ("Commands".into(), String::new()),
+            Modal::CreateArchive(dialog) => (
+                "Create Archive".into(),
+                format!("{} selected item(s)", dialog.selection_count()),
+            ),
+            Modal::ArchivePassword { request, .. } => (
+                "Unlock Archive".into(),
+                format!("{}\n{}", request.archive, request.member.display()),
+            ),
             Modal::QuickPick { request, .. } => (
                 request
                     .title
@@ -908,6 +916,118 @@ impl DotDir {
         }
         match modal {
             Modal::PanelMenu(_) => unreachable!(),
+            Modal::ArchivePassword { request, input } => {
+                if request.incorrect {
+                    content =
+                        content.child(text("Incorrect password. Try again.").text_color(p.error));
+                }
+                content = content
+                    .child(Input::new(input).aria_label("Archive password"))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(self.button(
+                                "password-cancel",
+                                "Cancel",
+                                |this, window, cx| this.dismiss(window, cx),
+                                cx,
+                            ))
+                            .child(
+                                self.button(
+                                    "password-unlock",
+                                    "Unlock",
+                                    |this, window, cx| this.accept_modal(window, cx),
+                                    cx,
+                                )
+                                .bg(p.accent)
+                                .text_color(p.accent_fg),
+                            ),
+                    );
+            }
+            Modal::CreateArchive(dialog) => {
+                use crate::app::ArchiveOption;
+                use dotdir_archive_api::OptionKind;
+
+                let mut formats = div().flex().flex_wrap().gap(px(6.));
+                for format in crate::archive_extensions::BUNDLED.creators() {
+                    let selected = dialog.format.info().id == format.info().id;
+                    formats = formats.child(
+                        self.button(
+                            format.info().id,
+                            format.creation().unwrap().name,
+                            move |this, window, cx| this.select_archive_format(format, window, cx),
+                            cx,
+                        )
+                        .when(selected, |button| button.border_color(p.accent)),
+                    );
+                }
+                content = content
+                    .child(text("Format"))
+                    .child(formats)
+                    .child(text("Output file"))
+                    .child(Input::new(&self.dialog_input).aria_label("Output file"));
+                let schema = dialog.format.creation().unwrap();
+                for (index, (field, value)) in schema.fields.iter().zip(&dialog.options).enumerate()
+                {
+                    content = content.child(text(field.label));
+                    match (value, &field.kind) {
+                        (ArchiveOption::Choice(selected), OptionKind::Choice(choices)) => {
+                            let mut buttons = div().flex().flex_wrap().gap(px(6.));
+                            for choice in *choices {
+                                let value = choice.value;
+                                buttons = buttons.child(
+                                    self.button(
+                                        SharedString::from(format!("archive-{}-{value}", field.id)),
+                                        choice.label,
+                                        move |this, _, cx| {
+                                            if let Some(Modal::CreateArchive(dialog)) =
+                                                &mut this.modal
+                                            {
+                                                dialog.options[index] =
+                                                    ArchiveOption::Choice(value);
+                                                cx.notify();
+                                            }
+                                        },
+                                        cx,
+                                    )
+                                    .when(*selected == value, |button| {
+                                        button.border_color(p.accent)
+                                    }),
+                                );
+                            }
+                            content = content.child(buttons);
+                        }
+                        (ArchiveOption::Text(input), _) => {
+                            content = content.child(Input::new(input).aria_label(field.label));
+                        }
+                        _ => {}
+                    }
+                }
+                content = content.child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(self.button(
+                            "cancel",
+                            "Cancel",
+                            |this, window, cx| this.dismiss(window, cx),
+                            cx,
+                        ))
+                        .child(
+                            self.button(
+                                "create",
+                                "Create Archive",
+                                |this, window, cx| this.accept_modal(window, cx),
+                                cx,
+                            )
+                            .bg(p.accent)
+                            .text_color(p.accent_fg),
+                        ),
+                );
+            }
             Modal::Palette => {
                 content = content.child(Input::new(&self.dialog_input));
                 let commands = self.filtered_commands(cx);
@@ -1020,11 +1140,19 @@ impl DotDir {
             Modal::Prompt { kind, .. } => {
                 if !matches!(
                     kind,
-                    PromptKind::Trash(_) | PromptKind::CloseTab { .. } | PromptKind::Quit
+                    PromptKind::Trash(_)
+                        | PromptKind::DeleteArchive(_)
+                        | PromptKind::CloseTab { .. }
+                        | PromptKind::Quit
                 ) {
                     content = content.child(Input::new(&self.dialog_input));
                 }
-                if matches!(kind, PromptKind::Transfer(..)) {
+                if let PromptKind::Transfer {
+                    sources,
+                    archive_destination,
+                    ..
+                } = kind
+                {
                     let policies = [
                         ("Ask", ConflictPolicy::Ask),
                         ("Overwrite", ConflictPolicy::Overwrite),
@@ -1079,13 +1207,18 @@ impl DotDir {
                             cx,
                         ));
                     }
-                    content = content.child(options);
+                    if archive_destination.is_none()
+                        && sources.first().is_some_and(|path| path.local().is_some())
+                    {
+                        content = content.child(options);
+                    }
                 }
                 let confirm = match kind {
                     PromptKind::Trash(_) => "Move to Trash",
+                    PromptKind::DeleteArchive(_) => "Delete Entries",
                     PromptKind::CloseTab { .. } => "Discard Changes",
                     PromptKind::Quit => "Close Without Saving",
-                    PromptKind::Transfer(kind, _) => kind.title(),
+                    PromptKind::Transfer { kind, .. } => kind.title(),
                     _ => "OK",
                 };
                 content = content.child(
@@ -1192,6 +1325,21 @@ impl DotDir {
                             cx,
                         )),
                 );
+                let minutes = self.settings.archive_password_cache_minutes;
+                let label = if minutes == 0 {
+                    "Archive password cache · Off".into()
+                } else {
+                    format!("Archive password cache · {minutes} min")
+                };
+                content = content.child(self.button("archive-cache", label, |this, window, cx| {
+                    this.prompt(
+                        PromptKind::ArchiveCache,
+                        "Archive Password Cache",
+                        "Enter how many minutes to remember a password, or 0 to ask on the next operation.".into(),
+                        this.settings.archive_password_cache_minutes.to_string(),
+                        window, cx,
+                    );
+                }, cx));
                 content=content.child(self.button("keybindings","Edit keybindings.json",|this,window,cx|{let path=this.settings_path.with_file_name("keybindings.json");if !path.exists(){let _=std::fs::write(&path,"[\n  {\"key\": \"cmd-l\", \"command\": \"location\", \"context\": \"DotDir\"}\n]\n");}this.dismiss(window,cx);this.open_document(this.active,path,false,window,cx);},cx));
             }
             Modal::OpenVsx => {
@@ -1241,6 +1389,32 @@ impl DotDir {
                         )),
                 );
                 content = content.child(self.icon_theme_controls("extension-icons", cx));
+                for format in crate::archive_extensions::BUNDLED.iter() {
+                    let suffixes = format
+                        .suffixes
+                        .iter()
+                        .map(|suffix| format!(".{suffix}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    content = content.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .p(px(12.))
+                            .border_1()
+                            .border_color(p.border)
+                            .rounded(px(4.))
+                            .child(
+                                text(format!("{}  {}", format.name, format.version))
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                text(format!("Bundled archive extension · {suffixes}"))
+                                    .text_color(p.muted),
+                            ),
+                    );
+                }
                 for e in &self.extensions {
                     let mut row = div()
                         .flex()
@@ -1818,6 +1992,7 @@ impl Render for DotDir {
                 .map(|number| function_key_command(&keymap, &contexts, number, window.modifiers()))
                 .collect::<Vec<_>>()
         };
+        let command_state = self.command_state(cx);
         for (i, id) in bindings.into_iter().enumerate() {
             let label = id
                 .as_deref()
@@ -1827,10 +2002,7 @@ impl Render for DotDir {
                         .find(|command| command.id == id)
                         .map(|command| {
                             command
-                                .keybar_label(
-                                    self.active_document().is_some(),
-                                    self.archive_active(self.active),
-                                )
+                                .keybar_label(self.active_document().is_some(), &command_state)
                                 .to_string()
                         })
                         .or_else(|| {
