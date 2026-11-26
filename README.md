@@ -129,26 +129,29 @@ ZIP panes are read-only and support stored and DEFLATE entries.
 
 ## Extensions
 
-**TypeScript 7** is detected from an unpacked `TypeScriptTeam.native-preview`
-extension in the DotDir configuration directory's `extensions` folder. Opening
-a JavaScript or TypeScript file in **Edit** starts the bundled compiler in LSP
-mode. Edit supports diagnostics for unsaved changes, hovers, completions
-(**Ctrl+Space**), and Go to Definition (**⌘⌥↓**, **⌘-click**, or **F1**).
-DotDir prefers the native architecture and can use the Intel package through
-Rosetta on Apple Silicon.
+**TypeScript 7** runs the JavaScript client from an unpacked
+`TypeScriptTeam.native-preview` VSIX. Enable it through **F11** and set
+`js/ts.experimental.useTsgo` to `true` in `vscode.configuration`. Use a VSIX
+that matches Node.js's architecture, or point `js/ts.tsdk.path` to the directory
+containing the SDK's `tsc` executable. On Apple Silicon this setting can point
+to an Intel SDK that runs under Rosetta. Edit supports diagnostics for unsaved
+changes, hovers, completions (**Ctrl+Space**), and Go to Definition
+(**⌘⌥↓**, **⌘-click**, or **F1**).
 
-**rust-analyzer** starts when you open a Rust file in Edit. DotDir looks for
-the native server at `server/rust-analyzer` inside an unpacked
-`rust-lang.rust-analyzer` extension. For a VSIX that ships without a server,
-add the matching native binary from the
-[rust-analyzer releases](https://github.com/rust-lang/rust-analyzer/releases).
+**rust-analyzer** runs the JavaScript client from an unpacked
+`rust-lang.rust-analyzer` VSIX when enabled through **F11**. The package should
+include its native server, or you can set `rust-analyzer.server.path` in
+`vscode.configuration`. If DotDir starts from Finder and Cargo is outside the
+app's PATH, set `rust-analyzer.server.extraEnv` to an object with a `PATH` entry
+that includes Cargo's bin directory.
 Rust projects use the same diagnostics, hover, completion, and definition
-features as TypeScript.
+features as TypeScript. [rust-analyzer releases](https://github.com/rust-lang/rust-analyzer/releases)
 
-**Red Hat YAML** starts when you open a `.yaml` or `.yml` file in Edit.
-DotDir runs the bundled YAML Language Server from the unpacked
-`redhat.vscode-yaml` extension using Node.js. It supports schema diagnostics,
-completions, and hover documentation, including local schemas referenced by a
+**Red Hat YAML** runs through the VS Code extension host. Unpack
+`redhat.vscode-yaml` into the extensions directory, enable **YAML** through
+**F11**, and open a `.yaml` or `.yml` file in Edit. Its JavaScript client
+starts the bundled server and provides schema diagnostics, completions, and
+hover documentation. You can associate a local schema with a
 `# yaml-language-server: $schema=./schema.json` comment.
 
 **VS Code editor commands** run in a separate, on-demand Node.js process.
@@ -169,6 +172,15 @@ document reads, and undoable text edits. It reads settings defaults from the
 extension manifest and accepts overrides in `vscode.configuration` using
 dotted keys such as `sortLines.ignoreUnselectedLastLine`. Enabled extensions
 run with the same OS permissions as DotDir.
+
+Enabled language extensions activate from their manifest language associations
+and `onLanguage` events. The language host supports document open, change,
+save, and close events, workspace folders, file watches, diagnostic collections,
+and hover, completion, and definition providers. Literal `workspaceContains`
+entries in the manifest identify project roots for language extensions.
+
+Open **F11 → Extension Logs** to see recent extension output, startup events,
+and errors from this DotDir run. Use **Copy Logs** to copy the log history.
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the

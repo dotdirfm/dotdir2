@@ -2,6 +2,7 @@ use crate::{
     archive::{Archive, Location, SavedLocation, is_zip},
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
+    extension_logs::ExtensionLogs,
     hover::HoverHints,
     icon_theme::IconTheme,
     lsp::{self, LanguageServers},
@@ -469,6 +470,39 @@ impl DotDir {
             })
     }
 
+    pub fn refresh_vscode_language_servers(&mut self, reload: bool, cx: &mut Context<Self>) {
+        if reload {
+            self.language_servers.forget_extension_sessions();
+        }
+        let documents = self
+            .documents
+            .values()
+            .filter_map(|document| {
+                let path = document.path.local().filter(|_| !document.readonly)?;
+                let desired = vscode::language_extension(
+                    &self.vscode_extensions,
+                    &self.settings.vscode,
+                    path,
+                )
+                .map(|(extension, _)| extension.id.as_str());
+                let current = document.lsp.as_ref().map(|buffer| buffer.extension_id());
+                (desired != current || (reload && current.is_some())).then_some(document.id)
+            })
+            .collect::<Vec<_>>();
+        if !documents.is_empty() {
+            self.dismiss_hover(cx);
+        }
+        for &id in &documents {
+            self.documents
+                .get_mut(&id)
+                .unwrap()
+                .clear_language_server(None, cx);
+        }
+        for id in documents {
+            self.enable_language_server(id, cx);
+        }
+    }
+
     fn vscode_document(&self) -> Option<&Document> {
         if !self.panels_visible {
             return None;
@@ -488,6 +522,7 @@ impl DotDir {
         } else {
             self.settings.vscode.enabled.push(id.into());
         }
+        self.refresh_vscode_language_servers(false, cx);
         self.persist();
         cx.notify();
     }
@@ -526,7 +561,11 @@ impl DotDir {
             .run(&self.settings.vscode, invocation, document_id, text)
         {
             Ok(()) => self.status = VSCODE_RUNNING.into(),
-            Err(error) => self.error(error, cx),
+            Err(error) => {
+                self.extension_logs
+                    .append("VS Code commands", &format!("{error:#}"));
+                self.error(error, cx);
+            }
         }
         cx.notify();
     }
@@ -538,6 +577,8 @@ impl DotDir {
         let reply = match event.reply {
             Ok(reply) => reply,
             Err(error) => {
+                self.extension_logs
+                    .append("VS Code commands", &format!("{error:#}"));
                 let running = self.vscode_host.pending.is_some();
                 self.vscode_host.reset();
                 if running {
@@ -570,6 +611,7 @@ impl DotDir {
                 {
                     self.vscode_host.pending = None;
                     if let Some(error) = error {
+                        self.extension_logs.append("VS Code commands", &error);
                         self.error(format!("VS Code extension: {error}"), cx);
                     } else if self.status == VSCODE_RUNNING {
                         self.status.clear();
@@ -802,6 +844,8 @@ impl DotDir {
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
         if self.vscode_host.expire() {
+            self.extension_logs
+                .append("VS Code commands", "VS Code extension command timed out");
             self.error("VS Code extension command timed out", cx);
         }
         for _ in 0..200 {
@@ -825,16 +869,30 @@ impl DotDir {
                     }
                 }
                 Message::Lsp(notice) => match notice {
+                    lsp::Notice::Ready { session, document } => {
+                        if let Some(doc) = self.documents.get_mut(&document)
+                            && let Some(buffer) = doc
+                                .lsp
+                                .as_ref()
+                                .filter(|buffer| buffer.session() == session)
+                            && doc
+                                .lsp_status
+                                .as_deref()
+                                .is_some_and(|status| status.starts_with("Starting "))
+                        {
+                            doc.lsp_status = Some(buffer.server_name().into());
+                        }
+                    }
                     lsp::Notice::Diagnostics {
+                        session,
                         document,
                         revision,
                         items,
                     } => {
                         if let Some(doc) = self.documents.get_mut(&document)
-                            && let Some(buffer) = doc
-                                .lsp
-                                .as_ref()
-                                .filter(|buffer| buffer.revision() == revision)
+                            && let Some(buffer) = doc.lsp.as_ref().filter(|buffer| {
+                                buffer.session() == session && buffer.revision() == revision
+                            })
                         {
                             let name = buffer.server_name();
                             doc.lsp_status = Some(match items.len() {
@@ -858,19 +916,7 @@ impl DotDir {
                                 .as_ref()
                                 .is_some_and(|buffer| buffer.session() == session)
                         }) {
-                            doc.lsp = None;
-                            doc.lsp_status = Some(error.clone());
-                            doc.input.update(cx, |state, cx| {
-                                let lsp = state.lsp_mut();
-                                lsp.completion_provider = None;
-                                lsp.hover_provider = None;
-                                lsp.definition_provider = None;
-                                lsp.show_document = None;
-                                if let Some(diagnostics) = state.diagnostics_mut() {
-                                    diagnostics.clear();
-                                }
-                                cx.notify();
-                            });
+                            doc.clear_language_server(Some(error.clone()), cx);
                         }
                     }
                 },
@@ -1129,7 +1175,11 @@ impl DotDir {
                             self.extensions.push(e);
                         }
                     }
-                    Err(e) => self.extension_errors.push(e.to_string()),
+                    Err(e) => {
+                        let error = e.to_string();
+                        self.extension_logs.append("DotDir extensions", &error);
+                        self.extension_errors.push(error);
+                    }
                 },
                 Message::VsCode(event) => self.handle_vscode(event, window, cx),
                 Message::ExtensionReply {
@@ -1144,9 +1194,13 @@ impl DotDir {
                         continue;
                     }
                     match result {
-                        Err(e) => self.error(format!("Extension: {e}"), cx),
+                        Err(e) => {
+                            self.extension_logs.append(&extension, &e.to_string());
+                            self.error(format!("Extension: {e}"), cx);
+                        }
                         Ok(reply) => {
                             if let Some(message) = reply.message {
+                                self.extension_logs.append(&extension, &message);
                                 self.status = message;
                             }
                             if let Some(node) = reply.panel {
@@ -1294,7 +1348,15 @@ impl DotDir {
         {
             changed = true;
         }
-        if changed {
+        let logs_changed =
+            matches!(self.modal, Some(Modal::ExtensionLogs)) && self.extension_logs.take_changed();
+        if logs_changed
+            && self.extension_log_scroll.offset().y + self.extension_log_scroll.max_offset().y
+                <= px(4.)
+        {
+            self.extension_log_scroll.scroll_to_bottom();
+        }
+        if changed || logs_changed {
             cx.notify();
             window.refresh();
         }
@@ -1318,6 +1380,22 @@ pub(crate) struct Document {
     pub _subscription: Subscription,
 }
 impl Document {
+    fn clear_language_server(&mut self, status: Option<String>, cx: &mut App) {
+        self.lsp = None;
+        self.lsp_status = status;
+        self.input.update(cx, |state, cx| {
+            let lsp = state.lsp_mut();
+            lsp.completion_provider = None;
+            lsp.hover_provider = None;
+            lsp.definition_provider = None;
+            lsp.show_document = None;
+            if let Some(diagnostics) = state.diagnostics_mut() {
+                diagnostics.clear();
+            }
+            cx.notify();
+        });
+    }
+
     pub fn dirty(&self, cx: &App) -> bool {
         if self.readonly {
             return false;
@@ -1504,6 +1582,7 @@ pub(crate) enum Modal {
     Palette,
     Settings,
     Extensions,
+    ExtensionLogs,
     Search,
     Conflict {
         source: PathBuf,
@@ -1553,6 +1632,8 @@ pub(crate) struct DotDir {
     pub hover: HoverHints,
     source_jump: [Option<(u64, lsp_types::Position)>; 2],
     pub extension_errors: Vec<String>,
+    pub extension_logs: ExtensionLogs,
+    pub extension_log_scroll: ScrollHandle,
     pub search: Option<SearchState>,
     pub status: String,
     pub tx: mpsc::Sender<Message>,
@@ -1592,12 +1673,13 @@ impl DotDir {
         palette.apply(&settings.theme, cx);
         let (tx, rx) = mpsc::channel();
         let lsp_tx = tx.clone();
+        let extension_logs = ExtensionLogs::default();
         let language_servers = LanguageServers::new(
             settings_path
                 .parent()
                 .unwrap_or(Path::new("."))
-                .join("extensions"),
-            settings.vscode.node.clone(),
+                .to_path_buf(),
+            extension_logs.clone(),
             move |notice| {
                 let _ = lsp_tx.send(Message::Lsp(notice));
             },
@@ -1667,9 +1749,10 @@ impl DotDir {
             .join("dev.dotdir.native");
         let host = ExtensionHost::new(cache.join("quickjs"));
         let vscode_tx = tx.clone();
-        let vscode_host = vscode::Host::new(cache.join("node"), move |event| {
-            let _ = vscode_tx.send(Message::VsCode(event));
-        });
+        let vscode_host =
+            vscode::Host::new(cache.join("node"), extension_logs.clone(), move |event| {
+                let _ = vscode_tx.send(Message::VsCode(event));
+            });
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
@@ -1726,6 +1809,8 @@ impl DotDir {
             hover: HoverHints::default(),
             source_jump: [None, None],
             extension_errors: vec![],
+            extension_logs,
+            extension_log_scroll: ScrollHandle::new(),
             search: None,
             status: String::new(),
             tx,
@@ -3268,7 +3353,7 @@ impl DotDir {
         let weak = cx.weak_entity();
         let Some(doc) = self
             .documents
-            .get_mut(&id)
+            .get(&id)
             .filter(|doc| !doc.readonly && doc.lsp.is_none())
         else {
             return;
@@ -3276,12 +3361,23 @@ impl DotDir {
         let Some(path) = doc.path.local().map(PathBuf::from) else {
             return;
         };
-        let Some(buffer) =
-            self.language_servers
-                .attach(id, &path, doc.input.read(cx).text().clone())
+        let text = doc.input.read(cx).text().clone();
+        let Some((extension, language)) =
+            vscode::language_extension(&self.vscode_extensions, &self.settings.vscode, &path)
         else {
             return;
         };
+        let Some(buffer) = self.language_servers.attach_extension(
+            id,
+            &path,
+            text,
+            language,
+            extension,
+            &self.settings.vscode,
+        ) else {
+            return;
+        };
+        let doc = self.documents.get_mut(&id).unwrap();
         doc.lsp_status = Some(format!("Starting {}…", buffer.server_name()));
         doc.lsp = Some(buffer.clone());
         let provider = Rc::new(lsp::EditorProvider(buffer));

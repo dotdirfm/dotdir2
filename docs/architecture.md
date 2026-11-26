@@ -134,6 +134,17 @@ and UTF-16 ranges before applying it as one editor undo transaction. The host
 receives the updated document after each accepted edit. A stalled command
 times out and the next command starts a fresh process.
 
+Language extensions use the same Node runtime and API module loader in a
+workspace process. DotDir matches a local editor file against enabled
+extensions' contributed languages and activation events. The extension's
+JavaScript starts its own language server or implements providers directly.
+The host exposes workspace and document lifecycle events and forwards
+registered diagnostics, hover, completion, and definition through DotDir's
+existing LSP client. Red Hat YAML, TypeScript 7, and rust-analyzer exercise
+this path with their published JavaScript clients. Literal
+`workspaceContains` activation entries identify project markers. A file
+outside those projects opens in a session with an empty workspace.
+
 ## Compatibility boundaries
 
 This port covers the native file-manager shell, core file operations, text/hex/image
@@ -144,8 +155,8 @@ WASM filesystem-provider loading and specialized PDF and SQLite surfaces are
 separate remaining porting work. Image/video viewing has a native renderer.
 Video and AVIF currently use macOS APIs. ZIP entry previews cover text, images,
 and hex. Language-server integration covers document sync, diagnostics, completion,
-hover, and definition. Project-wide watch registration, VS Code language
-extension APIs, and VS Code webviews are separate work.
+hover, and definition. VS Code workbench features such as task providers,
+debugging, and webviews are separate work.
 
 Native text/hex opening is currently capped at 16 MiB. Search retains the first
 10,000 matching paths. User keybinding changes apply on restart. Platform-specific

@@ -1,3 +1,4 @@
+use crate::{extension_logs::ExtensionLogs, vscode};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use gpui_kit::{
     App, Task, Window,
@@ -7,12 +8,10 @@ use lsp_types::{
     CompletionContext, CompletionResponse, CompletionTextEdit, Diagnostic, GotoDefinitionResponse,
     Hover, LocationLink, Position, Range,
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    env, fs,
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -28,9 +27,15 @@ use url::Url;
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Notice {
+    Ready {
+        session: u64,
+        document: u64,
+    },
     Diagnostics {
+        session: u64,
         document: u64,
         revision: i32,
         items: Vec<Diagnostic>,
@@ -43,97 +48,82 @@ pub enum Notice {
 
 type Notify = Arc<dyn Fn(Notice) + Send + Sync>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ServerKind {
-    TypeScript,
-    Rust,
-    Yaml,
-}
-
-impl ServerKind {
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::TypeScript => "TypeScript 7",
-            Self::Rust => "rust-analyzer",
-            Self::Yaml => "YAML Language Server",
-        }
-    }
-
-    fn extension_id(self) -> (&'static str, &'static str) {
-        match self {
-            Self::TypeScript => ("typescriptteam", "native-preview"),
-            Self::Rust => ("rust-lang", "rust-analyzer"),
-            Self::Yaml => ("redhat", "vscode-yaml"),
-        }
-    }
-
-    fn project(self, path: &Path) -> Option<Project> {
-        let parent = path.parent()?;
-        match self {
-            Self::TypeScript => Some(Project {
-                root: typescript_root(parent),
-                detached: None,
-            }),
-            Self::Rust => {
-                let root = parent.ancestors().find(|dir| {
-                    ["Cargo.toml", "rust-project.json", ".rust-project.json"]
-                        .iter()
-                        .any(|name| dir.join(name).is_file())
-                });
-                Some(match root {
-                    Some(root) => Project {
-                        root: root.into(),
-                        detached: None,
-                    },
-                    None => Project {
-                        root: parent.into(),
-                        detached: Some(path.into()),
-                    },
-                })
-            }
-            Self::Yaml => Some(Project {
-                root: parent
-                    .ancestors()
-                    .find(|dir| dir.join(".git").exists())
-                    .unwrap_or(parent)
-                    .into(),
-                detached: None,
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Project {
     root: PathBuf,
     detached: Option<PathBuf>,
 }
 
+impl Project {
+    fn for_extension(path: &Path, extension: &vscode::Extension) -> Option<Self> {
+        let parent = path.parent()?;
+        let mut markers = extension.workspace_markers().peekable();
+        let workspace = if markers.peek().is_some() {
+            parent.ancestors().find(|dir| {
+                extension
+                    .workspace_markers()
+                    .any(|marker| dir.join(marker).exists())
+            })
+        } else {
+            Some(
+                parent
+                    .ancestors()
+                    .find(|dir| dir.join(".git").exists())
+                    .unwrap_or(parent),
+            )
+        };
+        Some(Self {
+            root: workspace.unwrap_or(parent).into(),
+            detached: workspace.is_none().then(|| path.into()),
+        })
+    }
+}
+
+pub(crate) struct Launch {
+    pub name: String,
+    pub command: Box<dyn FnOnce() -> Result<Command> + Send>,
+    pub options: Value,
+}
+
 pub struct LanguageServers {
-    extensions: PathBuf,
-    node: Option<PathBuf>,
-    sessions: HashMap<(ServerKind, Project), Weak<Connection>>,
+    config: PathBuf,
+    logs: ExtensionLogs,
+    sessions: HashMap<(String, Project), Weak<Connection>>,
+    next_session: u64,
     notify: Notify,
 }
 
 impl LanguageServers {
     pub fn new(
-        extensions: PathBuf,
-        node: Option<PathBuf>,
+        config: PathBuf,
+        logs: ExtensionLogs,
         notify: impl Fn(Notice) + Send + Sync + 'static,
     ) -> Self {
         Self {
-            extensions,
-            node,
+            config,
+            logs,
             sessions: HashMap::new(),
+            next_session: 0,
             notify: Arc::new(notify),
         }
     }
 
-    pub fn attach(&mut self, id: u64, path: &Path, text: Rope) -> Option<Rc<Buffer>> {
-        let (kind, language) = language_for(path)?;
+    pub fn forget_extension_sessions(&mut self) {
+        self.sessions.clear();
+    }
+
+    pub fn attach_extension(
+        &mut self,
+        id: u64,
+        path: &Path,
+        text: Rope,
+        language: &str,
+        extension: &vscode::Extension,
+        settings: &vscode::Settings,
+    ) -> Option<Rc<Buffer>> {
         let uri = file_uri(path)?;
-        let key = (kind, kind.project(path)?);
+        let project = Project::for_extension(path, extension)?;
+        let key = (extension.id.clone(), project);
         self.sessions.retain(|_, weak| weak.strong_count() > 0);
         let active = self
             .sessions
@@ -143,15 +133,14 @@ impl LanguageServers {
         let connection = if let Some(active) = active {
             active
         } else {
-            let executable = installed_server(&self.extensions, kind)?
-                .canonicalize()
-                .ok()?;
+            let launch = extension.language_launch(settings, &self.config);
+            self.next_session += 1;
             let connection = Connection::start(
-                id,
-                kind,
-                executable,
-                self.node.clone(),
+                self.next_session,
+                key.0.clone(),
+                launch,
                 key.1.clone(),
+                self.logs.clone(),
                 self.notify.clone(),
             );
             self.sessions.insert(key, Arc::downgrade(&connection));
@@ -161,7 +150,7 @@ impl LanguageServers {
             .send(Event::Open {
                 id,
                 uri: uri.clone(),
-                language,
+                language: language.into(),
                 text: text.clone(),
             })
             .ok()?;
@@ -173,121 +162,6 @@ impl LanguageServers {
             revision: Cell::new(1),
         }))
     }
-}
-
-#[derive(Deserialize)]
-struct ExtensionManifest {
-    name: String,
-    publisher: String,
-    version: String,
-}
-
-fn installed_server(root: &Path, kind: ServerKind) -> Option<PathBuf> {
-    let platform = match std::env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
-        "windows" => "win32",
-        _ => return None,
-    };
-    let native = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        _ => return None,
-    };
-    let architectures = if platform == "darwin" && native == "arm64" {
-        &["arm64", "x64"][..]
-    } else {
-        std::slice::from_ref(&native)
-    };
-    let suffix = if platform == "win32" { ".exe" } else { "" };
-    let (publisher, name) = kind.extension_id();
-    fs::read_dir(root)
-        .ok()?
-        .filter_map(|entry| {
-            let root = entry.ok()?.path();
-            let (dir, manifest) = [root.join("extension"), root].into_iter().find_map(|dir| {
-                let manifest = serde_json::from_slice::<ExtensionManifest>(
-                    &fs::read(dir.join("package.json")).ok()?,
-                )
-                .ok()?;
-                Some((dir, manifest))
-            })?;
-            if !manifest.publisher.eq_ignore_ascii_case(publisher)
-                || !manifest.name.eq_ignore_ascii_case(name)
-            {
-                return None;
-            }
-            let version = manifest
-                .version
-                .split('.')
-                .map(|n| n.parse::<u32>().unwrap_or_default())
-                .collect::<Vec<_>>();
-            let (path, preferred) = match kind {
-                ServerKind::TypeScript => architectures.iter().find_map(|arch| {
-                    let path = dir.join(format!(
-                        "node_modules/@typescript/typescript-{platform}-{arch}/lib/tsc{suffix}"
-                    ));
-                    path.is_file().then_some((path, *arch == native))
-                }),
-                ServerKind::Rust => {
-                    let path = dir.join(format!("server/rust-analyzer{suffix}"));
-                    path.is_file().then_some((path, true))
-                }
-                ServerKind::Yaml => {
-                    let path = dir.join("dist/languageserver.js");
-                    path.is_file().then_some((path, true))
-                }
-            }?;
-            Some((preferred, version, path))
-        })
-        .max()
-        .map(|(_, _, path)| path)
-}
-
-fn language_for(path: &Path) -> Option<(ServerKind, &'static str)> {
-    let (kind, language) = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "ts" | "mts" | "cts" => (ServerKind::TypeScript, "typescript"),
-        "tsx" => (ServerKind::TypeScript, "typescriptreact"),
-        "js" | "mjs" | "cjs" => (ServerKind::TypeScript, "javascript"),
-        "jsx" => (ServerKind::TypeScript, "javascriptreact"),
-        "rs" => (ServerKind::Rust, "rust"),
-        "yaml" | "yml" => (ServerKind::Yaml, "yaml"),
-        _ => return None,
-    };
-    Some((kind, language))
-}
-
-fn typescript_root(parent: &Path) -> PathBuf {
-    let mut package = None;
-    for dir in parent.ancestors().filter(|dir| dir.parent().is_some()) {
-        if ["tsconfig.json", "jsconfig.json"]
-            .iter()
-            .any(|name| dir.join(name).is_file())
-        {
-            return dir.into();
-        }
-        if package.is_none() && dir.join("package.json").is_file() {
-            package = Some(dir.to_path_buf());
-        }
-        if dir.join(".git").exists() {
-            return package.unwrap_or_else(|| dir.into());
-        }
-    }
-    package.unwrap_or_else(|| parent.into())
-}
-
-// Finder launches may omit the Rust toolchain's bin directory from PATH.
-fn rust_toolchain_path() -> Option<std::ffi::OsString> {
-    let bin = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))?
-        .join("bin");
-    let path = env::var_os("PATH").unwrap_or_default();
-    let mut dirs = env::split_paths(&path).collect::<Vec<_>>();
-    if bin.is_dir() && !dirs.contains(&bin) {
-        dirs.push(bin);
-    }
-    env::join_paths(dirs).ok()
 }
 
 fn file_uri(path: &Path) -> Option<String> {
@@ -311,9 +185,14 @@ impl Buffer {
         self.connection.id
     }
 
-    pub fn server_name(&self) -> &'static str {
-        self.connection.kind.display_name()
+    pub fn server_name(&self) -> &str {
+        &self.connection.name
     }
+
+    pub fn extension_id(&self) -> &str {
+        &self.connection.extension
+    }
+
     pub fn revision(&self) -> i32 {
         self.revision.get()
     }
@@ -567,7 +446,8 @@ fn splits_crlf(text: &Rope, byte: usize) -> bool {
 
 struct Connection {
     id: u64,
-    kind: ServerKind,
+    extension: String,
+    name: String,
     events: mpsc::Sender<Event>,
     running: Arc<AtomicBool>,
 }
@@ -575,47 +455,46 @@ struct Connection {
 impl Connection {
     fn start(
         id: u64,
-        kind: ServerKind,
-        executable: PathBuf,
-        node: Option<PathBuf>,
+        extension: String,
+        launch: Launch,
         project: Project,
+        logs: ExtensionLogs,
         notify: Notify,
     ) -> Arc<Self> {
         let (events, receiver) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let connection = Arc::new(Self {
             id,
-            kind,
+            extension,
+            name: launch.name.clone(),
             events: events.clone(),
             running: running.clone(),
         });
         std::thread::spawn(move || {
-            let options = if kind == ServerKind::Yaml {
-                // The extension passes this directory to its bundled server.
-                executable
-                    .parent()
-                    .map(|dir| json!({"l10nPath": dir.join("l10n")}))
-            } else {
-                project
-                    .detached
-                    .as_ref()
-                    .map(|path| json!({"detachedFiles": [path]}))
-            };
-            let result = Server::start(
-                kind,
-                &executable,
-                node.as_deref(),
-                &project.root,
-                events,
-                receiver,
-            )
-            .and_then(|mut server| server.run(&project, options, &notify));
+            let source = format!("{} #{id}", launch.name);
+            logs.append(&source, &format!("Starting in {}", project.root.display()));
+            let result = (launch.command)()
+                .and_then(|command| {
+                    Server::start(
+                        id,
+                        command,
+                        &project.root,
+                        events,
+                        receiver,
+                        logs.clone(),
+                        source.clone(),
+                    )
+                })
+                .and_then(|mut server| server.run(&project, launch.options, &notify));
             running.store(false, Ordering::Relaxed);
             if let Err(error) = result {
+                logs.append(&source, &format!("{error:#}"));
                 notify(Notice::Failed {
                     session: id,
-                    error: format!("{}: {error:#}", kind.display_name()),
+                    error: format!("{}: {error:#}", launch.name),
                 });
+            } else {
+                logs.append(&source, "Stopped");
             }
         });
         connection
@@ -640,7 +519,7 @@ enum Event {
     Open {
         id: u64,
         uri: String,
-        language: &'static str,
+        language: String,
         text: Rope,
     },
     Change {
@@ -668,6 +547,7 @@ struct TrackedDocument {
     pending: Option<(i32, Rope)>,
     due: Option<Instant>,
     diagnostic: Option<u64>,
+    ready_deadline: Option<Instant>,
 }
 
 enum Pending {
@@ -676,6 +556,7 @@ enum Pending {
 }
 
 struct Server {
+    id: u64,
     child: Child,
     outgoing: mpsc::Sender<Value>,
     receiver: mpsc::Receiver<Event>,
@@ -684,6 +565,8 @@ struct Server {
     requests: HashMap<u64, (Instant, Pending)>,
     pull_diagnostics: bool,
     workspace_folders: Value,
+    logs: ExtensionLogs,
+    log_source: String,
 }
 
 impl Drop for Server {
@@ -697,46 +580,28 @@ impl Drop for Server {
 
 impl Server {
     fn start(
-        kind: ServerKind,
-        executable: &Path,
-        node: Option<&Path>,
+        id: u64,
+        mut command: Command,
         root: &Path,
         events: mpsc::Sender<Event>,
         receiver: mpsc::Receiver<Event>,
+        logs: ExtensionLogs,
+        log_source: String,
     ) -> Result<Self> {
-        let program = if kind == ServerKind::Yaml {
-            crate::vscode::node_path(node).context(
-                "Node.js is required. Set vscode.node in settings.json to its executable",
-            )?
-        } else {
-            executable.into()
-        };
-        let mut command = Command::new(&program);
-        match kind {
-            ServerKind::TypeScript => {
-                command.args(["--lsp", "--stdio"]);
-            }
-            ServerKind::Rust => {
-                if let Some(path) = rust_toolchain_path() {
-                    command.env("PATH", path);
-                }
-            }
-            ServerKind::Yaml => {
-                command
-                    .arg(executable)
-                    .arg("--stdio")
-                    .env_remove("NODE_OPTIONS");
-            }
-        }
+        let program = command.get_program().to_os_string();
         let mut child = command
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("Could not start {}", program.display()))?;
+            .with_context(|| format!("Could not start {}", Path::new(&program).display()))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        logs.capture(
+            log_source.clone(),
+            child.stderr.take().expect("piped stderr"),
+        );
         let (outgoing, queue) = mpsc::channel();
         let write_events = events.clone();
         std::thread::spawn(move || {
@@ -765,6 +630,7 @@ impl Server {
             }
         });
         Ok(Self {
+            id,
             child,
             outgoing,
             receiver,
@@ -773,17 +639,24 @@ impl Server {
             requests: HashMap::new(),
             pull_diagnostics: false,
             workspace_folders: Value::Null,
+            logs,
+            log_source,
         })
     }
 
-    fn run(&mut self, project: &Project, options: Option<Value>, notify: &Notify) -> Result<()> {
+    fn run(&mut self, project: &Project, options: Value, notify: &Notify) -> Result<()> {
         let root_uri = file_uri(&project.root).context("Invalid language server project path")?;
         let name = project
             .root
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        self.workspace_folders = json!([{"uri": root_uri, "name": name}]);
+        self.workspace_folders = if project.detached.is_none() {
+            json!([{"uri": root_uri, "name": name}])
+        } else {
+            json!([])
+        };
+        let root_uri = project.detached.is_none().then_some(root_uri);
         let init = self.request(
             "initialize",
             json!({
@@ -852,6 +725,14 @@ impl Server {
             }
             self.flush_due()?;
             self.expire_requests();
+            let now = Instant::now();
+            ensure!(
+                !self
+                    .documents
+                    .values()
+                    .any(|doc| doc.ready_deadline.is_some_and(|deadline| now >= deadline)),
+                "Timed out activating the language extension"
+            );
         }
     }
 
@@ -875,6 +756,7 @@ impl Server {
                         pending: None,
                         due: Some(Instant::now()),
                         diagnostic: None,
+                        ready_deadline: Some(Instant::now() + ACTIVATION_TIMEOUT),
                     },
                 );
             }
@@ -1016,6 +898,23 @@ impl Server {
     fn handle_message(&mut self, message: Value, notify: &Notify) -> Result<()> {
         if let Some(method) = message["method"].as_str() {
             match method {
+                "dotdir/documentReady" => {
+                    if let Some((&document, tracked)) = self.documents.iter_mut().find(|(_, tracked)| {
+                        tracked.ready_deadline.is_some() && Some(tracked.uri.as_str()) == message["params"]["uri"].as_str()
+                    }) {
+                        tracked.ready_deadline = None;
+                        self.logs.append(&self.log_source, "Language client ready");
+                        notify(Notice::Ready { session: self.id, document });
+                    }
+                }
+                "dotdir/activationFailed" => {
+                    bail!("{}", message["params"]["message"].as_str().unwrap_or("Extension activation failed"));
+                }
+                "window/logMessage" => {
+                    if let Some(message) = message["params"]["message"].as_str() {
+                        self.logs.append(&self.log_source, message);
+                    }
+                }
                 "workspace/configuration" => {
                     let count = message["params"]["items"].as_array().map_or(0, Vec::len);
                     self.respond(&message, json!(vec![Value::Null; count]))?;
@@ -1033,7 +932,7 @@ impl Server {
                         if let Some((&id, document)) = self.documents.iter().find(|(_, doc)| doc.uri == params.uri.as_str())
                             && document.pending.is_none() && params.version.is_none_or(|v| v == document.revision)
                         {
-                            send_diagnostics(notify, id, document, document.revision, params.diagnostics);
+                            send_diagnostics(notify, self.id, id, document, document.revision, params.diagnostics);
                         }
                     }
                 }
@@ -1065,7 +964,7 @@ impl Server {
                             && let Some(items) = report.get("items").cloned()
                             && let Ok(items) = serde_json::from_value::<Vec<Diagnostic>>(items)
                         {
-                            send_diagnostics(notify, id, document, revision, items);
+                            send_diagnostics(notify, self.id, id, document, revision, items);
                         }
                     }
                 }
@@ -1108,7 +1007,6 @@ impl Server {
                 if matches!(event, Event::Message(ref msg) if msg["id"].as_u64() == Some(id) && msg.get("method").is_none())
                 {
                     let _ = self.notify("exit", Value::Null);
-                    // TypeScript 7.0.2 can exit with status 1 after a successful shutdown.
                     for _ in 0..20 {
                         if self.child.try_wait()?.is_some() {
                             break;
@@ -1128,6 +1026,7 @@ impl Server {
 
 fn send_diagnostics(
     notify: &Notify,
+    session: u64,
     id: u64,
     document: &TrackedDocument,
     revision: i32,
@@ -1139,6 +1038,7 @@ fn send_diagnostics(
     // The editor builds its sorted range index in this order.
     items.sort_by_key(|item| (item.range.start.line, item.range.start.character));
     notify(Notice::Diagnostics {
+        session,
         document: id,
         revision,
         items,
@@ -1195,6 +1095,7 @@ fn write_message(writer: &mut impl Write, message: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn edit_ranges_use_utf16_and_keep_crlf_boundaries() {
@@ -1238,23 +1139,32 @@ mod tests {
     }
 
     #[test]
-    fn rust_uses_the_nearest_project_and_isolates_detached_files() {
+    fn uses_manifest_workspace_markers_and_isolates_detached_files() {
         let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("extensions/fixture.language");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), json!({
+            "publisher": "fixture", "name": "language", "version": "1.0.0", "main": "./main.js",
+            "activationEvents": ["workspaceContains:project.toml", "workspaceContains:*/project.toml"],
+            "contributes": {"languages": [{"id": "fixture", "extensions": [".src"]}]}
+        }).to_string()).unwrap();
+        let extensions = vscode::discover(&temp.path().join("extensions"));
+        let extension = &extensions[0];
         let root = temp.path().join("project");
-        let path = root.join("src/lib.rs");
+        let path = root.join("src/lib.src");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(root.join("Cargo.toml"), "").unwrap();
+        fs::write(root.join("project.toml"), "").unwrap();
+        assert_eq!(extension.language_for(&path), Some("fixture"));
         assert_eq!(
-            ServerKind::Rust.project(&path),
+            Project::for_extension(&path, extension),
             Some(Project {
                 root,
                 detached: None
             })
         );
-        let standalone = temp.path().join("example.rs");
-        assert_eq!(language_for(&standalone), Some((ServerKind::Rust, "rust")));
+        let standalone = temp.path().join("example.src");
         assert_eq!(
-            ServerKind::Rust.project(&standalone),
+            Project::for_extension(&standalone, extension),
             Some(Project {
                 root: temp.path().into(),
                 detached: Some(standalone),
@@ -1275,22 +1185,85 @@ mod tests {
         .unwrap();
         let file = root.join("src/lib.rs");
         let helper = root.join("src/helper.rs");
-        let source = "mod helper;\npub fn example() -> u32 {\n    helper::answer()\n}\n";
+        let broken = root.join("src/broken.rs");
+        let source =
+            "mod helper;\npub fn example() -> u32 {\n    helper::answer()\n}\nmod broken;\n";
+        let saved_error = "fn broken() { let _ = ; }\n";
         fs::write(&file, source).unwrap();
         fs::write(&helper, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        fs::write(&broken, saved_error).unwrap();
 
         let (events, notices) = mpsc::channel();
-        let mut servers = LanguageServers::new(installed_extensions_root(), None, move |notice| {
-            let _ = events.send(notice);
-        });
+        let extensions = vscode::discover(&installed_extensions_root());
+        let cargo = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().unwrap().join(".cargo"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(cargo.join("bin")).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let mut settings = vscode::Settings {
+            enabled: vec!["rust-lang.rust-analyzer".into()],
+            ..Default::default()
+        };
+        settings.configuration.insert(
+            "rust-analyzer.server.extraEnv".into(),
+            json!({"PATH": path.to_str().unwrap()}),
+        );
+        let (extension, language) =
+            vscode::language_extension(&extensions, &settings, &file).unwrap();
+        let mut servers = LanguageServers::new(
+            temp.path().into(),
+            ExtensionLogs::default(),
+            move |notice| {
+                let _ = events.send(notice);
+            },
+        );
         let buffer = servers
-            .attach(1, &file, Rope::from(source))
-            .expect("rust-analyzer executable in extension directory");
-        assert_eq!(buffer.server_name(), "rust-analyzer");
+            .attach_extension(1, &file, Rope::from(source), language, extension, &settings)
+            .expect("rust-analyzer VS Code client");
+        assert_eq!(buffer.extension_id(), "rust-lang.rust-analyzer");
         let other = servers
-            .attach(2, &helper, Rope::from(fs::read_to_string(&helper).unwrap()))
+            .attach_extension(
+                2,
+                &helper,
+                Rope::from(fs::read_to_string(&helper).unwrap()),
+                language,
+                extension,
+                &settings,
+            )
             .expect("analyzer for second document");
         assert_eq!(buffer.session(), other.session());
+        let broken = servers
+            .attach_extension(
+                3,
+                &broken,
+                Rope::from(saved_error),
+                language,
+                extension,
+                &settings,
+            )
+            .expect("analyzer for the document with a compiler error");
+        assert_eq!(buffer.session(), broken.session());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match notices.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Notice::Diagnostics {
+                    document: 3, items, ..
+                }) if items.iter().any(|item| {
+                    item.source.as_deref() == Some("rustc")
+                        && item.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                }) =>
+                {
+                    break;
+                }
+                Ok(Notice::Failed { error, .. }) => panic!("{error}"),
+                Ok(_) => {}
+                Err(error) => panic!("No Rust compiler diagnostic arrived: {error}"),
+            }
+        }
+
         let helper_uri = file_uri(&helper).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1324,6 +1297,7 @@ mod tests {
                         document: 1,
                         revision: actual,
                         items,
+                        ..
                     } if actual == revision => {
                         if items
                             .iter()
@@ -1357,37 +1331,89 @@ mod tests {
         let input = "const answer: number = \"wrong\";\nanswer;\n";
         fs::write(&path, input).unwrap();
         let (events, notices) = mpsc::channel();
-        let mut typescript = LanguageServers::new(root, None, move |notice| {
-            let _ = events.send(notice);
-        });
-        let buffer = typescript
-            .attach(1, &path, Rope::from(input))
-            .expect("TypeScript 7 executable in extension directory");
-        let diagnostic = |revision| match notices.recv_timeout(Duration::from_secs(10)).unwrap() {
-            Notice::Diagnostics {
-                document: 1,
-                revision: actual,
-                items,
-            } => {
-                assert_eq!(actual, revision);
-                items
-            }
-            Notice::Failed { error, .. } => panic!("{error}"),
-            _ => panic!("Unexpected diagnostic message"),
+        let extensions = vscode::discover(&root);
+        let mut settings = vscode::Settings {
+            enabled: vec!["typescriptteam.native-preview".into()],
+            ..Default::default()
         };
-        let original = diagnostic(1);
-        assert!(
-            original
+        let (extension, language) =
+            vscode::language_extension(&extensions, &settings, &path).unwrap();
+        let executable = if cfg!(windows) { "tsc.exe" } else { "tsc" };
+        let sdk = fs::read_dir(extension.directory().join("node_modules/@typescript"))
+            .unwrap()
+            .filter_map(|entry| Some(entry.ok()?.path().join("lib")))
+            .find(|dir| dir.join(executable).is_file())
+            .expect("TypeScript SDK in the installed package");
+        settings
+            .configuration
+            .insert("js/ts.experimental.useTsgo".into(), Value::Bool(true));
+        settings
+            .configuration
+            .insert("js/ts.tsdk.path".into(), json!(sdk));
+        let mut typescript = LanguageServers::new(
+            temp.path().into(),
+            ExtensionLogs::default(),
+            move |notice| {
+                let _ = events.send(notice);
+            },
+        );
+        let buffer = typescript
+            .attach_extension(1, &path, Rope::from(input), language, extension, &settings)
+            .expect("TypeScript 7 VS Code client");
+        assert_eq!(buffer.extension_id(), "typescriptteam.native-preview");
+        let diagnostic = |document, revision, matches: &dyn Fn(&[Diagnostic]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match notices
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    Notice::Diagnostics {
+                        document: id,
+                        revision: actual,
+                        items,
+                        ..
+                    } if id == document && actual == revision && matches(&items) => break,
+                    Notice::Failed { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        };
+        diagnostic(1, 1, &|items| {
+            items
                 .iter()
                 .any(|d| d.code == Some(lsp_types::NumberOrString::Number(2322)))
-        );
-
+        });
         assert!(!query(&buffer, "textDocument/hover", 1, 2).is_null());
         assert!(!query(&buffer, "textDocument/definition", 1, 2).is_null());
         assert!(!query(&buffer, "textDocument/completion", 1, 2).is_null());
         buffer.change(Rope::from(input.replace("\"wrong\"", "42")));
-        assert!(diagnostic(2).is_empty());
-        assert_eq!(fs::read_to_string(path).unwrap(), input);
+        diagnostic(1, 2, &|items| items.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), input);
+
+        let session = buffer.session();
+        drop(buffer);
+        let clean = input.replace("\"wrong\"", "42");
+        fs::write(&path, &clean).unwrap();
+        let reopened = typescript
+            .attach_extension(2, &path, Rope::from(clean), language, extension, &settings)
+            .unwrap();
+        assert_ne!(session, reopened.session());
+        assert!(!query(&reopened, "textDocument/hover", 1, 2).is_null());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match notices
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Notice::Ready {
+                    session,
+                    document: 2,
+                } if session == reopened.session() => break,
+                Notice::Failed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -1410,10 +1436,27 @@ mod tests {
         )
         .unwrap();
         let (events, notices) = mpsc::channel();
-        let mut servers = LanguageServers::new(installed_extensions_root(), None, move |notice| {
-            let _ = events.send(notice);
-        });
-        let buffer = servers.attach(1, &path, Rope::from(source)).unwrap();
+        let extensions = vscode::discover(&installed_extensions_root());
+        let mut settings = vscode::Settings {
+            enabled: vec!["redhat.vscode-yaml".into()],
+            ..Default::default()
+        };
+        settings
+            .configuration
+            .insert("yaml.schemaStore.enable".into(), Value::Bool(false));
+        let (extension, language) =
+            vscode::language_extension(&extensions, &settings, &path).unwrap();
+        let mut servers = LanguageServers::new(
+            temp.path().into(),
+            ExtensionLogs::default(),
+            move |notice| {
+                let _ = events.send(notice);
+            },
+        );
+        let buffer = servers
+            .attach_extension(1, &path, Rope::from(source), language, extension, &settings)
+            .unwrap();
+        assert_eq!(buffer.extension_id(), "redhat.vscode-yaml");
         let expect_diagnostics = |revision, matches: &dyn Fn(&[Diagnostic]) -> bool| {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -1425,6 +1468,7 @@ mod tests {
                         document: 1,
                         revision: actual,
                         items,
+                        ..
                     } if actual == revision && matches(&items) => break,
                     Notice::Failed { error, .. } => panic!("{error}"),
                     _ => {}
@@ -1435,7 +1479,12 @@ mod tests {
             items.iter().any(|item| item.message.contains("integer"))
         });
         let hover = query(&buffer, "textDocument/hover", 1, 2);
-        assert_eq!(hover["contents"]["value"], "Number of instances");
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Number of instances")
+        );
         let completion = query(&buffer, "textDocument/completion", 2, 0);
         assert!(
             completion["items"]

@@ -2,6 +2,7 @@ mod app;
 mod archive;
 mod column_scroll;
 mod commands;
+mod extension_logs;
 mod hover;
 mod icon_theme;
 mod lsp;

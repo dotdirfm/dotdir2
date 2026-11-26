@@ -1,20 +1,26 @@
+use crate::extension_logs::ExtensionLogs;
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui_kit::component::input::{Rope, RopeExt};
 use lsp_types::Position;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs,
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Range,
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
 const HOST: &str = include_str!("vscode_host.mjs");
+const LANGUAGE_HOST: &str = concat!(
+    include_str!("vscode_language.mjs"),
+    "\n",
+    include_str!("vscode_host.mjs")
+);
 const TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REPLY_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -34,6 +40,17 @@ impl Settings {
     }
 }
 
+pub(crate) fn language_extension<'a>(
+    extensions: &'a [Extension],
+    settings: &Settings,
+    path: &Path,
+) -> Option<(&'a Extension, &'a str)> {
+    extensions
+        .iter()
+        .filter(|extension| settings.enabled(&extension.id))
+        .find_map(|extension| Some((extension, extension.language_for(path)?)))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {
@@ -42,6 +59,9 @@ struct Manifest {
     display_name: Option<String>,
     version: String,
     main: Option<PathBuf>,
+    #[serde(default)]
+    activation_events: Vec<String>,
+    #[serde(default)]
     contributes: Contributions,
 }
 
@@ -49,7 +69,17 @@ struct Manifest {
 #[serde(default)]
 struct Contributions {
     commands: Vec<ManifestCommand>,
+    languages: Vec<ManifestLanguage>,
     configuration: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestLanguage {
+    id: String,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    filenames: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +97,8 @@ pub(crate) struct Extension {
     root: PathBuf,
     main: PathBuf,
     configuration: Map<String, Value>,
+    activation_events: Vec<String>,
+    languages: Vec<ManifestLanguage>,
 }
 
 pub(crate) struct ExtensionCommand {
@@ -120,7 +152,13 @@ fn read_extension(root: &Path) -> Option<Extension> {
             command: command.command,
         })
         .collect();
-    if commands.is_empty() {
+    if commands.is_empty()
+        && manifest.contributes.languages.is_empty()
+        && !manifest
+            .activation_events
+            .iter()
+            .any(|event| event.starts_with("onLanguage"))
+    {
         return None;
     }
     let configuration = &manifest.contributes.configuration;
@@ -141,6 +179,8 @@ fn read_extension(root: &Path) -> Option<Extension> {
         root: root.canonicalize().ok()?,
         main,
         configuration,
+        activation_events: manifest.activation_events,
+        languages: manifest.contributes.languages,
     })
 }
 
@@ -156,6 +196,72 @@ fn version_key(version: &str) -> (Vec<u32>, bool) {
 }
 
 impl Extension {
+    #[cfg(test)]
+    pub fn directory(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn workspace_markers(&self) -> impl Iterator<Item = &str> {
+        self.activation_events.iter().filter_map(|event| {
+            let marker = event.strip_prefix("workspaceContains:")?;
+            (!marker.is_empty()
+                && !marker.contains(['*', '?', '[', '{'])
+                && Path::new(marker)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)))
+            .then_some(marker)
+        })
+    }
+
+    pub fn language_for<'a>(&'a self, path: &Path) -> Option<&'a str> {
+        let name = path.file_name()?.to_str()?;
+        let lower = name.to_ascii_lowercase();
+        if let Some(language) = self.languages.iter().find(|language| {
+            language.filenames.iter().any(|file| file == name)
+                || language
+                    .extensions
+                    .iter()
+                    .any(|suffix| lower.ends_with(&suffix.to_ascii_lowercase()))
+        }) {
+            return Some(&language.id);
+        }
+        let language = language_id(path);
+        self.activation_events
+            .iter()
+            .any(|event| {
+                event == "onLanguage" || event.strip_prefix("onLanguage:") == Some(language)
+            })
+            .then_some(language)
+    }
+
+    pub fn language_launch(&self, settings: &Settings, config: &Path) -> crate::lsp::Launch {
+        let mut configuration = self.configuration.clone();
+        configuration.extend(settings.configuration.clone());
+        let cache = dirs::cache_dir()
+            .unwrap_or_else(env::temp_dir)
+            .join("dev.dotdir.native/node");
+        let configured_node = settings.node.clone();
+        crate::lsp::Launch {
+            name: self.title.clone(),
+            command: Box::new(move || {
+                let node = node_path(configured_node.as_deref()).context(
+                    "Node.js 22.15 or newer is required. Set vscode.node in settings.json to its executable",
+                )?;
+                let mut command = host_command(&node, &cache, LANGUAGE_HOST);
+                command.env("DOTDIR_VSCODE_LANGUAGE", "1");
+                Ok(command)
+            }),
+            options: json!({
+                "extension": self.id,
+                "root": self.root,
+                "main": self.main,
+                "configuration": configuration,
+                "configurationOverrides": settings.configuration,
+                "storage": config.join("vscode-storage"),
+            }),
+        }
+    }
+
     pub fn invocation(
         &self,
         command: &ExtensionCommand,
@@ -174,6 +280,21 @@ impl Extension {
             configuration,
             editor,
         }
+    }
+}
+
+fn language_id(path: &Path) -> &'static str {
+    let language = crate::syntax::language_for(path);
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jsx") => "javascriptreact",
+        Some("tsx") => "typescriptreact",
+        _ if language == "text" => "plaintext",
+        _ => language,
     }
 }
 
@@ -201,16 +322,9 @@ impl Snapshot {
         } else {
             (selection.start, selection.end)
         };
-        let language = crate::syntax::language_for(path);
-        let language_id = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("jsx") => "javascriptreact",
-            Some("tsx") => "typescriptreact",
-            _ if language == "text" => "plaintext",
-            _ => language,
-        };
         Self {
             file_name: path.into(),
-            language_id,
+            language_id: language_id(path),
             version,
             text: text.to_string(),
             anchor: position_at(text, anchor),
@@ -364,16 +478,22 @@ pub(crate) struct Host {
     pub pending: Option<Pending>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
     cache: PathBuf,
+    logs: ExtensionLogs,
 }
 
 impl Host {
-    pub fn new(cache: PathBuf, notify: impl Fn(Event) + Send + Sync + 'static) -> Self {
+    pub fn new(
+        cache: PathBuf,
+        logs: ExtensionLogs,
+        notify: impl Fn(Event) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             next_process: 0,
             process: None,
             pending: None,
             notify: Arc::new(notify),
             cache,
+            logs,
         }
     }
 
@@ -397,11 +517,16 @@ impl Host {
                 self.next_process,
                 &node,
                 &self.cache,
+                &self.logs,
                 &self.notify,
             )?);
         }
         let id = invocation.id;
         let version = invocation.editor.version;
+        self.logs.append(
+            "VS Code commands",
+            &format!("{}: {}", invocation.extension, invocation.command),
+        );
         self.send(Request::Run(invocation))?;
         self.pending = Some(Pending {
             id,
@@ -465,19 +590,21 @@ impl Process {
         id: u64,
         node: &Path,
         cache: &Path,
+        logs: &ExtensionLogs,
         notify: &Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Result<Self> {
-        let mut child = Command::new(node)
-            .args(["--input-type=module", "--eval", HOST])
-            .env_remove("NODE_OPTIONS")
-            .env("NODE_COMPILE_CACHE", cache)
+        let mut child = host_command(node, cache, HOST)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Starting the VS Code host with {}", node.display()))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        logs.capture(
+            "VS Code commands".into(),
+            child.stderr.take().expect("piped stderr"),
+        );
         let (input, requests) = mpsc::channel();
         let notify_write = notify.clone();
         std::thread::spawn(move || {
@@ -515,6 +642,16 @@ impl Process {
     }
 }
 
+fn host_command(node: &Path, cache: &Path, script: &str) -> Command {
+    let mut command = Command::new(node);
+    command
+        .args(["--input-type=module", "--eval", script])
+        .env_remove("DOTDIR_VSCODE_LANGUAGE")
+        .env_remove("NODE_OPTIONS")
+        .env("NODE_COMPILE_CACHE", cache);
+    command
+}
+
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -540,35 +677,65 @@ pub(crate) fn node_path(configured: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = configured {
         return Some(path.into());
     }
+    static DISCOVERED: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = DISCOVERED.get().filter(|path| path.is_file()) {
+        return Some(path.clone());
+    }
     let usual = [
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
     ];
     let name = if cfg!(windows) { "node.exe" } else { "node" };
     let path = env::var_os("PATH").unwrap_or_default();
-    let from_path = env::split_paths(&path)
+    // App bundles launched by Finder do not source nvm's shell setup.
+    let nvm = env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".nvm")));
+    let mut nvm_versions = nvm
+        .and_then(|dir| fs::read_dir(dir.join("versions/node")).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let version = entry.file_name();
+            Some((
+                version_key(version.to_str()?.strip_prefix('v')?),
+                entry.path().join("bin"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    nvm_versions.sort_unstable_by(|a, b| b.cmp(a));
+    let mut seen = HashSet::new();
+    let node = env::split_paths(&path)
         .chain(usual)
+        .chain(nvm_versions.into_iter().map(|(_, directory)| directory))
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file());
-    from_path.or_else(|| {
-        // App bundles launched by Finder do not source nvm's shell setup.
-        let nvm = env::var_os("NVM_DIR")
-            .map(PathBuf::from)
-            .or_else(|| Some(dirs::home_dir()?.join(".nvm")))?;
-        fs::read_dir(nvm.join("versions/node"))
-            .ok()?
-            .flatten()
-            .filter_map(|entry| {
-                let version = entry.file_name();
-                let version = version.to_str()?.strip_prefix('v')?;
-                let executable = entry.path().join("bin").join(name);
-                executable
-                    .is_file()
-                    .then(|| (version_key(version), executable))
-            })
-            .max()
-            .map(|(_, executable)| executable)
-    })
+        .find(|candidate| {
+            candidate.is_file() && seen.insert(candidate.clone()) && compatible_node(candidate)
+        })?;
+    let _ = DISCOVERED.set(node.clone());
+    Some(node)
+}
+
+fn compatible_node(path: &Path) -> bool {
+    let output = Command::new(path)
+        .arg("--version")
+        .env_remove("NODE_OPTIONS")
+        .output();
+    output
+        .ok()
+        .filter(|result| result.status.success())
+        .and_then(|result| {
+            let version = std::str::from_utf8(&result.stdout)
+                .ok()?
+                .trim()
+                .strip_prefix('v')?;
+            let mut numbers = version.split('.');
+            let major = numbers.next()?.parse::<u32>().ok()?;
+            let minor = numbers.next()?.parse::<u32>().ok()?;
+            Some((major, minor) >= (22, 15))
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -576,6 +743,7 @@ mod tests {
     use super::{
         Edit, EditBatch, Host, Reply, Settings, Snapshot, discover, offset_at, position_at,
     };
+    use crate::extension_logs::ExtensionLogs;
     use gpui_kit::component::input::Rope;
     use lsp_types::Position;
     use std::{env, path::PathBuf, sync::mpsc, time::Duration};
@@ -630,9 +798,13 @@ mod tests {
             .unwrap();
         let cache = tempfile::tempdir().unwrap();
         let (send, receive) = mpsc::channel();
-        let mut host = Host::new(cache.path().into(), move |event| {
-            let _ = send.send(event);
-        });
+        let mut host = Host::new(
+            cache.path().into(),
+            ExtensionLogs::default(),
+            move |event| {
+                let _ = send.send(event);
+            },
+        );
         let settings = Settings::default();
         let path = root.join("fixture.txt");
         let text = Rope::from("header\r\nzebra\r\nbanana\r\napple\r\nfooter");

@@ -767,6 +767,7 @@ impl DotDir {
                 "Extensions".into(),
                 "Installed JavaScript extensions".into(),
             ),
+            Modal::ExtensionLogs => ("Extension Logs".into(), String::new()),
             Modal::Search => (
                 "Find Files".into(),
                 self.cwd(self.active).display().to_string(),
@@ -1042,6 +1043,15 @@ impl DotDir {
                 content=content.child(self.button("keybindings","Edit keybindings.json",|this,window,cx|{let path=this.settings_path.with_file_name("keybindings.json");if !path.exists(){let _=std::fs::write(&path,"[\n  {\"key\": \"cmd-l\", \"command\": \"location\", \"context\": \"DotDir\"}\n]\n");}this.dismiss(window,cx);this.open_document(this.active,path,false,window,cx);},cx));
             }
             Modal::Extensions => {
+                content = content.child(self.button(
+                    "extension-logs",
+                    "Extension Logs",
+                    |this, window, cx| {
+                        this.extension_log_scroll.scroll_to_bottom();
+                        this.show_modal(Modal::ExtensionLogs, window, cx);
+                    },
+                    cx,
+                ));
                 content = content.child(self.icon_theme_controls("extension-icons", cx));
                 for e in &self.extensions {
                     let mut row = div()
@@ -1136,10 +1146,56 @@ impl DotDir {
                     |this, _, cx| {
                         this.extension_errors.clear();
                         this.load_extensions();
+                        this.refresh_vscode_language_servers(true, cx);
                         cx.notify();
                     },
                     cx,
                 ));
+            }
+            Modal::ExtensionLogs => {
+                let log = self.extension_logs.snapshot();
+                let output = if log.is_empty() {
+                    text("No extension output yet").text_color(p.muted)
+                } else {
+                    div().whitespace_normal().child(SharedString::from(log))
+                };
+                content = content
+                    .child(
+                        div()
+                            .id("extension-log-output")
+                            .track_scroll(&self.extension_log_scroll)
+                            .overflow_y_scroll()
+                            .h(px(400.))
+                            .max_h(window.viewport_size().height * 0.55)
+                            .p(px(10.))
+                            .border_1()
+                            .border_color(p.border)
+                            .rounded(px(4.))
+                            .font_family("Menlo")
+                            .text_size(px(11.))
+                            .child(output),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(self.button(
+                                "extension-log-back",
+                                "Back to Extensions",
+                                |this, window, cx| this.show_modal(Modal::Extensions, window, cx),
+                                cx,
+                            ))
+                            .child(self.button(
+                                "copy-extension-log",
+                                "Copy Logs",
+                                |this, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        this.extension_logs.snapshot(),
+                                    ));
+                                },
+                                cx,
+                            )),
+                    );
             }
             Modal::Search => {
                 content = content

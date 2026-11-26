@@ -9,6 +9,15 @@ const protocol = process.stdout.write.bind(process.stdout);
 const send = (message) => protocol(JSON.stringify(message) + '\n');
 process.stdout.write = process.stderr.write.bind(process.stderr);
 
+function createOutputChannel(name) {
+  const log = (message, ...args) => console.error('[' + name + ']', message, ...args);
+  return {
+    name, logLevel: 2, onDidChangeLogLevel: () => ({ dispose() {} }),
+    append: log, appendLine: log, trace: log, debug: log, info: log, warn: log, error: log,
+    clear() {}, replace: log, show() {}, hide() {}, dispose() {}
+  };
+}
+
 class Position {
   constructor(line, character) {
     if (!Number.isSafeInteger(line) || line < 0 || !Number.isSafeInteger(character) || character < 0) {
@@ -24,6 +33,17 @@ class Position {
 
   isEqual(other) { return this.compareTo(other) === 0; }
   isBefore(other) { return this.compareTo(other) < 0; }
+  isBeforeOrEqual(other) { return this.compareTo(other) <= 0; }
+  isAfter(other) { return this.compareTo(other) > 0; }
+  isAfterOrEqual(other) { return this.compareTo(other) >= 0; }
+  translate(line = 0, character = 0) {
+    if (typeof line === 'object') ({ lineDelta: line = 0, characterDelta: character = 0 } = line);
+    return new Position(this.line + line, this.character + character);
+  }
+  with(line = this.line, character = this.character) {
+    if (typeof line === 'object') ({ line: line = this.line, character: character = this.character } = line);
+    return new Position(line, character);
+  }
 }
 
 class Range {
@@ -37,6 +57,10 @@ class Range {
 
   get isEmpty() { return this.start.isEqual(this.end); }
   get isSingleLine() { return this.start.line === this.end.line; }
+  contains(value) {
+    return value instanceof Range ? this.contains(value.start) && this.contains(value.end)
+      : this.start.isBeforeOrEqual(value) && this.end.isAfterOrEqual(value);
+  }
 }
 
 class Selection extends Range {
@@ -56,9 +80,17 @@ class Selection extends Range {
 class TextDocument {
   constructor(snapshot) {
     this.fileName = snapshot.fileName;
-    this.version = snapshot.version;
     this.languageId = snapshot.languageId;
-    this.text = snapshot.text;
+    this.uri = snapshot.uri;
+    this.isUntitled = false;
+    this.isDirty = false;
+    this.isClosed = false;
+    this.update(snapshot.text, snapshot.version);
+  }
+
+  update(text, version) {
+    this.version = version;
+    this.text = text;
     this.eol = /\r?\n/.exec(this.text)?.[0] === '\r\n' ? 2 : 1;
     this.lines = this.text.split(/\r?\n/);
     this.offsets = [0];
@@ -70,6 +102,17 @@ class TextDocument {
   offsetAt(position) {
     if (position.line >= this.lineCount) return this.text.length;
     return this.offsets[position.line] + Math.min(position.character, this.lines[position.line].length);
+  }
+
+  positionAt(offset) {
+    const bounded = Math.max(0, Math.min(offset, this.text.length));
+    let low = 0, high = this.offsets.length;
+    while (low + 1 < high) {
+      const middle = (low + high) >>> 1;
+      if (this.offsets[middle] <= bounded) low = middle;
+      else high = middle;
+    }
+    return new Position(low, Math.min(bounded - this.offsets[low], this.lines[low].length));
   }
 
   getText(range) {
@@ -146,7 +189,7 @@ const api = {
   Range,
   Selection,
   EndOfLine: Object.freeze({ LF: 1, CRLF: 2 }),
-  window: { get activeTextEditor() { return current?.editor; } },
+  window: { createOutputChannel, get activeTextEditor() { return current?.editor; } },
   workspace: {
     getConfiguration(section) {
       const values = current?.configuration ?? {};
@@ -168,12 +211,14 @@ const api = {
       return { dispose() { if (commands.get(id) === command) commands.delete(id); } };
     },
     async executeCommand(id, ...args) {
+      if (id === 'setContext') return;
       const callback = current?.extension.commands.get(id);
       if (!callback) throw new Error('Unsupported command ' + id);
       return await callback(...args);
     }
   }
 };
+const languageSession = process.env.DOTDIR_VSCODE_LANGUAGE === '1' ? new LanguageSession(api) : undefined;
 const apiKey = Symbol.for('dotdir.vscode.api');
 globalThis[apiKey] = api;
 const apiUrl = pathToFileURL(resolve('.dotdir-vscode-api.cjs')).href;
@@ -193,7 +238,13 @@ registerHooks({
   }
 });
 
-async function activate(job, request) {
+async function disposeSubscriptions(subscriptions) {
+  for (const disposable of subscriptions.reverse()) {
+    try { await disposable.dispose(); } catch (error) { console.error(error); }
+  }
+}
+
+async function activate(job, request, context = {}) {
   const root = realpathSync(request.root);
   const require = createRequire(resolve(root, 'package.json'));
   const entry = realpathSync(require.resolve(resolve(root, request.main)));
@@ -205,18 +256,25 @@ async function activate(job, request) {
   const extension = module.default?.activate ? module.default : module;
   const subscriptions = [];
   try {
-    await extension.activate?.({
+    const exports = await extension.activate?.({
+      ...context,
       subscriptions,
       extensionPath: root,
       asAbsolutePath: (path) => resolve(root, path)
     });
+    if (context.extension) {
+      Object.defineProperty(context.extension, 'exports', { value: exports });
+    }
   } catch (error) {
-    for (const disposable of subscriptions) disposable.dispose();
+    await disposeSubscriptions(subscriptions);
     throw error;
   }
   job.extension.subscriptions = subscriptions;
   extensions.set(request.extension, job.extension);
   flushCompileCache();
+  return async () => {
+    try { await extension.deactivate?.(); } finally { await disposeSubscriptions(subscriptions); }
+  };
 }
 
 async function run(request) {
@@ -242,15 +300,22 @@ async function run(request) {
   }
 }
 
-const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-input.on('line', (line) => {
-  const message = JSON.parse(line);
-  if (message.type === 'ack') {
-    if (current?.id !== message.id) return;
-    const finish = current.edits.get(message.serial);
-    current.edits.delete(message.serial);
-    finish?.(message.editor);
-  } else if (message.type === 'run' && !current) {
-    void run(message);
-  }
-});
+if (languageSession) {
+  languageSession.start(async (request, context) => {
+    current = { extension: { commands: new Map() } };
+    languageSession.deactivate = await activate(current, request, context);
+  });
+} else {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  input.on('line', (line) => {
+    const message = JSON.parse(line);
+    if (message.type === 'ack') {
+      if (current?.id !== message.id) return;
+      const finish = current.edits.get(message.serial);
+      current.edits.delete(message.serial);
+      finish?.(message.editor);
+    } else if (message.type === 'run' && !current) {
+      void run(message);
+    }
+  });
+}
