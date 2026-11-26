@@ -3,6 +3,7 @@ mod archive;
 mod column_scroll;
 mod commands;
 mod extension_logs;
+mod filesystems;
 mod hover;
 mod icon_theme;
 mod lsp;
@@ -10,12 +11,14 @@ mod media;
 mod media_native;
 mod model;
 mod operations;
+mod panel_menu;
 mod panels;
 mod syntax;
 mod terminal;
 mod theme;
 mod ui;
 mod vscode;
+mod vscode_nls;
 
 use gpui_kit::*;
 fn main() {

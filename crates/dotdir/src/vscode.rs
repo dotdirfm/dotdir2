@@ -1,4 +1,7 @@
-use crate::extension_logs::ExtensionLogs;
+use crate::{
+    extension_logs::ExtensionLogs,
+    vscode_nls::{ExtensionLocalization, Locale},
+};
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui_kit::component::input::{Rope, RopeExt};
 use lsp_types::Position;
@@ -24,10 +27,74 @@ const LANGUAGE_HOST: &str = concat!(
 const TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REPLY_BYTES: u64 = 128 * 1024 * 1024;
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(crate) enum LanguageCommandResult {
+    GoToLocation { location: lsp_types::Location },
+    Status { message: String },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuickPick {
+    pub title: Option<String>,
+    pub place_holder: Option<String>,
+    pub items: Vec<QuickPickItem>,
+    #[serde(default)]
+    pub match_on_description: bool,
+    #[serde(default)]
+    pub match_on_detail: bool,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct QuickPickItem {
+    pub label: String,
+    pub description: Option<String>,
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub separator: bool,
+}
+
+impl QuickPick {
+    pub fn matches(&self, query: &str) -> Vec<usize> {
+        let query = query.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if item.separator {
+                    return None;
+                }
+                let label = item.label.to_lowercase();
+                let description = item
+                    .description
+                    .as_deref()
+                    .filter(|_| self.match_on_description)
+                    .map(str::to_lowercase);
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .filter(|_| self.match_on_detail)
+                    .map(str::to_lowercase);
+                query
+                    .split_whitespace()
+                    .all(|word| {
+                        label.contains(word)
+                            || description.as_ref().is_some_and(|text| text.contains(word))
+                            || detail.as_ref().is_some_and(|text| text.contains(word))
+                    })
+                    .then_some(index)
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     pub node: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
     pub enabled: Vec<String>,
     pub configuration: Map<String, Value>,
 }
@@ -59,6 +126,7 @@ struct Manifest {
     display_name: Option<String>,
     version: String,
     main: Option<PathBuf>,
+    l10n: Option<PathBuf>,
     #[serde(default)]
     activation_events: Vec<String>,
     #[serde(default)]
@@ -70,7 +138,6 @@ struct Manifest {
 struct Contributions {
     commands: Vec<ManifestCommand>,
     languages: Vec<ManifestLanguage>,
-    configuration: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,21 +166,24 @@ pub(crate) struct Extension {
     configuration: Map<String, Value>,
     activation_events: Vec<String>,
     languages: Vec<ManifestLanguage>,
+    localization: ExtensionLocalization,
 }
 
 pub(crate) struct ExtensionCommand {
     pub id: String,
     pub title: String,
-    command: String,
+    pub original_title: Option<String>,
+    pub command: String,
 }
 
-pub(crate) fn discover(directory: &Path) -> Vec<Extension> {
+pub(crate) fn discover(directory: &Path, settings: &Settings) -> Vec<Extension> {
+    let locale = Locale::detect(settings.locale.as_deref());
     let mut extensions: BTreeMap<String, Extension> = BTreeMap::new();
     for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
         let directory = entry.path();
         let extension = [directory.join("extension"), directory]
             .iter()
-            .find_map(|path| read_extension(path));
+            .find_map(|path| read_extension(path, &locale));
         if let Some(extension) = extension
             && extensions.get(&extension.id).is_none_or(|current| {
                 (version_key(&extension.version), &extension.root)
@@ -126,9 +196,11 @@ pub(crate) fn discover(directory: &Path) -> Vec<Extension> {
     extensions.into_values().collect()
 }
 
-fn read_extension(root: &Path) -> Option<Extension> {
-    let manifest: Manifest =
+fn read_extension(root: &Path, locale: &Locale) -> Option<Extension> {
+    let root = root.canonicalize().ok()?;
+    let mut package_json: Value =
         serde_json::from_slice(&fs::read(root.join("package.json")).ok()?).ok()?;
+    let manifest = Manifest::deserialize(&package_json).ok()?;
     let main = manifest.main?;
     if main.as_os_str().is_empty()
         || main
@@ -137,31 +209,32 @@ fn read_extension(root: &Path) -> Option<Extension> {
     {
         return None;
     }
+    let messages = locale.manifest(&root);
     let id = format!("{}.{}", manifest.publisher, manifest.name).to_ascii_lowercase();
     let commands: Vec<_> = manifest
         .contributes
         .commands
         .into_iter()
         .filter(|command| !command.command.is_empty() && !command.title.is_empty())
-        .map(|command| ExtensionCommand {
-            id: format!("vscode:{id}:{}", command.command),
-            title: command
-                .category
-                .map(|category| format!("{category}: {}", command.title))
-                .unwrap_or(command.title),
-            command: command.command,
+        .map(|command| {
+            let title = command_title(
+                command.category.as_deref().map(|s| messages.translate(s)),
+                messages.translate(&command.title),
+            );
+            let original = command_title(
+                command.category.as_deref().map(|s| messages.original(s)),
+                messages.original(&command.title),
+            );
+            ExtensionCommand {
+                id: format!("vscode:{id}:{}", command.command),
+                original_title: (original != title).then_some(original),
+                title,
+                command: command.command,
+            }
         })
         .collect();
-    if commands.is_empty()
-        && manifest.contributes.languages.is_empty()
-        && !manifest
-            .activation_events
-            .iter()
-            .any(|event| event.starts_with("onLanguage"))
-    {
-        return None;
-    }
-    let configuration = &manifest.contributes.configuration;
+    messages.localize(&mut package_json);
+    let configuration = &package_json["contributes"]["configuration"];
     let configuration = configuration
         .as_array()
         .map_or(std::slice::from_ref(configuration), Vec::as_slice);
@@ -171,17 +244,28 @@ fn read_extension(root: &Path) -> Option<Extension> {
         .flatten()
         .filter_map(|(key, schema)| Some((key.clone(), schema.get("default")?.clone())))
         .collect();
-    Some(Extension {
+    let extension = Extension {
         id,
-        title: manifest.display_name.unwrap_or(manifest.name),
+        title: messages
+            .translate(manifest.display_name.as_deref().unwrap_or(&manifest.name))
+            .into(),
         version: manifest.version,
         commands,
-        root: root.canonicalize().ok()?,
+        localization: locale.extension(&root, manifest.l10n.as_deref(), package_json),
+        root,
         main,
         configuration,
         activation_events: manifest.activation_events,
         languages: manifest.contributes.languages,
-    })
+    };
+    (!extension.commands.is_empty() || extension.provides_language()).then_some(extension)
+}
+
+fn command_title(category: Option<&str>, title: &str) -> String {
+    match category {
+        Some(category) => format!("{category}: {title}"),
+        None => title.into(),
+    }
 }
 
 fn version_key(version: &str) -> (Vec<u32>, bool) {
@@ -213,6 +297,14 @@ impl Extension {
         })
     }
 
+    pub fn provides_language(&self) -> bool {
+        !self.languages.is_empty()
+            || self
+                .activation_events
+                .iter()
+                .any(|event| event == "onLanguage" || event.starts_with("onLanguage:"))
+    }
+
     pub fn language_for<'a>(&'a self, path: &Path) -> Option<&'a str> {
         let name = path.file_name()?.to_str()?;
         let lower = name.to_ascii_lowercase();
@@ -235,8 +327,6 @@ impl Extension {
     }
 
     pub fn language_launch(&self, settings: &Settings, config: &Path) -> crate::lsp::Launch {
-        let mut configuration = self.configuration.clone();
-        configuration.extend(settings.configuration.clone());
         let cache = dirs::cache_dir()
             .unwrap_or_else(env::temp_dir)
             .join("dev.dotdir.native/node");
@@ -255,7 +345,8 @@ impl Extension {
                 "extension": self.id,
                 "root": self.root,
                 "main": self.main,
-                "configuration": configuration,
+                "localization": self.localization,
+                "configuration": self.configuration,
                 "configurationOverrides": settings.configuration,
                 "storage": config.join("vscode-storage"),
             }),
@@ -277,6 +368,7 @@ impl Extension {
             root: self.root.clone(),
             main: self.main.clone(),
             command: command.command.clone(),
+            localization: self.localization.clone(),
             configuration,
             editor,
         }
@@ -429,6 +521,7 @@ pub(crate) struct Invocation {
     root: PathBuf,
     main: PathBuf,
     command: String,
+    localization: ExtensionLocalization,
     configuration: Map<String, Value>,
     editor: Snapshot,
 }
@@ -447,6 +540,10 @@ enum Request {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Reply {
+    Log {
+        extension: String,
+        message: String,
+    },
     Edit {
         id: u64,
         serial: u64,
@@ -455,8 +552,27 @@ pub(crate) enum Reply {
     },
     Done {
         id: u64,
-        error: Option<String>,
+        error: Option<CommandError>,
     },
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CommandError {
+    message: String,
+    stack: Option<String>,
+}
+
+impl From<CommandError> for anyhow::Error {
+    fn from(error: CommandError) -> Self {
+        host_error(&error.message, error.stack.as_deref())
+    }
+}
+
+pub(crate) fn host_error(message: &str, stack: Option<&str>) -> anyhow::Error {
+    match stack.filter(|stack| !stack.is_empty()) {
+        Some(stack) => anyhow::anyhow!("{stack}").context(message.to_owned()),
+        None => anyhow::anyhow!("{message}"),
+    }
 }
 
 pub(crate) struct Event {
@@ -469,6 +585,8 @@ pub(crate) struct Pending {
     pub document: u64,
     pub version: u64,
     pub text: Rope,
+    pub extension: String,
+    pub command: String,
     deadline: Instant,
 }
 
@@ -523,16 +641,19 @@ impl Host {
         }
         let id = invocation.id;
         let version = invocation.editor.version;
-        self.logs.append(
-            "VS Code commands",
-            &format!("{}: {}", invocation.extension, invocation.command),
-        );
+        self.logs
+            .source(&invocation.extension, "VS Code commands")
+            .append(&format!("Running {}", invocation.command));
+        let extension = invocation.extension.clone();
+        let command = invocation.command.clone();
         self.send(Request::Run(invocation))?;
         self.pending = Some(Pending {
             id,
             document,
             version,
             text,
+            extension,
+            command,
             deadline: Instant::now() + TIMEOUT,
         });
         Ok(())
@@ -544,17 +665,13 @@ impl Host {
             .is_some_and(|child| child.id == process)
     }
 
-    pub fn expire(&mut self) -> bool {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| Instant::now() >= pending.deadline)
-        {
-            self.reset();
-            true
-        } else {
-            false
+    pub fn expire(&mut self) -> Option<Pending> {
+        if Instant::now() < self.pending.as_ref()?.deadline {
+            return None;
         }
+        let pending = self.pending.take();
+        self.reset();
+        pending
     }
 
     pub fn reset(&mut self) {
@@ -642,7 +759,7 @@ impl Process {
     }
 }
 
-fn host_command(node: &Path, cache: &Path, script: &str) -> Command {
+pub(crate) fn host_command(node: &Path, cache: &Path, script: &str) -> Command {
     let mut command = Command::new(node);
     command
         .args(["--input-type=module", "--eval", script])
@@ -749,6 +866,80 @@ mod tests {
     use std::{env, path::PathBuf, sync::mpsc, time::Duration};
 
     #[test]
+    fn localizes_extension_names_and_commands_with_locale_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("example/extension");
+        std::fs::create_dir_all(package.join("l10n")).unwrap();
+        for (file, contents) in [
+            (
+                "package.json",
+                r#"{
+                "name":"example", "publisher":"Fixture", "version":"1.0.0",
+                "displayName":"%name%", "main":"main.js", "l10n":"./l10n",
+                "contributes":{"commands":[
+                    {"command":"example.open", "title":"%open%", "category":"%category%"},
+                    {"command":"example.copy", "title":"%copy%"},
+                    {"command":"example.help", "title":"100% help"}
+                ]}
+            }"#,
+            ),
+            (
+                "package.nls.json",
+                r#"{"name":"Example","category":{"message":"Files","comment":["category"]},"open":"Open","copy":"Copy"}"#,
+            ),
+            (
+                "package.nls.fr.json",
+                r#"{"name":"Exemple","category":"Fichiers","open":"Ouvrir"}"#,
+            ),
+            (
+                "package.nls.fr-ca.json",
+                r#"{"open":"Ouvrir ici","copy":42}"#,
+            ),
+            (
+                "l10n/bundle.l10n.fr.json",
+                r#"{"Hello, {name}":"Bonjour, {name}"}"#,
+            ),
+        ] {
+            std::fs::write(package.join(file), contents).unwrap();
+        }
+        let settings = Settings {
+            locale: Some("fr_CA.UTF-8".into()),
+            ..Default::default()
+        };
+        let extensions = discover(temp.path(), &settings);
+        let extension = &extensions[0];
+        assert_eq!(extension.title, "Exemple");
+        assert_eq!(
+            extension.commands[0].id,
+            "vscode:fixture.example:example.open"
+        );
+        assert_eq!(extension.commands[0].title, "Fichiers: Ouvrir ici");
+        assert_eq!(
+            extension.commands[0].original_title.as_deref(),
+            Some("Files: Open")
+        );
+        assert_eq!(extension.commands[1].title, "Copy");
+        assert_eq!(extension.commands[2].title, "100% help");
+        let localization = serde_json::to_value(&extension.localization).unwrap();
+        assert_eq!(localization["locale"], "fr-ca");
+        assert_eq!(localization["packageJson"]["displayName"], "Exemple");
+        assert_eq!(
+            localization["bundle"]["messages"]["Hello, {name}"],
+            "Bonjour, {name}"
+        );
+
+        let base = discover(
+            temp.path(),
+            &Settings {
+                locale: Some("ja".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(base[0].commands[0].title, "Files: Open");
+        assert!(base[0].commands[0].original_title.is_none());
+    }
+
+    #[test]
     fn edit_batch_validates_utf16_and_preserves_text_between_replacements() {
         let source = Rope::from("z😀\r\nkeep\r\nβ");
         let edit = |start, end, text: &str| Edit {
@@ -786,7 +977,7 @@ mod tests {
     #[ignore = "requires Node.js and the published Sort Lines VSIX unpacked in DOTDIR_SORT_LINES_EXTENSIONS"]
     fn real_sort_lines_runs_in_node_and_waits_for_the_editor() {
         let root = PathBuf::from(env::var_os("DOTDIR_SORT_LINES_EXTENSIONS").unwrap());
-        let extensions = discover(&root);
+        let extensions = discover(&root, &Settings::default());
         let extension = extensions
             .iter()
             .find(|extension| extension.id == "tyriar.sort-lines")

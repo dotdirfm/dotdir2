@@ -74,6 +74,10 @@ requires an editable document that is not already saving. Read-only previews,
 images and failed videos do not offer video playback. Existing API v1 extension
 commands remain global; native viewer registrations are not executable commands.
 
+In a text editor or read-only text viewer, use **F1 → Disable Line Wrap** or
+**Enable Line Wrap**. The choice applies to the open document, including when
+the same file is shown in both panes.
+
 ⌘F3 opens an italic preview tab in the opposite pane and keeps keyboard focus
 in the source file list. Moving to another file updates that same preview,
 including text, images and video. Double-click its header or run **Keep Preview
@@ -89,6 +93,18 @@ behavior.
 Drag tab headers to reorder them or move them to the other pane. Hold
 **Option** while dropping into the other pane to duplicate a tab. Two tabs for
 the same file share its edits.
+
+Open the three-dot menu on a pane, or press **⌥F1** for the left pane and
+**⌥F2** for the right. **Duplicate Tab** copies the current tab. **Go To** opens
+the opposite pane's location, your home directory, a bookmark, a mounted drive,
+or a path you enter. Middle-click a saved location or use **Shift+Enter** to
+open it in a new tab. Define bookmarks in the `pathAliases` object in
+`settings.json` with the bookmark name as the key and a path or filesystem URI
+as the value.
+
+**Jump To…** moves the cursor to matching names in the current folder. Use
+**↑** and **↓** to cycle through matches, **Enter** to open the selected match,
+and **`.*`** to toggle regular expressions.
 
 ## File pane presentations
 
@@ -173,14 +189,35 @@ extension manifest and accepts overrides in `vscode.configuration` using
 dotted keys such as `sortLines.ignoreUnselectedLastLine`. Enabled extensions
 run with the same OS permissions as DotDir.
 
+VS Code extension labels and runtime messages use the system locale and the
+translations bundled with each extension. Set `vscode.locale` in
+`settings.json` and restart DotDir to choose a locale such as `fr-CA`.
+The command palette also matches the original command name when a translation
+is available.
+
 Enabled language extensions activate from their manifest language associations
 and `onLanguage` events. The language host supports document open, change,
 save, and close events, workspace folders, file watches, diagnostic collections,
 and hover, completion, and definition providers. Literal `workspaceContains`
 entries in the manifest identify project roots for language extensions.
 
+Language extensions can open a single-selection picker with `window.showQuickPick`.
+Workspace settings changed by a language extension are stored in DotDir's
+profile for that extension and workspace.
+
 Open **F11 → Extension Logs** to see recent extension output, startup events,
 and errors from this DotDir run. Use **Copy Logs** to copy the log history.
+Open **F11 → Browse Logs**, or enter `ext-logs://` in **⌘L**, to browse the same
+logs in a file panel. Each extension has a folder with a read-only `output.log`
+containing its retained output for this session. Open it with **Enter** or **F3**.
+
+Open **F11 → Open DotDir Log** for persistent app and extension errors.
+DotDir appends these errors to `dotdir.log` next to `settings.json`, including
+VS Code command IDs and JavaScript stack traces when available. The default
+path on macOS is `~/Library/Application Support/dev.dotdir.native/dotdir.log`.
+
+Node.js extensions can register custom protocols for browsing folders and
+previewing files in DotDir. [Filesystem extension API](docs/architecture.md#filesystem-extensions)
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the

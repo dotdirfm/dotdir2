@@ -1,4 +1,7 @@
-use crate::{extension_logs::ExtensionLogs, vscode};
+use crate::{
+    extension_logs::{ExtensionLogs, LogSource},
+    vscode,
+};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use gpui_kit::{
     App, Task, Window,
@@ -11,13 +14,13 @@ use lsp_types::{
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -30,6 +33,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Notice {
+    CommandsChanged,
+    QuickPick {
+        session: u64,
+        request: vscode::QuickPick,
+        reply: mpsc::Sender<usize>,
+    },
+    QuickPickClosed {
+        session: u64,
+    },
     Ready {
         session: u64,
         document: u64,
@@ -222,6 +234,49 @@ impl Buffer {
         let _ = self.connection.send(Event::Save(self.id));
     }
 
+    pub fn command_available(&self, command: &str) -> bool {
+        self.connection.running.load(Ordering::Relaxed)
+            && self.connection.commands.read().unwrap().contains(command)
+    }
+
+    pub fn execute_command(
+        &self,
+        command: &str,
+        text: &Rope,
+        anchor: usize,
+        active: usize,
+    ) -> Result<async_channel::Receiver<Result<Value>>> {
+        ensure!(
+            self.command_available(command),
+            "Command is no longer available"
+        );
+        self.change(text.clone());
+        self.request(
+            "dotdir/executeCommand",
+            json!({
+                "command": command,
+                "textDocument": {"uri": self.uri},
+                "anchor": wire_position(text, anchor),
+                "active": wire_position(text, active),
+            }),
+        )
+    }
+
+    fn request(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<async_channel::Receiver<Result<Value>>> {
+        let (reply, receiver) = async_channel::bounded(1);
+        self.connection.send(Event::Query {
+            id: self.id,
+            method,
+            params,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
     fn query(
         self: &Rc<Self>,
         text: &Rope,
@@ -231,19 +286,10 @@ impl Buffer {
     ) -> Task<Result<Value>> {
         self.change(text.clone());
         let revision = self.revision();
-        let (reply, receiver) = async_channel::bounded(1);
-        if self
-            .connection
-            .send(Event::Query {
-                id: self.id,
-                method,
-                params,
-                reply,
-            })
-            .is_err()
-        {
-            return Task::ready(Err(anyhow!("Language server is unavailable")));
-        }
+        let receiver = match self.request(method, params) {
+            Ok(receiver) => receiver,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let buffer = Rc::downgrade(self);
         cx.spawn(async move |_| {
             let value = receiver
@@ -450,6 +496,7 @@ struct Connection {
     name: String,
     events: mpsc::Sender<Event>,
     running: Arc<AtomicBool>,
+    commands: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Connection {
@@ -463,16 +510,18 @@ impl Connection {
     ) -> Arc<Self> {
         let (events, receiver) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
+        let commands = Arc::new(RwLock::new(HashSet::new()));
+        let log = logs.source(&extension, &format!("{} #{id}", launch.name));
         let connection = Arc::new(Self {
             id,
             extension,
             name: launch.name.clone(),
             events: events.clone(),
             running: running.clone(),
+            commands: commands.clone(),
         });
         std::thread::spawn(move || {
-            let source = format!("{} #{id}", launch.name);
-            logs.append(&source, &format!("Starting in {}", project.root.display()));
+            log.append(&format!("Starting in {}", project.root.display()));
             let result = (launch.command)()
                 .and_then(|command| {
                     Server::start(
@@ -481,20 +530,20 @@ impl Connection {
                         &project.root,
                         events,
                         receiver,
-                        logs.clone(),
-                        source.clone(),
+                        log.clone(),
+                        commands,
                     )
                 })
                 .and_then(|mut server| server.run(&project, launch.options, &notify));
             running.store(false, Ordering::Relaxed);
             if let Err(error) = result {
-                logs.append(&source, &format!("{error:#}"));
+                log.error(&format!("{error:#}"));
                 notify(Notice::Failed {
                     session: id,
-                    error: format!("{}: {error:#}", launch.name),
+                    error: format!("{}: {error}", launch.name),
                 });
             } else {
-                logs.append(&source, "Stopped");
+                log.append("Stopped");
             }
         });
         connection
@@ -555,6 +604,12 @@ enum Pending {
     Diagnostic { document: u64, revision: i32 },
 }
 
+struct PendingQuickPick {
+    id: String,
+    command: u64,
+    reply: mpsc::Receiver<usize>,
+}
+
 struct Server {
     id: u64,
     child: Child,
@@ -565,8 +620,9 @@ struct Server {
     requests: HashMap<u64, (Instant, Pending)>,
     pull_diagnostics: bool,
     workspace_folders: Value,
-    logs: ExtensionLogs,
-    log_source: String,
+    log: LogSource,
+    commands: Arc<RwLock<HashSet<String>>>,
+    quick_pick: Option<PendingQuickPick>,
 }
 
 impl Drop for Server {
@@ -585,8 +641,8 @@ impl Server {
         root: &Path,
         events: mpsc::Sender<Event>,
         receiver: mpsc::Receiver<Event>,
-        logs: ExtensionLogs,
-        log_source: String,
+        log: LogSource,
+        commands: Arc<RwLock<HashSet<String>>>,
     ) -> Result<Self> {
         let program = command.get_program().to_os_string();
         let mut child = command
@@ -598,10 +654,7 @@ impl Server {
             .with_context(|| format!("Could not start {}", Path::new(&program).display()))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        logs.capture(
-            log_source.clone(),
-            child.stderr.take().expect("piped stderr"),
-        );
+        log.capture(child.stderr.take().expect("piped stderr"));
         let (outgoing, queue) = mpsc::channel();
         let write_events = events.clone();
         std::thread::spawn(move || {
@@ -639,8 +692,9 @@ impl Server {
             requests: HashMap::new(),
             pull_diagnostics: false,
             workspace_folders: Value::Null,
-            logs,
-            log_source,
+            log,
+            commands,
+            quick_pick: None,
         })
     }
 
@@ -724,6 +778,7 @@ impl Server {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
             self.flush_due()?;
+            self.finish_quick_pick()?;
             self.expire_requests();
             let now = Instant::now();
             ensure!(
@@ -874,8 +929,13 @@ impl Server {
             .requests
             .iter()
             .filter_map(|(&id, (deadline, pending))| {
-                (*deadline <= now || matches!(pending, Pending::Query(reply) if reply.is_closed()))
-                    .then_some(id)
+                let waiting_for_user = self
+                    .quick_pick
+                    .as_ref()
+                    .is_some_and(|picker| picker.command == id);
+                ((!waiting_for_user && *deadline <= now)
+                    || matches!(pending, Pending::Query(reply) if reply.is_closed()))
+                .then_some(id)
             })
             .collect::<Vec<_>>();
         for id in expired {
@@ -898,21 +958,60 @@ impl Server {
     fn handle_message(&mut self, message: Value, notify: &Notify) -> Result<()> {
         if let Some(method) = message["method"].as_str() {
             match method {
+                "dotdir/showQuickPick" => {
+                    let params = &message["params"];
+                    if self.quick_pick.is_none()
+                        && let Some(id) = message["id"].as_str()
+                        && let Some(command) = params["command"].as_u64()
+                        && matches!(self.requests.get(&command), Some((_, Pending::Query(_))))
+                        && let Ok(request) = serde_json::from_value::<vscode::QuickPick>(params.clone())
+                    {
+                        let (reply, receive) = mpsc::channel();
+                        self.quick_pick = Some(PendingQuickPick { id: id.into(), command, reply: receive });
+                        notify(Notice::QuickPick { session: self.id, request, reply });
+                    } else {
+                        self.respond(&message, Value::Null)?;
+                    }
+                }
+                "dotdir/cancelQuickPick" => {
+                    if self.quick_pick.as_ref().is_some_and(|picker| {
+                        Some(picker.id.as_str()) == message["params"]["id"].as_str()
+                    }) {
+                        self.reply_to_quick_pick(None)?;
+                        notify(Notice::QuickPickClosed { session: self.id });
+                    }
+                }
+                "dotdir/commandsChanged" => {
+                    if let Ok(commands) =
+                        serde_json::from_value(message["params"]["commands"].clone())
+                    {
+                        *self.commands.write().unwrap() = commands;
+                        notify(Notice::CommandsChanged);
+                    }
+                }
                 "dotdir/documentReady" => {
                     if let Some((&document, tracked)) = self.documents.iter_mut().find(|(_, tracked)| {
                         tracked.ready_deadline.is_some() && Some(tracked.uri.as_str()) == message["params"]["uri"].as_str()
                     }) {
                         tracked.ready_deadline = None;
-                        self.logs.append(&self.log_source, "Language client ready");
+                        self.log.append("Language client ready");
                         notify(Notice::Ready { session: self.id, document });
                     }
                 }
                 "dotdir/activationFailed" => {
-                    bail!("{}", message["params"]["message"].as_str().unwrap_or("Extension activation failed"));
+                    return Err(vscode::host_error(
+                        message["params"]["message"].as_str().unwrap_or("Extension activation failed"),
+                        message["params"]["stack"].as_str(),
+                    ));
                 }
                 "window/logMessage" => {
-                    if let Some(message) = message["params"]["message"].as_str() {
-                        self.logs.append(&self.log_source, message);
+                    let params = &message["params"];
+                    if let Some(message) = params["message"].as_str() {
+                        if params["type"].as_u64() == Some(1) {
+                            self.log.error(message);
+                        } else {
+                            self.log.append(message);
+                        }
                     }
                 }
                 "workspace/configuration" => {
@@ -947,6 +1046,14 @@ impl Server {
         if let Some(request) = message["id"].as_u64()
             && let Some((_, pending)) = self.requests.remove(&request)
         {
+            if self
+                .quick_pick
+                .as_ref()
+                .is_some_and(|picker| picker.command == request)
+            {
+                self.quick_pick = None;
+                notify(Notice::QuickPickClosed { session: self.id });
+            }
             let result = response_result(message);
             match pending {
                 Pending::Query(reply) => {
@@ -971,6 +1078,28 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    fn finish_quick_pick(&mut self) -> Result<()> {
+        let Some(picker) = &self.quick_pick else {
+            return Ok(());
+        };
+        let selection = match picker.reply.try_recv() {
+            Ok(index) => Some(index),
+            Err(mpsc::TryRecvError::Disconnected) => None,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+        };
+        self.reply_to_quick_pick(selection)
+    }
+
+    fn reply_to_quick_pick(&mut self, selection: Option<usize>) -> Result<()> {
+        let Some(picker) = self.quick_pick.take() else {
+            return Ok(());
+        };
+        if let Some((deadline, _)) = self.requests.get_mut(&picker.command) {
+            *deadline = Instant::now() + REQUEST_TIMEOUT;
+        }
+        self.write(json!({"jsonrpc": "2.0", "id": picker.id, "result": selection}))
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<u64> {
@@ -1047,12 +1176,12 @@ fn send_diagnostics(
 
 fn response_result(mut message: Value) -> Result<Value> {
     if let Some(error) = message.get("error") {
-        bail!(
-            "{}",
+        return Err(vscode::host_error(
             error["message"]
                 .as_str()
-                .unwrap_or("Language server request failed")
-        );
+                .unwrap_or("Language server request failed"),
+            error["data"]["stack"].as_str(),
+        ));
     }
     Ok(message["result"].take())
 }
@@ -1148,7 +1277,10 @@ mod tests {
             "activationEvents": ["workspaceContains:project.toml", "workspaceContains:*/project.toml"],
             "contributes": {"languages": [{"id": "fixture", "extensions": [".src"]}]}
         }).to_string()).unwrap();
-        let extensions = vscode::discover(&temp.path().join("extensions"));
+        let extensions = vscode::discover(
+            &temp.path().join("extensions"),
+            &vscode::Settings::default(),
+        );
         let extension = &extensions[0];
         let root = temp.path().join("project");
         let path = root.join("src/lib.src");
@@ -1194,7 +1326,8 @@ mod tests {
         fs::write(&broken, saved_error).unwrap();
 
         let (events, notices) = mpsc::channel();
-        let extensions = vscode::discover(&installed_extensions_root());
+        let extensions =
+            vscode::discover(&installed_extensions_root(), &vscode::Settings::default());
         let cargo = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| dirs::home_dir().unwrap().join(".cargo"));
@@ -1317,6 +1450,17 @@ mod tests {
         buffer.change(Rope::from(source));
         expect_diagnostics(3, false);
         assert_eq!(fs::read_to_string(file).unwrap(), source);
+
+        let text = buffer.text.borrow().clone();
+        let error = buffer
+            .execute_command("rust-analyzer.viewCrateGraph", &text, 0, 0)
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("requires VS Code webviews"));
+        assert!(format!("{error:#}").contains("out/main.js"));
+        assert!(!query(&buffer, "textDocument/hover", 2, 14).is_null());
     }
 
     #[test]
@@ -1328,10 +1472,33 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().canonicalize().unwrap();
         let path = project.join("sample #1.ts");
-        let input = "const answer: number = \"wrong\";\nanswer;\n";
+        let input = "const answer: number = \"wrong\";\nanswer;\n\nimport { greet } from 'source-probe';\ngreet();\n";
         fs::write(&path, input).unwrap();
+        fs::write(
+            project.join("tsconfig.json"),
+            r#"{"compilerOptions":{"types":[],"module":"NodeNext","moduleResolution":"NodeNext"}}"#,
+        )
+        .unwrap();
+        let dependency = project.join("node_modules/source-probe");
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"source-probe","version":"1.0.0","types":"index.d.ts","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dependency.join("index.d.ts"),
+            "export function greet(): string;\n",
+        )
+        .unwrap();
+        let implementation = dependency.join("index.js");
+        fs::write(
+            &implementation,
+            "// Implementation\nexports.greet = function greet() { return 'hello'; };\n",
+        )
+        .unwrap();
         let (events, notices) = mpsc::channel();
-        let extensions = vscode::discover(&root);
+        let extensions = vscode::discover(&root, &vscode::Settings::default());
         let mut settings = vscode::Settings {
             enabled: vec!["typescriptteam.native-preview".into()],
             ..Default::default()
@@ -1379,16 +1546,122 @@ mod tests {
                 }
             }
         };
-        diagnostic(1, 1, &|items| {
+        let has_type_error = |items: &[Diagnostic]| {
             items
                 .iter()
                 .any(|d| d.code == Some(lsp_types::NumberOrString::Number(2322)))
-        });
+        };
+        diagnostic(1, 1, &has_type_error);
         assert!(!query(&buffer, "textDocument/hover", 1, 2).is_null());
         assert!(!query(&buffer, "textDocument/definition", 1, 2).is_null());
         assert!(!query(&buffer, "textDocument/completion", 1, 2).is_null());
-        buffer.change(Rope::from(input.replace("\"wrong\"", "42")));
+
+        let unsaved = Rope::from(
+            input
+                .replace("\"wrong\"", "42")
+                .replace("answer", "unsavedAnswer"),
+        );
+        buffer.change(unsaved.clone());
         diagnostic(1, 2, &|items| items.is_empty());
+
+        let restart = "typescript.native-preview.restart";
+        assert!(buffer.command_available(restart));
+        buffer
+            .execute_command(restart, &unsaved, 0, 0)
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        assert!(
+            query(&buffer, "textDocument/hover", 1, 2)
+                .to_string()
+                .contains("unsavedAnswer")
+        );
+
+        let go_to_source = |offset| {
+            let value = buffer
+                .execute_command(
+                    "typescript.native-preview.goToSourceDefinition",
+                    &unsaved,
+                    offset,
+                    offset,
+                )
+                .unwrap()
+                .recv_blocking()
+                .unwrap()
+                .unwrap();
+            serde_json::from_value::<vscode::LanguageCommandResult>(value).unwrap()
+        };
+        let reference = unsaved.to_string().rfind("greet").unwrap() + 1;
+        let vscode::LanguageCommandResult::GoToLocation { location } = go_to_source(reference)
+        else {
+            panic!("Expected a source definition");
+        };
+        assert_eq!(uri_to_path(&location.uri).unwrap(), implementation);
+        assert_eq!(location.range.start.line, 1);
+        let whitespace = unsaved.to_string().find("\n\n").unwrap() + 1;
+        assert!(matches!(
+            go_to_source(whitespace),
+            vscode::LanguageCommandResult::Status { message } if message == "No source definitions found."
+        ));
+
+        for accept in [false, true] {
+            let command = buffer
+                .execute_command("typescript.native-preview.selectVersion", &unsaved, 0, 0)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (picker, reply) = loop {
+                match notices
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    Notice::QuickPick {
+                        session,
+                        request,
+                        reply,
+                    } if session == buffer.session() => {
+                        break (request, reply);
+                    }
+                    Notice::Failed { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            };
+            let (index, item) = picker
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.label.contains("Use TypeScript 7"))
+                .expect("TypeScript 7 version option");
+            assert!(item.detail.as_deref().unwrap().ends_with(executable));
+            if accept {
+                reply.send(index).unwrap();
+            }
+            drop(reply);
+            command.recv_blocking().unwrap().unwrap();
+        }
+        let storage = fs::read_dir(temp.path().join("vscode-storage"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let workspace = fs::read_dir(storage.join("workspace"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let configuration: Value =
+            serde_json::from_slice(&fs::read(workspace.join("configuration.json")).unwrap())
+                .unwrap();
+        assert_eq!(configuration["js/ts.experimental.useTsgo"], true);
+        assert!(
+            query(&buffer, "textDocument/hover", 1, 2)
+                .to_string()
+                .contains("unsavedAnswer")
+        );
+        buffer.change(Rope::from(input));
+        diagnostic(1, 3, &has_type_error);
         assert_eq!(fs::read_to_string(&path).unwrap(), input);
 
         let session = buffer.session();
@@ -1436,7 +1709,8 @@ mod tests {
         )
         .unwrap();
         let (events, notices) = mpsc::channel();
-        let extensions = vscode::discover(&installed_extensions_root());
+        let extensions =
+            vscode::discover(&installed_extensions_root(), &vscode::Settings::default());
         let mut settings = vscode::Settings {
             enabled: vec!["redhat.vscode-yaml".into()],
             ..Default::default()

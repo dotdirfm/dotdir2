@@ -145,6 +145,60 @@ this path with their published JavaScript clients. Literal
 `workspaceContains` activation entries identify project markers. A file
 outside those projects opens in a session with an empty workspace.
 
+## Filesystem extensions
+
+DotDir routes `scheme://…` locations to read-only filesystem providers. The
+built-in `ext-logs://` provider lists extensions by ID and exposes their recent
+session output as `output.log` files. Provider locations use the same directory
+panels, parent navigation, session restore, and preview as local locations.
+
+To add a provider, place a package in the native config directory's
+`extensions/` folder and choose **F11 → Reload Extensions**. Give the package
+an `extension.json` manifest with an explicit Node.js runtime and a list of
+lowercase protocols.
+
+```json
+{
+  "id": "example.notes",
+  "name": "Example Notes",
+  "version": "1.0.0",
+  "api_version": 1,
+  "runtime": "node",
+  "main": "index.mjs",
+  "filesystems": ["example-notes"]
+}
+```
+
+Export `readDirectory(address)` and `readFile(address, maxBytes)` from the
+entry module. Both may be asynchronous. The address includes `uri`, `scheme`,
+and decoded `segments`. The root has an empty `segments` array. Use entry
+names without separators, and throw an error for missing paths. Directory
+entries may include byte `size` and `modifiedMs` as a Unix timestamp in
+milliseconds. Return a string or `Uint8Array` from `readFile`.
+
+```js
+const contents = 'Hello from a filesystem extension.\n';
+
+export async function readDirectory({ segments }) {
+  if (segments.length) throw new Error('Directory does not exist');
+  return [{ name: 'readme.txt', size: Buffer.byteLength(contents) }];
+}
+
+export async function readFile({ segments }, maxBytes) {
+  if (segments.length !== 1 || segments[0] !== 'readme.txt') {
+    throw new Error('File does not exist');
+  }
+  if (Buffer.byteLength(contents) > maxBytes) throw new Error('File is too large');
+  return contents;
+}
+```
+
+Open `example-notes://` with **⌘L** to use the example. Protocols are unique
+within DotDir. Each request runs in its own Node.js process with a 30-second
+timeout. Providers can use standard Node.js modules and installed dependencies,
+and run with the same OS permissions as DotDir. DotDir handles browsing and
+preview with a 16 MiB file limit.
+
 ## Compatibility boundaries
 
 This port covers the native file-manager shell, core file operations, text/hex/image

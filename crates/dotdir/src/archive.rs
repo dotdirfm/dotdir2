@@ -1,3 +1,4 @@
+use crate::filesystems::{Filesystems, ProviderPath};
 use anyhow::{Context, Result, bail, ensure};
 use dotdir_core::copy::{CancelToken, ConflictPolicy, ConflictResolution, CopyEvent, CopyProgress};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ pub enum Location {
         archive: Arc<Archive>,
         member: PathBuf,
     },
+    Provider(ProviderPath),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub enum Location {
 pub enum SavedLocation {
     Local(PathBuf),
     Zip { archive: PathBuf, member: PathBuf },
+    Provider { uri: ProviderPath },
 }
 
 impl SavedLocation {
@@ -36,6 +39,7 @@ impl SavedLocation {
         match self {
             Self::Local(path) => path.is_dir(),
             Self::Zip { archive, .. } => archive.is_file(),
+            Self::Provider { .. } => true,
         }
     }
 }
@@ -48,6 +52,7 @@ impl From<SavedLocation> for Location {
                 archive: Arc::new(Archive::new(archive)),
                 member,
             },
+            SavedLocation::Provider { uri } => Self::Provider(uri),
         }
     }
 }
@@ -60,6 +65,7 @@ impl From<&Location> for SavedLocation {
                 archive: archive.path.clone(),
                 member: member.clone(),
             },
+            Location::Provider(uri) => Self::Provider { uri: uri.clone() },
         }
     }
 }
@@ -80,26 +86,43 @@ impl Location {
     pub fn local(&self) -> Option<&Path> {
         match self {
             Self::Local(path) => Some(path),
-            Self::Zip { .. } => None,
+            _ => None,
         }
     }
 
-    pub fn host_path(&self) -> &Path {
+    pub fn host_path(&self) -> Option<&Path> {
         match self {
-            Self::Local(path) => path,
-            Self::Zip { archive, .. } => &archive.path,
+            Self::Local(path) => Some(path),
+            Self::Zip { archive, .. } => Some(&archive.path),
+            Self::Provider(_) => None,
         }
     }
 
     pub fn name_path(&self) -> &Path {
         match self {
             Self::Zip { member, .. } if !member.as_os_str().is_empty() => member,
-            _ => self.host_path(),
+            Self::Provider(path) => Path::new(path.name().unwrap_or_default()),
+            _ => self.host_path().expect("local or archive path"),
         }
     }
 
     pub fn file_name(&self) -> Option<&OsStr> {
-        self.name_path().file_name()
+        match self {
+            Self::Provider(path) => path.name().map(OsStr::new),
+            _ => self.name_path().file_name(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                if matches!(self, Self::Provider(_)) {
+                    self.display()
+                } else {
+                    "/".into()
+                }
+            })
     }
 
     pub fn extension(&self) -> Option<&OsStr> {
@@ -111,7 +134,8 @@ impl Location {
             Self::Zip { archive, member } if !member.as_os_str().is_empty() => {
                 Some(archive.location(member.parent()?.into()))
             }
-            _ => Some(self.host_path().parent()?.into()),
+            Self::Provider(path) => Some(Self::Provider(path.parent()?)),
+            _ => Some(self.host_path()?.parent()?.into()),
         }
     }
 
@@ -121,10 +145,11 @@ impl Location {
             Self::Zip { archive, member } => {
                 format!("{}!/{}", archive.path.display(), member.display())
             }
+            Self::Provider(path) => path.to_string(),
         }
     }
 
-    pub fn read_preview(&self) -> Result<Vec<u8>> {
+    pub fn read_preview(&self, filesystems: &Filesystems) -> Result<Vec<u8>> {
         match self {
             Self::Local(path) => {
                 ensure!(
@@ -142,6 +167,7 @@ impl Location {
                 Ok(data)
             }
             Self::Zip { archive, member } => archive.read_preview(member),
+            Self::Provider(path) => filesystems.read_file(path, PREVIEW_LIMIT as usize),
         }
     }
 }
@@ -644,7 +670,11 @@ mod tests {
         assert!(children[0].1.directory);
         let nested = archive.list(Path::new("docs")).unwrap();
         let (file, _) = &nested[0];
-        assert_eq!(file.read_preview().unwrap(), b"hello");
+        assert_eq!(
+            file.read_preview(&Filesystems::new(Default::default()))
+                .unwrap(),
+            b"hello"
+        );
         assert_eq!(file.parent(), Some(children[0].0.clone()));
         let restored: SavedLocation =
             serde_json::from_slice(&serde_json::to_vec(&SavedLocation::from(file)).unwrap())

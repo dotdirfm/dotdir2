@@ -14,6 +14,7 @@ pub struct CommandState {
     pub panels_visible: bool,
     pub directory: bool,
     pub archive: bool,
+    pub provider: bool,
     pub entry: bool,
     pub real_entry: bool,
     pub file: bool,
@@ -21,6 +22,7 @@ pub struct CommandState {
     pub selection: bool,
     pub parent: bool,
     pub can_save: bool,
+    pub line_wrap: Option<bool>,
     pub language_server: bool,
     pub has_tab: bool,
     pub multiple_tabs: bool,
@@ -53,6 +55,7 @@ pub enum Availability {
     Parent,
     RenameOrSave,
     Save,
+    TextDocument,
     LanguageServer,
     Tab,
     MultipleTabs,
@@ -64,25 +67,29 @@ pub enum Availability {
 }
 impl Availability {
     pub fn matches(self, state: &CommandState) -> bool {
+        let local = !state.archive && !state.provider;
         match self {
             Self::Always => true,
             Self::Panels => state.panels_visible,
             Self::Directory => state.directory,
-            Self::LocalDirectory => state.directory && !state.archive,
-            Self::LocalLocation => !state.archive,
+            Self::LocalDirectory => state.directory && local,
+            Self::LocalLocation => local,
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
             Self::File => state.directory && state.file,
-            Self::EditableFile => state.directory && state.file && !state.archive,
+            Self::EditableFile => state.directory && state.file && local,
             Self::Items => state.directory && state.items,
-            Self::Copy => state.directory && state.selection && state.operation_idle,
-            Self::LocalTransfer => Self::Copy.matches(state) && !state.archive,
+            Self::Copy => {
+                state.directory && state.selection && state.operation_idle && !state.provider
+            }
+            Self::LocalTransfer => Self::Copy.matches(state) && local,
             Self::Parent => state.directory && state.parent,
             Self::RenameOrSave => {
-                (state.directory && !state.archive && state.real_entry && state.operation_idle)
+                (state.directory && local && state.real_entry && state.operation_idle)
                     || state.can_save
             }
             Self::Save => state.can_save,
+            Self::TextDocument => state.panels_visible && state.line_wrap.is_some(),
             Self::LanguageServer => state.panels_visible && state.language_server,
             Self::Tab => state.has_tab,
             Self::MultipleTabs => state.multiple_tabs,
@@ -108,16 +115,29 @@ impl Command {
     }
 
     pub fn title(&self, state: &CommandState) -> &'static str {
-        if self.id == "copy" && state.archive {
-            "Extract ZIP"
-        } else {
-            self.title
+        match self.id {
+            "copy" if state.archive => "Extract ZIP",
+            "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
+            "toggle-line-wrap" if state.line_wrap == Some(false) => "Enable Line Wrap",
+            _ => self.title,
         }
+    }
+
+    fn binding(&self) -> Option<KeyBinding> {
+        (!self.key.is_empty()).then(|| {
+            KeyBinding::new(
+                self.key,
+                RunCommand { id: self.id.into() },
+                Some(self.context),
+            )
+        })
     }
 
     pub fn keybar_label(&self, editor: bool, archive: bool) -> &str {
         match self.id {
             "palette" => "Commands",
+            "left-panel-menu" => "Left Menu",
+            "right-panel-menu" => "Right Menu",
             "rename" if editor => "Save",
             "rename" => "Rename",
             "view" => "View",
@@ -180,6 +200,20 @@ pub const COMMANDS: &[Command] = &[
         key: "f1",
         context: "DotDir",
         availability: Availability::Always,
+    },
+    Command {
+        id: "left-panel-menu",
+        title: "Open Left Panel Menu",
+        key: "alt-f1",
+        context: "DotDir",
+        availability: Availability::Panels,
+    },
+    Command {
+        id: "right-panel-menu",
+        title: "Open Right Panel Menu",
+        key: "alt-f2",
+        context: "DotDir",
+        availability: Availability::Panels,
     },
     Command {
         id: "rename",
@@ -441,6 +475,13 @@ pub const COMMANDS: &[Command] = &[
         availability: Availability::Save,
     },
     Command {
+        id: "toggle-line-wrap",
+        title: "Toggle Line Wrap",
+        key: "",
+        context: "DotDir",
+        availability: Availability::TextDocument,
+    },
+    Command {
         id: "definition",
         title: "Language: Go to Definition",
         key: "cmd-alt-down",
@@ -596,11 +637,7 @@ pub struct UserBinding {
     pub context: Option<String>,
 }
 pub fn bind(cx: &mut App, path: &std::path::Path) {
-    cx.bind_keys(
-        COMMANDS
-            .iter()
-            .map(|c| KeyBinding::new(c.key, RunCommand { id: c.id.into() }, Some(c.context))),
-    );
+    cx.bind_keys(COMMANDS.iter().filter_map(Command::binding));
     cx.bind_keys([
         KeyBinding::new(
             "cmd-shift-p",
@@ -714,15 +751,7 @@ mod tests {
             },
             Some("Input"),
         )];
-        bindings.extend(COMMANDS.iter().map(|command| {
-            KeyBinding::new(
-                command.key,
-                RunCommand {
-                    id: command.id.into(),
-                },
-                Some(command.context),
-            )
-        }));
+        bindings.extend(COMMANDS.iter().filter_map(|command| command.binding()));
         let keymap = Keymap::new(bindings);
         for (contexts, expected) in [
             (vec!["DotDir", "FilePane"], "switch"),
@@ -933,10 +962,23 @@ mod tests {
     #[test]
     fn editor_empty_directory_and_terminal_have_distinct_command_sets() {
         let mut editor = CommandState {
+            panels_visible: true,
             has_tab: true,
+            line_wrap: Some(true),
             ..Default::default()
         };
         assert!(!available("save", &editor)); // read-only or saving
+        let wrap = COMMANDS
+            .iter()
+            .find(|c| c.id == "toggle-line-wrap")
+            .unwrap();
+        assert!(wrap.available(&editor));
+        assert_eq!(wrap.title(&editor), "Disable Line Wrap");
+        editor.line_wrap = Some(false);
+        assert_eq!(wrap.title(&editor), "Enable Line Wrap");
+        editor.panels_visible = false;
+        assert!(!wrap.available(&editor));
+        editor.panels_visible = true;
         editor.can_save = true;
         assert!(available("save", &editor));
         assert!(available("rename", &editor)); // F2 saves an editable document
@@ -950,6 +992,7 @@ mod tests {
             assert!(!available(id, &editor), "{id}");
         }
         let empty_directory = CommandState {
+            panels_visible: true,
             directory: true,
             ..Default::default()
         };
@@ -957,6 +1000,7 @@ mod tests {
         assert!(available("refresh", &empty_directory));
         assert!(!available("open", &empty_directory));
         assert!(!available("select-all", &empty_directory));
+        assert!(!wrap.available(&empty_directory));
         assert!(!available("next-tab", &editor));
         editor.multiple_tabs = true;
         assert!(available("next-tab", &editor));

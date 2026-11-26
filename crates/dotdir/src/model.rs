@@ -1,8 +1,9 @@
 use crate::archive::{Location, SavedLocation};
+use crate::filesystems::Filesystems;
 use dotdir_core::ops::{EntryInfo, EntryKind};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -61,7 +62,12 @@ pub fn read_directory(path: &Path, hidden: bool, sort: SortOrder) -> anyhow::Res
     Ok(sort_entries(&path.into(), items, sort))
 }
 
-pub fn read_location(path: &Location, hidden: bool, sort: SortOrder) -> anyhow::Result<Vec<Entry>> {
+pub fn read_location(
+    path: &Location,
+    filesystems: &Filesystems,
+    hidden: bool,
+    sort: SortOrder,
+) -> anyhow::Result<Vec<Entry>> {
     match path {
         Location::Local(path) => read_directory(path, hidden, sort),
         Location::Zip { archive, member } => {
@@ -79,6 +85,27 @@ pub fn read_location(path: &Location, hidden: bool, sort: SortOrder) -> anyhow::
                         modified: member.modified,
                         hidden: is_hidden,
                         parent: false,
+                        mode: 0,
+                    })
+                })
+                .collect();
+            Ok(sort_entries(path, items, sort))
+        }
+        Location::Provider(address) => {
+            let items = filesystems
+                .read_directory(address)?
+                .into_iter()
+                .filter_map(|item| {
+                    let is_hidden = item.name.starts_with('.');
+                    (hidden || !is_hidden).then(|| Entry {
+                        path: Location::Provider(address.child(item.name.clone())),
+                        name: item.name,
+                        directory: item.directory,
+                        size: item.size,
+                        modified: item.modified_ms as f64,
+                        hidden: is_hidden,
+                        parent: false,
+                        symlink: false,
                         mode: 0,
                     })
                 })
@@ -559,6 +586,12 @@ pub struct Settings {
     pub right_active: usize,
     pub active_pane: usize,
     pub terminal_height: f32,
+    #[serde(
+        rename = "pathAliases",
+        alias = "path_aliases",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub path_aliases: BTreeMap<String, String>,
     pub vscode: crate::vscode::Settings,
 }
 impl Default for Settings {
@@ -577,6 +610,7 @@ impl Default for Settings {
             right_active: 0,
             active_pane: 0,
             terminal_height: 240.,
+            path_aliases: BTreeMap::new(),
             vscode: Default::default(),
         }
     }

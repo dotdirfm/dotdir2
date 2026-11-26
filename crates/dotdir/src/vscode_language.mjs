@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, mkdirSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync, watch, writeFileSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
-import { matchesGlob, posix } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
+import { matchesGlob } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 class Disposable {
   constructor(dispose) { this.dispose = dispose; }
@@ -24,37 +24,6 @@ class EventEmitter {
     }
   }
   dispose() { this.listeners.clear(); }
-}
-
-class Uri {
-  constructor(url) { this.url = url; }
-  static parse(value) { return new Uri(new URL(value)); }
-  static file(path) { return new Uri(pathToFileURL(path)); }
-  static from({ scheme, authority = '', path = '', query = '', fragment = '' }) {
-    const host = authority || scheme === 'file' ? '//' + authority : '';
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const search = query ? '?' + encodeURIComponent(query) : '';
-    const hash = fragment ? '#' + encodeURIComponent(fragment) : '';
-    return Uri.parse(scheme + ':' + host + encodedPath + search + hash);
-  }
-  static joinPath(uri, ...parts) { return uri.with({ path: posix.join(uri.path, ...parts) }); }
-  get fsPath() { return this.scheme === 'file' ? fileURLToPath(this.url) : this.path; }
-  get scheme() { return this.url.protocol.slice(0, -1); }
-  get authority() { return this.url.host; }
-  get path() { return decodeURIComponent(this.url.pathname); }
-  get query() { return decodeURIComponent(this.url.search.slice(1)); }
-  get fragment() { return decodeURIComponent(this.url.hash.slice(1)); }
-  with(change) {
-    const url = new URL(this.url);
-    if (change.scheme !== undefined) url.protocol = change.scheme + ':';
-    if (change.authority !== undefined) url.host = change.authority;
-    if (change.path !== undefined) url.pathname = change.path.split('/').map(encodeURIComponent).join('/');
-    if (change.query !== undefined) url.search = encodeURIComponent(change.query);
-    if (change.fragment !== undefined) url.hash = encodeURIComponent(change.fragment);
-    return new Uri(url);
-  }
-  toString() { return this.url.href; }
-  toJSON() { return { scheme: this.scheme, authority: this.authority, path: this.path, query: this.query, fragment: this.fragment }; }
 }
 
 class MarkdownString {
@@ -114,7 +83,11 @@ function pathMatches(glob, path) {
   return matchesGlob(path.split(sep).join('/'), glob) || (isAbsolute(path) && matchesGlob(path.slice(1).split(sep).join('/'), glob));
 }
 
-function getConfiguration(values, section, overrides = {}) {
+function getConfiguration(section, defaults, overrides, workspace, update) {
+  const values = { ...defaults, ...overrides };
+  for (const key of workspace.keys()) {
+    Object.defineProperty(values, key, { value: workspace.get(key), enumerable: true, configurable: true });
+  }
   function valueFor(key) {
     if (Object.hasOwn(values, key)) return values[key];
     const prefix = key ? key + '.' : '';
@@ -143,25 +116,42 @@ function getConfiguration(values, section, overrides = {}) {
   Object.defineProperties(result, {
     get: { value: (key, fallback) => valueFor(keyFor(key)) ?? fallback },
     has: { value: key => valueFor(keyFor(key)) !== undefined },
-    inspect: { value: key => ({
-      key: keyFor(key), defaultValue: valueFor(keyFor(key)), globalValue: overrides[keyFor(key)]
-    }) }
+    inspect: { value: key => {
+      const name = keyFor(key);
+      return {
+        key: name,
+        defaultValue: Object.hasOwn(defaults, name) ? defaults[name] : undefined,
+        globalValue: Object.hasOwn(overrides, name) ? overrides[name] : undefined,
+        workspaceValue: workspace.get(name)
+      };
+    } },
+    update: { value: (key, value, target) => update(keyFor(key), value, target) }
   });
   return result;
 }
 
 function memento(directory, filename) {
   const path = resolve(directory, filename);
-  let data = {};
-  try { data = JSON.parse(readFileSync(path, 'utf8')); } catch {}
+  const read = () => {
+    try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; }
+  };
+  let data = read();
   return {
     get: (key, fallback) => Object.hasOwn(data, key) ? data[key] : fallback,
     keys: () => Object.keys(data),
     async update(key, value) {
-      if (value === undefined) delete data[key];
-      else Object.defineProperty(data, key, { value, enumerable: true, configurable: true, writable: true });
+      const updated = read();
+      if (value === undefined) delete updated[key];
+      else Object.defineProperty(updated, key, { value, enumerable: true, configurable: true, writable: true });
       mkdirSync(directory, { recursive: true });
-      writeFileSync(path, JSON.stringify(data), { mode: 0o600 });
+      const temporary = resolve(directory, filename + '.' + randomUUID());
+      try {
+        writeFileSync(temporary, JSON.stringify(updated), { mode: 0o600 });
+        renameSync(temporary, path);
+      } finally {
+        rmSync(temporary, { force: true });
+      }
+      data = updated;
     },
     setKeysForSync() {}
   };
@@ -175,13 +165,16 @@ class LanguageSession {
   close = new EventEmitter();
   save = new EventEmitter();
   active = new EventEmitter();
+  configurationChanged = new EventEmitter();
   contentProviders = new Map();
   readers = new Set();
   diagnosticCollections = new Set();
   folders = [];
   requests = new Map();
+  nextQuickPick = 0;
 
   constructor(api) {
+    this.commands = api.commands;
     const session = this;
     const group = {
       get activeTab() {
@@ -208,6 +201,7 @@ class LanguageSession {
       showErrorMessage: alerts,
       showWarningMessage: alerts,
       showInformationMessage: alerts,
+      showQuickPick: (items, options, token) => this.showQuickPick(items, options, token),
       withProgress: (_options, task) => task({ report() {} }, new CancellationTokenSource().token)
     });
     Object.defineProperties(api.window, {
@@ -225,7 +219,7 @@ class LanguageSession {
       onDidChangeTextDocument: this.change.event,
       onDidCloseTextDocument: this.close.event,
       onDidSaveTextDocument: this.save.event,
-      onDidChangeConfiguration: emptyEvent,
+      onDidChangeConfiguration: this.configurationChanged.event,
       onDidChangeWorkspaceFolders: emptyEvent,
       onDidCreateFiles: emptyEvent,
       onDidDeleteFiles: emptyEvent,
@@ -234,7 +228,10 @@ class LanguageSession {
       onWillDeleteFiles: emptyEvent,
       onWillRenameFiles: emptyEvent,
       onWillSaveTextDocument: emptyEvent,
-      getConfiguration: section => getConfiguration(session.configuration ?? {}, section, session.configurationOverrides),
+      getConfiguration: section => getConfiguration(
+        section, session.configuration, session.configurationOverrides, session.workspaceConfiguration,
+        (key, value, target) => session.updateConfiguration(key, value, target)
+      ),
       getWorkspaceFolder: uri => session.folders.find(folder => {
         if (uri.scheme !== folder.uri.scheme) return false;
         const path = relative(folder.uri.fsPath, uri.fsPath);
@@ -278,14 +275,14 @@ class LanguageSession {
       onDidChange: emptyEvent
     };
     api.tasks = { registerTaskProvider: () => new Disposable(() => {}) };
-    api.env = {
-      appName: 'DotDir', appHost: 'desktop', uriScheme: 'dotdir', language: 'en', uiKind: 1,
+    Object.assign(api.env, {
+      appName: 'DotDir', appHost: 'desktop', uriScheme: 'dotdir', uiKind: 1,
       isTelemetryEnabled: false, onDidChangeTelemetryEnabled: emptyEvent,
       createTelemetryLogger: () => ({
         isUsageEnabled: false, isErrorsEnabled: false, onDidChangeEnableStates: emptyEvent,
         logUsage() {}, logError() {}, dispose() {}
       })
-    };
+    });
     api.languages = new Proxy({
       match: (selector, document) => Number(documentMatches(selector, document)),
       createDiagnosticCollection: name => this.diagnostics(name),
@@ -317,7 +314,7 @@ class LanguageSession {
         }
       },
       TreeItemCollapsibleState: enumValues(['None', 'Collapsed', 'Expanded']),
-      Uri, Disposable, EventEmitter, CancellationTokenSource, MarkdownString, TabInputText,
+      Disposable, EventEmitter, CancellationTokenSource, MarkdownString, TabInputText,
       CancellationError: class CancellationError extends Error {},
       Diagnostic: class Diagnostic { constructor(range, message, severity = 0) { Object.assign(this, { range, message, severity }); } },
       DiagnosticRelatedInformation: class DiagnosticRelatedInformation { constructor(location, message) { Object.assign(this, { location, message }); } },
@@ -349,8 +346,7 @@ class LanguageSession {
       TextDocumentChangeReason: enumValues(['Undo', 'Redo'], 1),
       ProgressLocation: { SourceControl: 1, Window: 10, Notification: 15 },
       ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
-      l10n: { t: (message, ...args) => (typeof message === 'string' ? message : message.message)
-        .replace(/\{(\d+)\}/g, (_, index) => args[Number(index)] ?? '') }
+      QuickPickItemKind: { Separator: -1, Default: 0 }
     });
     for (const [name, value] of Object.entries({
       Empty: '', QuickFix: 'quickfix', Refactor: 'refactor', RefactorExtract: 'refactor.extract',
@@ -367,9 +363,11 @@ class LanguageSession {
   context(request) {
     const hash = value => createHash('sha256').update(value).digest('hex');
     const storage = resolve(request.storage, hash(request.extension));
-    const root = this.folders[0]?.uri.fsPath ?? '';
-    const workspace = resolve(storage, 'workspace', hash(root));
-    const pkg = JSON.parse(readFileSync(resolve(request.root, 'package.json'), 'utf8'));
+    const root = this.folders[0]?.uri.fsPath;
+    const workspace = resolve(storage, 'workspace', hash(root ?? ''));
+    const configuration = resolve(storage, 'workspace', hash(root ?? process.cwd()));
+    this.workspaceConfiguration = memento(configuration, 'configuration.json');
+    const pkg = request.localization?.packageJson ?? JSON.parse(readFileSync(resolve(request.root, 'package.json'), 'utf8'));
     this.extension = {
       id: request.extension, extensionUri: Uri.file(request.root), extensionPath: request.root,
       packageJSON: pkg, isActive: true,
@@ -381,6 +379,81 @@ class LanguageSession {
       logUri: Uri.file(resolve(storage, 'logs')),
       globalState: memento(storage, 'state.json'), workspaceState: memento(workspace, 'state.json'),
       environmentVariableCollection: { replace() {}, append() {}, prepend() {}, delete() {}, clear() {} }
+    };
+  }
+
+  async updateConfiguration(key, value, target) {
+    if (target !== 2 && target !== false) {
+      throw new Error('DotDir supports workspace-scoped configuration updates');
+    }
+    const previous = this.workspaceConfiguration.get(key);
+    if (isDeepStrictEqual(previous, value)) return;
+    const inherited = Object.hasOwn(this.configurationOverrides, key)
+      ? this.configurationOverrides[key]
+      : this.configuration[key];
+    await this.workspaceConfiguration.update(key, value);
+    if (isDeepStrictEqual(previous === undefined ? inherited : previous, value === undefined ? inherited : value)) return;
+    this.configurationChanged.fire({
+      affectsConfiguration: section => section === key || key.startsWith(section + '.') || section.startsWith(key + '.')
+    });
+  }
+
+  async showQuickPick(items, options = {}, token) {
+    const command = this.commandRequest;
+    items = await items;
+    if (token?.isCancellationRequested || !items.length) return;
+    if (command === undefined || command !== this.commandRequest) {
+      throw new Error('DotDir quick picks require an active extension command');
+    }
+    if (options.canPickMany) throw new Error('DotDir quick picks support single selection');
+    if (this.quickPickReply) throw new Error('Another quick pick is already open');
+    const id = 'quick-pick:' + (++this.nextQuickPick);
+    const selected = new Promise(finish => { this.quickPickReply = { id, finish }; });
+    const cancel = token?.onCancellationRequested(() => {
+      this.send({ method: 'dotdir/cancelQuickPick', params: { id } });
+    });
+    try {
+      const rows = items.map(item => typeof item === 'string' ? { label: item } : {
+        label: item.label, description: item.description, detail: item.detail, separator: item.kind === -1
+      });
+      this.send({ id, method: 'dotdir/showQuickPick', params: {
+        command: command.id, items: rows, title: options.title, placeHolder: options.placeHolder,
+        matchOnDescription: !!options.matchOnDescription, matchOnDetail: !!options.matchOnDetail
+      } });
+      const index = await selected;
+      if (!token?.isCancellationRequested && Number.isInteger(index) && !rows[index]?.separator) {
+        return items[index];
+      }
+    } finally {
+      cancel?.dispose();
+      this.quickPickReply = undefined;
+    }
+  }
+
+  async goToLocations(_uri, _position, locations, multiple, noResultsMessage) {
+    const command = this.commandRequest;
+    if (!command) throw new Error('DotDir location navigation requires an active extension command');
+    if (!locations.length) {
+      command.result = { type: 'status', message: noResultsMessage ?? 'No locations found.' };
+      return;
+    }
+    const local = locations.filter(location => location.uri?.scheme === 'file');
+    if (!local.length) throw new Error('DotDir source navigation requires a file URI');
+    let location = local[0];
+    if (local.length > 1 && multiple !== 'goto') {
+      const items = local.map(location => ({
+        label: basename(location.uri.fsPath),
+        description: String(location.range.start.line + 1),
+        detail: location.uri.fsPath,
+        location
+      }));
+      const choice = await this.showQuickPick(items, { placeHolder: 'Select a source location', matchOnDetail: true });
+      if (!choice) return;
+      location = choice.location;
+    }
+    command.result = {
+      type: 'goToLocation',
+      location: { uri: location.uri.toString(), range: location.range }
     };
   }
 
@@ -503,7 +576,9 @@ class LanguageSession {
         const message = JSON.parse(bytes.subarray(0, size).toString());
         bytes = bytes.subarray(size);
         size = undefined;
-        if (message.method === '$/cancelRequest') {
+        if (message.method === undefined) {
+          if (this.quickPickReply && message.id === this.quickPickReply.id) this.quickPickReply.finish(message.result);
+        } else if (message.method === '$/cancelRequest') {
           this.requests.get(message.params.id)?.cancel();
         } else if (message.method === 'exit') {
           process.exit();
@@ -525,15 +600,29 @@ class LanguageSession {
   async dispatch({ id, method, params }, activateExtension) {
     const token = id === undefined ? undefined : new CancellationTokenSource();
     if (token) this.requests.set(id, token);
+    if (method === 'dotdir/executeCommand') this.commandRequest = { id };
     try {
       const result = await this.handle(method, params, token?.token, activateExtension);
       if (id !== undefined) this.send({ id, result: result ?? null });
     } catch (error) {
-      if (id !== undefined) this.send({ id, error: { code: -32603, message: String(error?.message ?? error) } });
+      if (id !== undefined) {
+        const { message, stack } = errorDetails(error);
+        this.send({ id, error: { code: -32603, message, data: { stack } } });
+      }
       else this.send({ method: 'window/logMessage', params: { type: 1, message: String(error?.stack ?? error) } });
     } finally {
+      if (method === 'dotdir/executeCommand') this.commandRequest = undefined;
       if (token) { this.requests.delete(id); token.dispose(); }
     }
+  }
+
+  publishCommands() {
+    if (!this.activated || this.commandsQueued) return;
+    this.commandsQueued = true;
+    queueMicrotask(() => {
+      this.commandsQueued = false;
+      this.send({ method: 'dotdir/commandsChanged', params: { commands: this.registeredCommands() } });
+    });
   }
 
   async handle(method, params, token, activateExtension) {
@@ -561,9 +650,10 @@ class LanguageSession {
         this.activating = Promise.resolve().then(() => activateExtension(this.request, this.context(this.request)));
         try {
           await this.activating;
+          this.activated = true;
+          this.publishCommands();
         } catch (error) {
-          console.error(error);
-          this.send({ method: 'dotdir/activationFailed', params: { message: String(error?.message ?? error) } });
+          this.send({ method: 'dotdir/activationFailed', params: errorDetails(error) });
           return;
         }
       } else {
@@ -602,6 +692,18 @@ class LanguageSession {
         this.active.fire(this.editor);
       }
       return;
+    }
+    if (method === 'dotdir/executeCommand') {
+      await this.activating;
+      const document = this.documents.get(params.textDocument.uri);
+      if (!document) throw new Error('The editor document is no longer open');
+      const { anchor, active } = params;
+      const selection = new Selection(anchor.line, anchor.character, active.line, active.character);
+      const changed = this.editor?.document !== document;
+      this.editor = { document, selection, viewColumn: 1 };
+      if (changed) this.active.fire(this.editor);
+      await this.commands.executeCommand(params.command);
+      return this.commandRequest.result;
     }
     const selected = providerKinds.get(method);
     if (!selected) return;

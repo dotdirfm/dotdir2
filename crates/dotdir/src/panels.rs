@@ -367,10 +367,7 @@ impl DotDir {
             .rev()
             .enumerate()
         {
-            let label = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/".into());
+            let label = path.label();
             if index > 1 {
                 breadcrumbs = breadcrumbs.child(text("/").text_color(p.muted));
             }
@@ -469,11 +466,7 @@ impl DotDir {
                     cx.notify();
                 }));
             for (index, directory) in browser.columns.iter().enumerate() {
-                let title = directory
-                    .path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".into());
+                let title = directory.path.label();
                 columns = columns.child(
                     div()
                         .w(px(COLUMN_WIDTH))

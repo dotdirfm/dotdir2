@@ -1,13 +1,89 @@
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire, flushCompileCache, registerHooks } from 'node:module';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Stdout carries protocol messages only, including when an extension logs.
 const protocol = process.stdout.write.bind(process.stdout);
 const send = (message) => protocol(JSON.stringify(message) + '\n');
+const commandLog = new AsyncLocalStorage();
+
+function errorDetails(error) {
+  const message = String(error?.message ?? error);
+  const stack = typeof error?.stack === 'string'
+    ? error.stack.split('\n').slice(1).join('\n').slice(0, 8192)
+    : undefined;
+  return { message, stack };
+}
+if (process.env.DOTDIR_VSCODE_LANGUAGE !== '1') {
+  const stderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, encoding, callback) => {
+    const extension = commandLog.getStore();
+    if (!extension) return stderr(chunk, encoding, callback);
+    const buffer = typeof chunk === 'string'
+      ? Buffer.from(chunk, typeof encoding === 'string' ? encoding : undefined)
+      : Buffer.from(chunk);
+    const written = send({ type: 'log', extension, message: buffer.subarray(0, 8192).toString() });
+    const done = typeof encoding === 'function' ? encoding : callback;
+    if (done) queueMicrotask(done);
+    return written;
+  };
+}
 process.stdout.write = process.stderr.write.bind(process.stderr);
+
+class Uri {
+  constructor(url) { this.url = url; }
+  static parse(value) { return new Uri(new URL(value)); }
+  static file(path) { return new Uri(pathToFileURL(path)); }
+  static from({ scheme, authority = '', path = '', query = '', fragment = '' }) {
+    const host = authority || scheme === 'file' ? '//' + authority : '';
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+    const search = query ? '?' + encodeURIComponent(query) : '';
+    const hash = fragment ? '#' + encodeURIComponent(fragment) : '';
+    return Uri.parse(scheme + ':' + host + encodedPath + search + hash);
+  }
+  static joinPath(uri, ...parts) { return uri.with({ path: posix.join(uri.path, ...parts) }); }
+  get fsPath() { return this.scheme === 'file' ? fileURLToPath(this.url) : this.path; }
+  get scheme() { return this.url.protocol.slice(0, -1); }
+  get authority() { return this.url.host; }
+  get path() { return decodeURIComponent(this.url.pathname); }
+  get query() { return decodeURIComponent(this.url.search.slice(1)); }
+  get fragment() { return decodeURIComponent(this.url.hash.slice(1)); }
+  with(change) {
+    const url = new URL(this.url);
+    if (change.scheme !== undefined) url.protocol = change.scheme + ':';
+    if (change.authority !== undefined) url.host = change.authority;
+    if (change.path !== undefined) url.pathname = change.path.split('/').map(encodeURIComponent).join('/');
+    if (change.query !== undefined) url.search = encodeURIComponent(change.query);
+    if (change.fragment !== undefined) url.hash = encodeURIComponent(change.fragment);
+    return new Uri(url);
+  }
+  toString() { return this.url.href; }
+  toJSON() { return { scheme: this.scheme, authority: this.authority, path: this.path, query: this.query, fragment: this.fragment }; }
+}
+
+function localization() {
+  const extensionId = commandLog.getStore();
+  const extension = extensionId && extensionId !== current?.extensionId
+    ? extensions.get(extensionId)
+    : current?.extension;
+  return extension?.localization;
+}
+
+function translate(messageOrOptions, ...args) {
+  const options = typeof messageOrOptions === 'string'
+    ? { message: messageOrOptions, args: typeof args[0] === 'object' && args[0] !== null ? args[0] : args }
+    : messageOrOptions;
+  const { message, comment, args: values = {} } = options;
+  const note = Array.isArray(comment) ? comment.join('') : comment;
+  const key = note ? message + '/' + note : message;
+  const messages = localization()?.bundle?.messages;
+  const text = messages && Object.hasOwn(messages, key) ? messages[key] : message;
+  return text.replace(/\{([^{}]+)\}/g, (placeholder, name) =>
+    Object.hasOwn(values, name) ? String(values[name]) : placeholder);
+}
 
 function createOutputChannel(name) {
   const log = (message, ...args) => console.error('[' + name + ']', message, ...args);
@@ -185,11 +261,26 @@ function textEditor(job, snapshot) {
 }
 
 const api = {
+  Uri,
   Position,
   Range,
   Selection,
   EndOfLine: Object.freeze({ LF: 1, CRLF: 2 }),
-  window: { createOutputChannel, get activeTextEditor() { return current?.editor; } },
+  env: { get language() { return localization()?.locale ?? 'en'; } },
+  l10n: {
+    t: translate,
+    get bundle() { return localization()?.bundle?.messages; },
+    get uri() {
+      const path = localization()?.bundle?.path;
+      return path && Uri.file(path);
+    }
+  },
+  ViewColumn: { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3, Four: 4, Five: 5, Six: 6, Seven: 7, Eight: 8, Nine: 9 },
+  window: {
+    createOutputChannel,
+    createWebviewPanel() { throw new Error('This command requires VS Code webviews, which DotDir does not support yet'); },
+    get activeTextEditor() { return current?.editor; }
+  },
   workspace: {
     getConfiguration(section) {
       const values = current?.configuration ?? {};
@@ -208,10 +299,19 @@ const api = {
       }
       const command = callback.bind(thisArg);
       commands.set(id, command);
-      return { dispose() { if (commands.get(id) === command) commands.delete(id); } };
+      languageSession?.publishCommands();
+      return { dispose() {
+        if (commands.get(id) === command) {
+          commands.delete(id);
+          languageSession?.publishCommands();
+        }
+      } };
     },
     async executeCommand(id, ...args) {
       if (id === 'setContext') return;
+      if (id === 'editor.action.goToLocations' && languageSession) {
+        return await languageSession.goToLocations(...args);
+      }
       const callback = current?.extension.commands.get(id);
       if (!callback) throw new Error('Unsupported command ' + id);
       return await callback(...args);
@@ -255,16 +355,22 @@ async function activate(job, request, context = {}) {
   const module = await import(pathToFileURL(entry).href);
   const extension = module.default?.activate ? module.default : module;
   const subscriptions = [];
+  const metadata = context.extension ?? {
+    id: request.extension,
+    extensionPath: root,
+    extensionUri: Uri.file(root),
+    packageJSON: request.localization?.packageJson ?? JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')),
+    isActive: true
+  };
   try {
     const exports = await extension.activate?.({
       ...context,
+      extension: metadata,
       subscriptions,
       extensionPath: root,
       asAbsolutePath: (path) => resolve(root, path)
     });
-    if (context.extension) {
-      Object.defineProperty(context.extension, 'exports', { value: exports });
-    }
+    Object.defineProperty(metadata, 'exports', { value: exports });
   } catch (error) {
     await disposeSubscriptions(subscriptions);
     throw error;
@@ -280,11 +386,13 @@ async function activate(job, request, context = {}) {
 async function run(request) {
   const job = {
     id: request.id,
+    extensionId: request.extension,
     extension: extensions.get(request.extension) ?? { commands: new Map() },
     configuration: request.configuration,
     edits: new Map(),
     transactions: []
   };
+  job.extension.localization = request.localization;
   job.editor = textEditor(job, request.editor);
   current = job;
   let error = null;
@@ -292,7 +400,7 @@ async function run(request) {
     if (!extensions.has(request.extension)) await activate(job, request);
     await api.commands.executeCommand(request.command);
   } catch (failure) {
-    error = String(failure?.message ?? failure);
+    error = errorDetails(failure);
   } finally {
     await Promise.allSettled(job.transactions);
     current = undefined;
@@ -301,8 +409,9 @@ async function run(request) {
 }
 
 if (languageSession) {
+  languageSession.registeredCommands = () => [...(current?.extension.commands.keys() ?? [])];
   languageSession.start(async (request, context) => {
-    current = { extension: { commands: new Map() } };
+    current = { extensionId: request.extension, extension: { commands: new Map(), localization: request.localization } };
     languageSession.deactivate = await activate(current, request, context);
   });
 } else {
@@ -315,7 +424,7 @@ if (languageSession) {
       current.edits.delete(message.serial);
       finish?.(message.editor);
     } else if (message.type === 'run' && !current) {
-      void run(message);
+      void commandLog.run(message.extension, () => run(message));
     }
   });
 }

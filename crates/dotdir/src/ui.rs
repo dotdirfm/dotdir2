@@ -73,7 +73,7 @@ impl Render for TabDragPreview {
     }
 }
 
-fn icon(name: IconName, color: Hsla) -> Icon {
+pub(crate) fn icon(name: IconName, color: Hsla) -> Icon {
     Icon::new(name).size(px(16.)).text_color(color)
 }
 fn icon_image(source: ImageSource, size: f32) -> AnyElement {
@@ -267,13 +267,23 @@ impl DotDir {
     ) -> AnyElement {
         let p = self.palette;
         let active = self.active == pane;
+        let selected = self.panes[pane].active;
+        let tab = self.panes[pane].tabs[selected].id();
+        let scroll = &mut self.tab_strip_scrolls[pane];
+        if scroll.last_selected != Some((selected, tab)) {
+            scroll.handle.scroll_to_item(selected);
+            scroll.last_selected = Some((selected, tab));
+        }
         let mut tabs = div()
+            .id(("pane-tabs", pane))
+            .role(Role::TabList)
             .flex()
-            .h(px(28.))
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(p.border)
-            .overflow_hidden();
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .overflow_x_scroll()
+            .track_scroll(&scroll.handle);
         for (index, tab) in self.panes[pane].tabs.iter().enumerate() {
             let id = tab.id();
             let preview = tab.preview;
@@ -282,7 +292,8 @@ impl DotDir {
                 TabContent::Directory(browser) => {
                     let path = &browser.current().path;
                     let archive_root = matches!(path, Location::Zip { member, .. } if member.as_os_str().is_empty());
-                    self.file_tab_label(path.file_name().unwrap_or(OsStr::new("/")), !archive_root)
+                    let label = path.label();
+                    self.file_tab_label(OsStr::new(&label), !archive_root)
                 }
                 TabContent::Document(id) => {
                     let doc = &self.documents[id];
@@ -324,14 +335,22 @@ impl DotDir {
                     .items_center()
                     .gap(px(6.))
                     .h_full()
+                    .flex_shrink_0()
                     .min_w(px(64.))
                     .max_w(px(200.))
                     .px(px(8.))
                     .border_r_1()
                     .border_color(p.border)
                     .when(selected, |s| {
-                        s.border_b_2()
-                            .border_color(if active { p.accent } else { p.muted })
+                        s.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.))
+                                .bg(if active { p.accent } else { p.muted }),
+                        )
                     })
                     .text_color(if selected { p.fg } else { p.muted })
                     .text_size(px(12.))
@@ -406,23 +425,40 @@ impl DotDir {
             )
         }
         let end = self.panes[pane].tabs.len();
-        tabs = tabs
+        let tab_bar = div()
+            .flex()
+            .h(px(28.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(p.border)
             .child(
-                div()
-                    .id(("tab-drop-end", pane))
-                    .flex_1()
-                    .h_full()
-                    .drag_over::<TabDrag>(move |s, _, _, _| {
-                        s.border_l_2().border_color(p.accent).bg(p.selected)
-                    })
-                    .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                        this.drop_tab(drag.id, pane, end, window.modifiers().alt, window, cx);
-                    })),
+                tabs.child(
+                    div()
+                        .id(("tab-drop-end", pane))
+                        .flex_1()
+                        .h_full()
+                        .drag_over::<TabDrag>(move |s, _, _, _| {
+                            s.border_l_2().border_color(p.accent).bg(p.selected)
+                        })
+                        .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+                            this.drop_tab(drag.id, pane, end, window.modifiers().alt, window, cx);
+                        })),
+                ),
             )
             .child(
                 div()
                     .id(("pane-menu", pane))
+                    .role(Role::Button)
+                    .aria_label(if pane == 0 {
+                        "Left panel actions"
+                    } else {
+                        "Right panel actions"
+                    })
+                    .aria_expanded(
+                        matches!(&self.modal, Some(Modal::PanelMenu(menu)) if menu.pane == pane),
+                    )
                     .w(px(28.))
+                    .flex_shrink_0()
                     .h_full()
                     .flex()
                     .items_center()
@@ -432,8 +468,7 @@ impl DotDir {
                     .cursor_pointer()
                     .child(icon(IconName::EllipsisVertical, p.accent_fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.active = pane;
-                        this.show_modal(Modal::Palette, window, cx);
+                        this.open_panel_menu(pane, window, cx);
                     })),
             );
         let content = match &self.panes[pane].tabs[self.panes[pane].active].content {
@@ -544,7 +579,7 @@ impl DotDir {
                         if let Some(image) = image {
                             img(image.clone())
                         } else {
-                            img(path.host_path().to_path_buf())
+                            img(path.host_path().expect("local image path").to_path_buf())
                         }
                         .size_full()
                         .object_fit(ObjectFit::Contain),
@@ -586,7 +621,7 @@ impl DotDir {
             .border_1()
             .border_color(if active { p.accent } else { p.border })
             .bg(p.bg)
-            .child(tabs)
+            .child(tab_bar)
             .child(
                 div()
                     .flex()
@@ -757,11 +792,22 @@ impl DotDir {
         let Some(modal) = &self.modal else {
             return div().into_any_element();
         };
+        if let Modal::PanelMenu(menu) = modal {
+            return self.render_panel_menu(menu, window, cx);
+        }
         let (title, description) = match modal {
             Modal::Prompt {
                 title, description, ..
             } => (title.clone(), description.clone()),
             Modal::Palette => ("Commands".into(), String::new()),
+            Modal::QuickPick { request, .. } => (
+                request
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Select an option".into()),
+                request.place_holder.clone().unwrap_or_default(),
+            ),
+            Modal::PanelMenu(_) => unreachable!(),
             Modal::Settings => ("Settings".into(), String::new()),
             Modal::Extensions => (
                 "Extensions".into(),
@@ -828,6 +874,7 @@ impl DotDir {
             );
         }
         match modal {
+            Modal::PanelMenu(_) => unreachable!(),
             Modal::Palette => {
                 content = content.child(Input::new(&self.dialog_input));
                 let commands = self.filtered_commands(cx);
@@ -865,6 +912,65 @@ impl DotDir {
                                 this.run(&id, window, cx);
                             })),
                     );
+                }
+                content = content.child(list);
+            }
+            Modal::QuickPick { request, .. } => {
+                content = content.child(Input::new(&self.dialog_input));
+                let indices = request.matches(&self.dialog_input.read(cx).value());
+                self.palette_cursor = self.palette_cursor.min(indices.len().saturating_sub(1));
+                let start = self.palette_cursor.saturating_sub(7);
+                let mut list = div().flex().flex_col().gap(px(2.));
+                if indices.is_empty() {
+                    list = list.child(text("No matching options").text_color(p.muted));
+                }
+                for (cursor, &index) in indices.iter().enumerate().skip(start).take(9) {
+                    let group_start = cursor.checked_sub(1).map_or(0, |prev| indices[prev] + 1);
+                    if let Some(separator) = request.items[group_start..index]
+                        .iter()
+                        .rev()
+                        .find(|item| item.separator)
+                    {
+                        list = list.child(
+                            div()
+                                .border_t_1()
+                                .border_color(p.border)
+                                .px(px(8.))
+                                .text_size(px(11.))
+                                .text_color(p.muted)
+                                .child(separator.label.clone()),
+                        );
+                    }
+                    let item = &request.items[index];
+                    let mut heading = div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(text(item.label.clone()));
+                    if let Some(description) = &item.description {
+                        heading = heading.child(text(description.clone()).text_color(p.muted));
+                    }
+                    let mut row = div()
+                        .id(("quick-pick", index))
+                        .role(Role::Button)
+                        .aria_label(item.label.clone())
+                        .flex()
+                        .flex_col()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(3.))
+                        .when(cursor == self.palette_cursor, |s| s.bg(p.selected))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(p.selected))
+                        .child(heading)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.accept_quick_pick(index, window, cx);
+                        }));
+                    if let Some(detail) = &item.detail {
+                        row =
+                            row.child(text(detail.clone()).text_size(px(11.)).text_color(p.muted));
+                    }
+                    list = list.child(row);
                 }
                 content = content.child(list);
             }
@@ -1043,15 +1149,38 @@ impl DotDir {
                 content=content.child(self.button("keybindings","Edit keybindings.json",|this,window,cx|{let path=this.settings_path.with_file_name("keybindings.json");if !path.exists(){let _=std::fs::write(&path,"[\n  {\"key\": \"cmd-l\", \"command\": \"location\", \"context\": \"DotDir\"}\n]\n");}this.dismiss(window,cx);this.open_document(this.active,path,false,window,cx);},cx));
             }
             Modal::Extensions => {
-                content = content.child(self.button(
-                    "extension-logs",
-                    "Extension Logs",
-                    |this, window, cx| {
-                        this.extension_log_scroll.scroll_to_bottom();
-                        this.show_modal(Modal::ExtensionLogs, window, cx);
-                    },
-                    cx,
-                ));
+                content = content.child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(self.button(
+                            "extension-logs",
+                            "Extension Logs",
+                            |this, window, cx| {
+                                this.extension_log_scroll.scroll_to_bottom();
+                                this.show_modal(Modal::ExtensionLogs, window, cx);
+                            },
+                            cx,
+                        ))
+                        .child(self.button(
+                            "browse-logs",
+                            "Browse Logs",
+                            |this, window, cx| this.browse_extension_logs(window, cx),
+                            cx,
+                        ))
+                        .child(self.button(
+                            "open-dotdir-log",
+                            "Open DotDir Log",
+                            |this, window, cx| {
+                                let path = this
+                                    .settings_path
+                                    .with_file_name(crate::extension_logs::ERROR_LOG_NAME);
+                                this.dismiss(window, cx);
+                                this.open_document(this.active, path, true, window, cx);
+                            },
+                            cx,
+                        )),
+                );
                 content = content.child(self.icon_theme_controls("extension-icons", cx));
                 for e in &self.extensions {
                     let mut row = div()
@@ -1146,6 +1275,7 @@ impl DotDir {
                     |this, _, cx| {
                         this.extension_errors.clear();
                         this.load_extensions();
+                        this.refresh_provider_directories();
                         this.refresh_vscode_language_servers(true, cx);
                         cx.notify();
                     },
@@ -1338,6 +1468,11 @@ impl Render for DotDir {
                 window.refresh();
             }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.handle_panel_menu_key(event, window, cx) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 if event.keystroke.key == "escape" {
                     if this.dismiss_hover(cx) {
                         cx.stop_propagation();
@@ -1366,10 +1501,15 @@ impl Render for DotDir {
                         window.refresh();
                         cx.stop_propagation();
                         window.prevent_default();
-                    } else if matches!(this.modal, Some(Modal::Palette))
+                    } else if matches!(this.modal, Some(Modal::Palette | Modal::QuickPick { .. }))
                         && matches!(key, "up" | "down")
                     {
-                        let len = this.filtered_commands(cx).len();
+                        let len = match &this.modal {
+                            Some(Modal::QuickPick { request, .. }) => {
+                                request.matches(&this.dialog_input.read(cx).value()).len()
+                            }
+                            _ => this.filtered_commands(cx).len(),
+                        };
                         this.palette_cursor = if key == "up" {
                             this.palette_cursor.saturating_sub(1)
                         } else {
@@ -1458,7 +1598,12 @@ impl Render for DotDir {
                     )),
             );
         }
-        let path = self.cwd(self.active).display().to_string();
+        let location = self.pane_location(self.active);
+        let path = if matches!(location, Location::Provider(_)) {
+            location.display()
+        } else {
+            self.cwd(self.active).display().to_string()
+        };
         root = root.child(
             div()
                 .h(px(26.))

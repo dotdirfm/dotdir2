@@ -2,13 +2,15 @@ use crate::{
     archive::{Archive, Location, SavedLocation, is_zip},
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
-    extension_logs::ExtensionLogs,
+    extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
+    filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
     hover::HoverHints,
     icon_theme::IconTheme,
     lsp::{self, LanguageServers},
     media::{MediaEvent, MediaFilter, MediaViewer},
     model::*,
     operations::*,
+    panel_menu::{JumpStep, PanelMenu},
     syntax::language_for,
     terminal::Terminal,
     theme::Palette,
@@ -39,6 +41,7 @@ const VSCODE_RUNNING: &str = "Running VS Code extension…";
 pub(crate) enum Message {
     IconTheme(u64, anyhow::Result<Box<IconTheme>>),
     Lsp(lsp::Notice),
+    MountedRoots(Vec<PathBuf>),
     Directory(u64, u64, anyhow::Result<Vec<Entry>>),
     Watch(u64),
     Opened {
@@ -71,6 +74,12 @@ pub(crate) enum Message {
 impl DotDir {
     pub fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.dialog_input.read(cx).value().to_string();
+        if let Some(Modal::QuickPick { request, .. }) = &self.modal {
+            if let Some(&index) = request.matches(&value).get(self.palette_cursor) {
+                self.accept_quick_pick(index, window, cx);
+            }
+            return;
+        }
         if matches!(self.modal, Some(Modal::Palette)) {
             let commands = self.filtered_commands(cx);
             if let Some((id, _, _)) = commands.get(self.palette_cursor).cloned() {
@@ -109,14 +118,7 @@ impl DotDir {
                     self.load_icon_theme(self.resolve_path(value.trim()), cx);
                 }
                 PromptKind::Location => {
-                    let p = self.resolve_path(&value);
-                    let location = if p.is_dir() {
-                        p.into()
-                    } else if p.is_file() && is_zip(&p) {
-                        Archive::mount(p)
-                    } else {
-                        anyhow::bail!("Directory or ZIP archive does not exist");
-                    };
+                    let location = self.resolve_directory(&value, true)?;
                     self.navigate(self.active, location, window, cx);
                 }
                 PromptKind::Mkdir => {
@@ -243,11 +245,41 @@ impl DotDir {
             self.cwd(self.active).join(p)
         }
     }
+
+    pub(crate) fn resolve_directory(
+        &self,
+        value: &str,
+        allow_zip: bool,
+    ) -> anyhow::Result<Location> {
+        if let Some(path) = ProviderPath::parse(value)? {
+            self.filesystems.check(&path)?;
+            return Ok(Location::Provider(path));
+        }
+        if let Location::Provider(path) = self.pane_location(self.active)
+            && value != "~"
+            && !value.starts_with("~/")
+            && !Path::new(value).is_absolute()
+        {
+            self.filesystems.check(&path)?;
+            return Ok(Location::Provider(path.resolve(value)?));
+        }
+        let path = self.resolve_path(value);
+        if path.is_dir() {
+            Ok(path.into())
+        } else if allow_zip && path.is_file() && is_zip(&path) {
+            Ok(Archive::mount(path))
+        } else {
+            anyhow::bail!(if allow_zip {
+                "Directory or ZIP archive does not exist"
+            } else {
+                "Directory does not exist"
+            });
+        }
+    }
+
     pub fn filtered_commands(&self, cx: &App) -> Vec<(String, String, String)> {
         let query = self.dialog_input.read(cx).value().to_lowercase();
         let state = self.command_state(cx);
-        let vscode_available =
-            self.vscode_document().is_some() && self.vscode_host.pending.is_none();
         COMMANDS
             .iter()
             .filter(|command| command.available(&state))
@@ -255,6 +287,8 @@ impl DotDir {
                 !matches!(
                     c.id,
                     "up" | "down"
+                        | "left-panel-menu"
+                        | "right-panel-menu"
                         | "left"
                         | "right"
                         | "first"
@@ -269,26 +303,34 @@ impl DotDir {
                     c.id.to_string(),
                     c.title(&state).to_string(),
                     c.key.to_string(),
+                    None,
                 )
             })
             .chain(self.extensions.iter().flat_map(|e| {
                 e.contributions
                     .iter()
                     .filter(|c| c.viewer.is_none())
-                    .map(|c| (c.id.clone(), c.title.clone(), "Extension".into()))
+                    .map(|c| (c.id.clone(), c.title.clone(), "Extension".into(), None))
             }))
-            .chain(
-                self.vscode_commands()
-                    .filter(|_| vscode_available)
-                    .map(|(_, command)| {
-                        (command.id.clone(), command.title.clone(), "VS Code".into())
-                    }),
-            )
-            .filter(|(id, title, _)| {
-                query
-                    .split_whitespace()
-                    .all(|q| title.to_lowercase().contains(q) || id.to_lowercase().contains(q))
+            .chain(self.vscode_commands().map(|(_, command)| {
+                (
+                    command.id.clone(),
+                    command.title.clone(),
+                    "VS Code".into(),
+                    command.original_title.as_deref(),
+                )
+            }))
+            .filter(|(id, title, _, original)| {
+                let id = id.to_lowercase();
+                let title = title.to_lowercase();
+                let original = original.map(str::to_lowercase);
+                query.split_whitespace().all(|q| {
+                    title.contains(q)
+                        || id.contains(q)
+                        || original.as_ref().is_some_and(|title| title.contains(q))
+                })
             })
+            .map(|(id, title, shortcut, _)| (id, title, shortcut))
             .collect()
     }
     pub fn command_state(&self, cx: &App) -> CommandState {
@@ -301,10 +343,12 @@ impl DotDir {
         let document = self
             .active_document()
             .and_then(|id| self.documents.get(&id));
+        let location = self.pane_location(self.active);
         CommandState {
             panels_visible: self.panels_visible,
             directory: directory.is_some(),
-            archive: self.archive_active(self.active),
+            archive: matches!(location, Location::Zip { .. }),
+            provider: matches!(location, Location::Provider(_)),
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
             file: entry.is_some_and(|entry| !entry.directory && !entry.parent),
@@ -313,6 +357,7 @@ impl DotDir {
                 .is_some_and(|d| !d.marked.is_empty() || d.focused().is_some_and(|e| !e.parent)),
             parent: directory.is_some_and(|d| d.path.parent().is_some()),
             can_save: self.panels_visible && document.is_some_and(|d| !d.readonly && !d.saving),
+            line_wrap: document.and_then(|doc| doc.line_wrap),
             language_server: document.is_some_and(|d| d.lsp.is_some()),
             has_tab: self.panels_visible && tab.is_some(),
             multiple_tabs: self.panels_visible && self.panes[self.active].tabs.len() > 1,
@@ -331,9 +376,7 @@ impl DotDir {
             return command.available(&self.command_state(cx));
         }
         if id.starts_with("vscode:") {
-            return self.vscode_document().is_some()
-                && self.vscode_host.pending.is_none()
-                && self.vscode_commands().any(|(_, command)| command.id == id);
+            return self.vscode_commands().any(|(_, command)| command.id == id);
         }
         // API v1 extension commands are global; viewer registrations aren't
         // executable commands. They still obey the shared modal execution gate.
@@ -420,6 +463,7 @@ impl DotDir {
         }
     }
     pub fn load_extensions(&mut self) {
+        let mut filesystems = Filesystems::new(self.extension_logs.clone());
         let mut roots = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions")];
         if let Some(bundle) = std::env::current_exe()
             .ok()
@@ -429,19 +473,46 @@ impl DotDir {
         }
         if let Some(base) = self.settings_path.parent() {
             let directory = base.join("extensions");
-            self.vscode_extensions = vscode::discover(&directory);
+            self.vscode_extensions = vscode::discover(&directory, &self.settings.vscode);
+            for extension in &self.vscode_extensions {
+                self.extension_logs.register(&extension.id);
+            }
             self.reset_vscode_host();
             roots.push(directory);
         }
         let mut seen = std::collections::HashSet::new();
         for root in roots {
             if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
+                let mut paths = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>();
+                paths.sort_unstable();
+                for path in paths {
                     if !path.join("extension.json").is_file() {
                         continue;
                     }
                     if !seen.insert(path.canonicalize().unwrap_or(path.clone())) {
+                        continue;
+                    }
+                    if let Some(manifest) = std::fs::read(path.join("extension.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .filter(|manifest| manifest["runtime"].as_str() == Some("node"))
+                    {
+                        let result = serde_json::from_value(manifest)
+                            .map_err(Into::into)
+                            .and_then(|package| {
+                                filesystems.register(
+                                    package,
+                                    &path,
+                                    self.settings.vscode.node.clone(),
+                                    self.extension_logs.clone(),
+                                )
+                            });
+                        if let Err(error) = result {
+                            self.report_extension_error(format!("{}: {error:#}", path.display()));
+                        }
                         continue;
                     }
                     let rx = self.extension_host.load(path);
@@ -454,18 +525,49 @@ impl DotDir {
                 }
             }
         }
+        self.filesystems = filesystems;
+    }
+
+    fn report_extension_error(&mut self, error: String) {
+        self.extension_logs
+            .source("dotdir", "DotDir extensions")
+            .error(&error);
+        self.extension_errors.push(error);
+    }
+
+    pub fn browse_extension_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss(window, cx);
+        self.navigate(
+            self.active,
+            Location::Provider(ProviderPath::root(LOG_SCHEME)),
+            window,
+            cx,
+        );
     }
 
     fn vscode_commands(
         &self,
     ) -> impl Iterator<Item = (&vscode::Extension, &vscode::ExtensionCommand)> {
+        let document = self.vscode_document().filter(|_| {
+            self.vscode_host.pending.is_none() && self.vscode_language_command.is_none()
+        });
         self.vscode_extensions
             .iter()
-            .filter(|extension| self.settings.vscode.enabled(&extension.id))
-            .flat_map(|extension| {
+            .filter(move |extension| {
+                document.is_some() && self.settings.vscode.enabled(&extension.id)
+            })
+            .flat_map(move |extension| {
+                let language_session = document
+                    .and_then(|document| document.lsp.as_deref())
+                    .filter(|buffer| buffer.extension_id() == extension.id);
                 extension
                     .commands
                     .iter()
+                    .filter(move |command| {
+                        !extension.provides_language()
+                            || language_session
+                                .is_some_and(|buffer| buffer.command_available(&command.command))
+                    })
                     .map(move |command| (extension, command))
             })
     }
@@ -529,12 +631,13 @@ impl DotDir {
 
     fn reset_vscode_host(&mut self) {
         self.vscode_host.reset();
+        self.vscode_language_command = None;
         if self.status == VSCODE_RUNNING {
             self.status.clear();
         }
     }
 
-    fn invoke_vscode(&mut self, command_id: &str, cx: &mut Context<Self>) {
+    fn invoke_vscode(&mut self, command_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.id();
         let Some(document) = self.vscode_document() else {
             return;
@@ -547,12 +650,106 @@ impl DotDir {
         };
         let editor = document.input.read(cx);
         let text = editor.text().clone();
+        let selection = editor.selected_range();
+        let reversed = editor.is_selection_reversed();
+        let extension_id = extension.id.clone();
+        let command_name = command.command.clone();
+        if extension.provides_language() {
+            let Some(buffer) = &document.lsp else {
+                return;
+            };
+            let invocation = (id, buffer.session());
+            let pane = self.active;
+            let origin = document.id;
+            let version = document.version.get();
+            let (anchor, active) = if reversed {
+                (selection.end, selection.start)
+            } else {
+                (selection.start, selection.end)
+            };
+            match buffer.execute_command(&command.command, &text, anchor, active) {
+                Ok(reply) => {
+                    self.vscode_language_command = Some(invocation);
+                    self.status = VSCODE_RUNNING.into();
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = reply
+                            .recv()
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Language server disconnected"))
+                            .and_then(|result| result)
+                            .and_then(|value| {
+                                Ok(serde_json::from_value::<
+                                    Option<vscode::LanguageCommandResult>,
+                                >(value)?)
+                            });
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if this.vscode_language_command != Some(invocation) {
+                                return;
+                            }
+                            this.vscode_language_command = None;
+                            if this.status == VSCODE_RUNNING {
+                                this.status.clear();
+                            }
+                            match result {
+                                Err(error) => this.report_vscode_error(
+                                    &extension_id,
+                                    &command_name,
+                                    error,
+                                    cx,
+                                ),
+                                Ok(Some(action))
+                                    if this.modal.is_none()
+                                        && this.active == pane
+                                        && this.active_document() == Some(origin)
+                                        && this.documents[&origin].version.get() == version =>
+                                {
+                                    match action {
+                                        vscode::LanguageCommandResult::GoToLocation {
+                                            location,
+                                        } => {
+                                            if let Some(path) = lsp::uri_to_path(&location.uri) {
+                                                this.open_source_location(
+                                                    pane,
+                                                    path,
+                                                    Some(location.range.start),
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.report_vscode_error(
+                                                    &extension_id,
+                                                    &command_name,
+                                                    anyhow::anyhow!(
+                                                        "Cannot open source location {}",
+                                                        location.uri.as_str()
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        vscode::LanguageCommandResult::Status { message } => {
+                                            this.status = message
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(error) => self.report_vscode_error(&extension_id, &command_name, error, cx),
+            }
+            cx.notify();
+            return;
+        }
         let snapshot = vscode::Snapshot::new(
             document.path.local().expect("local editor"),
             document.version.get(),
             &text,
-            editor.selected_range(),
-            editor.is_selection_reversed(),
+            selection,
+            reversed,
         );
         let document_id = document.id;
         let invocation = extension.invocation(command, &self.settings.vscode, id, snapshot);
@@ -561,12 +758,22 @@ impl DotDir {
             .run(&self.settings.vscode, invocation, document_id, text)
         {
             Ok(()) => self.status = VSCODE_RUNNING.into(),
-            Err(error) => {
-                self.extension_logs
-                    .append("VS Code commands", &format!("{error:#}"));
-                self.error(error, cx);
-            }
+            Err(error) => self.report_vscode_error(&extension_id, &command_name, error, cx),
         }
+        cx.notify();
+    }
+
+    fn report_vscode_error(
+        &mut self,
+        extension: &str,
+        command: &str,
+        error: anyhow::Error,
+        cx: &mut Context<Self>,
+    ) {
+        self.extension_logs
+            .source(extension, "VS Code commands")
+            .error(&format!("{command}: {error:#}"));
+        self.status = format!("VS Code extension: {error}");
         cx.notify();
     }
 
@@ -577,17 +784,24 @@ impl DotDir {
         let reply = match event.reply {
             Ok(reply) => reply,
             Err(error) => {
-                self.extension_logs
-                    .append("VS Code commands", &format!("{error:#}"));
-                let running = self.vscode_host.pending.is_some();
+                let pending = self.vscode_host.pending.take();
                 self.vscode_host.reset();
-                if running {
-                    self.error(error, cx);
+                if let Some(pending) = pending {
+                    self.report_vscode_error(&pending.extension, &pending.command, error, cx);
+                } else {
+                    self.extension_logs
+                        .source("dotdir", "VS Code commands")
+                        .error(&format!("{error:#}"));
                 }
                 return;
             }
         };
         match reply {
+            vscode::Reply::Log { extension, message } => {
+                self.extension_logs
+                    .source(&extension, "VS Code commands")
+                    .append(&message);
+            }
             vscode::Reply::Edit {
                 id,
                 serial,
@@ -603,16 +817,15 @@ impl DotDir {
                 }
             }
             vscode::Reply::Done { id, error } => {
-                if self
-                    .vscode_host
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.id == id)
+                if let Some(pending) = self.vscode_host.pending.take_if(|pending| pending.id == id)
                 {
-                    self.vscode_host.pending = None;
                     if let Some(error) = error {
-                        self.extension_logs.append("VS Code commands", &error);
-                        self.error(format!("VS Code extension: {error}"), cx);
+                        self.report_vscode_error(
+                            &pending.extension,
+                            &pending.command,
+                            error.into(),
+                            cx,
+                        );
                     } else if self.status == VSCODE_RUNNING {
                         self.status.clear();
                     }
@@ -745,14 +958,18 @@ impl DotDir {
             } else {
                 command[3..].trim()
             };
-            let path = self.resolve_path(path);
-            if path.is_dir() {
-                self.navigate(self.active, path.into(), window, cx);
-            } else {
-                self.error("Directory does not exist", cx);
-                return;
+            match self.resolve_directory(path, false) {
+                Ok(path) => self.navigate(self.active, path, window, cx),
+                Err(error) => {
+                    self.error(error, cx);
+                    return;
+                }
             }
         } else {
+            if matches!(self.pane_location(self.active), Location::Provider(_)) {
+                self.error("Shell commands require a local directory", cx);
+                return;
+            }
             self.ensure_terminal(cx);
             self.terminal_visible = true;
             if let Some(t) = self.terminals.get_mut(self.terminal_active) {
@@ -843,10 +1060,13 @@ impl DotDir {
     }
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
-        if self.vscode_host.expire() {
-            self.extension_logs
-                .append("VS Code commands", "VS Code extension command timed out");
-            self.error("VS Code extension command timed out", cx);
+        if let Some(pending) = self.vscode_host.expire() {
+            self.report_vscode_error(
+                &pending.extension,
+                &pending.command,
+                anyhow::anyhow!("Command timed out"),
+                cx,
+            );
         }
         for _ in 0..200 {
             let Ok(message) = self.rx.try_recv() else {
@@ -854,6 +1074,7 @@ impl DotDir {
             };
             changed = true;
             match message {
+                Message::MountedRoots(roots) => self.mounted_roots = roots,
                 Message::IconTheme(request, result) => {
                     if request != self.icon_theme_request {
                         continue;
@@ -869,6 +1090,31 @@ impl DotDir {
                     }
                 }
                 Message::Lsp(notice) => match notice {
+                    lsp::Notice::CommandsChanged => {}
+                    lsp::Notice::QuickPick {
+                        session,
+                        request,
+                        reply,
+                    } => {
+                        if self.modal.is_none()
+                            && self
+                                .vscode_language_command
+                                .is_some_and(|(_, owner)| owner == session)
+                        {
+                            self.show_modal(
+                                Modal::QuickPick {
+                                    session,
+                                    request,
+                                    reply,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    lsp::Notice::QuickPickClosed { session } => {
+                        self.dismiss_quick_pick(session, window, cx);
+                    }
                     lsp::Notice::Ready { session, document } => {
                         if let Some(doc) = self.documents.get_mut(&document)
                             && let Some(buffer) = doc
@@ -911,6 +1157,7 @@ impl DotDir {
                         }
                     }
                     lsp::Notice::Failed { session, error } => {
+                        self.dismiss_quick_pick(session, window, cx);
                         for doc in self.documents.values_mut().filter(|doc| {
                             doc.lsp
                                 .as_ref()
@@ -1014,8 +1261,9 @@ impl DotDir {
                                 }
                                 continue;
                             }
-                            let (text, readonly) = match String::from_utf8(bytes.clone()) {
-                                Ok(text) => (text, readonly),
+                            let (text, readonly, line_wrap) = match String::from_utf8(bytes.clone())
+                            {
+                                Ok(text) => (text, readonly, Some(true)),
                                 Err(_) => {
                                     let text = bytes
                                         .chunks(16)
@@ -1038,7 +1286,7 @@ impl DotDir {
                                         })
                                         .collect::<Vec<_>>()
                                         .join("\n");
-                                    (text, true)
+                                    (text, true, None)
                                 }
                             };
                             // A second pane may have completed the same canonical path first.
@@ -1055,6 +1303,7 @@ impl DotDir {
                                 let input = cx.new(|cx| {
                                     EditorState::new(window, cx)
                                         .language(language)
+                                        .soft_wrap(line_wrap.unwrap_or(true))
                                         .default_value(text)
                                 });
                                 let subscription =
@@ -1102,6 +1351,7 @@ impl DotDir {
                                         version: Cell::new(1),
                                         dirty_cache: Cell::new(None),
                                         readonly,
+                                        line_wrap,
                                         saving: false,
                                         error: None,
                                         lsp: None,
@@ -1163,24 +1413,24 @@ impl DotDir {
                         }
                     }
                 }
-                Message::Extension(result) => match result {
-                    Ok(e) => {
-                        if let Some(i) = self
-                            .extensions
-                            .iter()
-                            .position(|x| x.manifest.id == e.manifest.id)
-                        {
-                            self.extensions[i] = e;
-                        } else {
-                            self.extensions.push(e);
+                Message::Extension(result) => {
+                    match result {
+                        Ok(e) => {
+                            self.extension_logs.register(&e.manifest.id);
+                            if let Some(i) = self
+                                .extensions
+                                .iter()
+                                .position(|x| x.manifest.id == e.manifest.id)
+                            {
+                                self.extensions[i] = e;
+                            } else {
+                                self.extensions.push(e);
+                            }
+                            self.refresh_directories(|path| matches!(path, Location::Provider(address) if address.is_log()));
                         }
+                        Err(e) => self.report_extension_error(e.to_string()),
                     }
-                    Err(e) => {
-                        let error = e.to_string();
-                        self.extension_logs.append("DotDir extensions", &error);
-                        self.extension_errors.push(error);
-                    }
-                },
+                }
                 Message::VsCode(event) => self.handle_vscode(event, window, cx),
                 Message::ExtensionReply {
                     request,
@@ -1373,6 +1623,7 @@ pub(crate) struct Document {
     // or redraws. Keep undo-to-saved detection without allocating the full text.
     dirty_cache: Cell<Option<bool>>,
     pub readonly: bool,
+    line_wrap: Option<bool>,
     pub saving: bool,
     pub error: Option<String>,
     pub lsp: Option<Rc<lsp::Buffer>>,
@@ -1508,6 +1759,13 @@ pub(crate) struct Pane {
     pub tabs: Vec<Tab>,
     pub active: usize,
 }
+
+#[derive(Default)]
+pub(crate) struct TabStripScroll {
+    pub handle: ScrollHandle,
+    pub last_selected: Option<(usize, u64)>,
+}
+
 impl Pane {
     fn insert_after_active(&mut self, tab: Tab) {
         let index = (self.active + 1).min(self.tabs.len());
@@ -1580,6 +1838,12 @@ pub(crate) enum Modal {
         description: String,
     },
     Palette,
+    QuickPick {
+        session: u64,
+        request: vscode::QuickPick,
+        reply: mpsc::Sender<usize>,
+    },
+    PanelMenu(PanelMenu),
     Settings,
     Extensions,
     ExtensionLogs,
@@ -1604,6 +1868,7 @@ pub(crate) struct DotDir {
     pub terminal_focus: FocusHandle,
     pub modal_focus: FocusHandle,
     pub panes: [Pane; 2],
+    pub tab_strip_scrolls: [TabStripScroll; 2],
     pub panel_scrolls: HashMap<u64, ColumnScroll>,
     pub active: usize,
     pub documents: HashMap<u64, Document>,
@@ -1614,10 +1879,13 @@ pub(crate) struct DotDir {
     pub icon_theme_request: u64,
     pub command_line: Entity<InputState>,
     pub dialog_input: Entity<InputState>,
+    pub jump_input: Entity<InputState>,
     pub search_content: Entity<InputState>,
     pub modal: Option<Modal>,
     pub modal_error: Option<String>,
     pub palette_cursor: usize,
+    pub mounted_roots: Vec<PathBuf>,
+    pub panel_menu_scroll: ScrollHandle,
     pub operation: Option<Operation>,
     pub copy_options: CopyOptions,
     pub terminals: Vec<Terminal>,
@@ -1628,11 +1896,13 @@ pub(crate) struct DotDir {
     pub extension_host: ExtensionHost,
     pub vscode_extensions: Vec<vscode::Extension>,
     vscode_host: vscode::Host,
+    vscode_language_command: Option<(u64, u64)>,
     language_servers: LanguageServers,
     pub hover: HoverHints,
     source_jump: [Option<(u64, lsp_types::Position)>; 2],
     pub extension_errors: Vec<String>,
     pub extension_logs: ExtensionLogs,
+    filesystems: Filesystems,
     pub extension_log_scroll: ScrollHandle,
     pub search: Option<SearchState>,
     pub status: String,
@@ -1658,7 +1928,14 @@ impl DotDir {
     ) -> Self {
         let mut settings = Settings::load(&settings_path);
         if let Some(path) = initial {
-            if path.is_dir() {
+            if let Some(path) = path
+                .to_str()
+                .and_then(|path| ProviderPath::parse(path).ok().flatten())
+            {
+                settings.left = vec![SavedLocation::Provider { uri: path }];
+                settings.active_pane = 0;
+                settings.left_active = 0;
+            } else if path.is_dir() {
                 settings.left = vec![SavedLocation::Local(path.clone())];
                 settings.right = vec![SavedLocation::Local(path)];
             } else if path.is_file() && is_zip(&path) {
@@ -1673,7 +1950,8 @@ impl DotDir {
         palette.apply(&settings.theme, cx);
         let (tx, rx) = mpsc::channel();
         let lsp_tx = tx.clone();
-        let extension_logs = ExtensionLogs::default();
+        let extension_logs =
+            ExtensionLogs::with_error_file(&settings_path.with_file_name(ERROR_LOG_NAME));
         let language_servers = LanguageServers::new(
             settings_path
                 .parent()
@@ -1695,6 +1973,7 @@ impl DotDir {
         focus.focus(window, cx);
         let command_line = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         let dialog_input = cx.new(|cx| InputState::new(window, cx));
+        let jump_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type filename…"));
         let search_content =
             cx.new(|cx| InputState::new(window, cx).placeholder("Containing text (optional)"));
         let subscriptions = vec![
@@ -1717,6 +1996,11 @@ impl DotDir {
                     _ => {}
                 },
             ),
+            cx.subscribe_in(&jump_input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.select_jump_match(JumpStep::First, window, cx);
+                }
+            }),
             cx.subscribe_in(
                 &search_content,
                 window,
@@ -1783,6 +2067,7 @@ impl DotDir {
             terminal_focus: cx.focus_handle(),
             modal_focus: cx.focus_handle(),
             panes,
+            tab_strip_scrolls: Default::default(),
             panel_scrolls: HashMap::new(),
             active: settings.active_pane,
             documents: HashMap::new(),
@@ -1791,10 +2076,13 @@ impl DotDir {
             icon_theme_request: 0,
             command_line,
             dialog_input,
+            jump_input,
             search_content,
             modal: None,
             modal_error: None,
             palette_cursor: 0,
+            mounted_roots: vec![],
+            panel_menu_scroll: ScrollHandle::new(),
             operation: None,
             copy_options: CopyOptions::default(),
             terminals: vec![],
@@ -1805,10 +2093,12 @@ impl DotDir {
             extension_host: host,
             vscode_extensions: vec![],
             vscode_host,
+            vscode_language_command: None,
             language_servers,
             hover: HoverHints::default(),
             source_jump: [None, None],
             extension_errors: vec![],
+            filesystems: Filesystems::new(extension_logs.clone()),
             extension_logs,
             extension_log_scroll: ScrollHandle::new(),
             search: None,
@@ -1830,6 +2120,7 @@ impl DotDir {
         };
         this.panes[0].active = this.settings.left_active.min(this.panes[0].tabs.len() - 1);
         this.panes[1].active = this.settings.right_active.min(this.panes[1].tabs.len() - 1);
+        this.load_extensions();
         let ids = this
             .panes
             .iter()
@@ -1838,7 +2129,6 @@ impl DotDir {
         for id in ids {
             this.reload(id);
         }
-        this.load_extensions();
         if let Some(path) = this.settings.icon_theme.clone() {
             this.load_icon_theme(path, cx);
         }
@@ -1917,7 +2207,7 @@ impl DotDir {
                 _ => None,
             })
     }
-    fn pane_location(&self, pane: usize) -> Location {
+    pub(crate) fn pane_location(&self, pane: usize) -> Location {
         match self.panes[pane]
             .tabs
             .get(self.panes[pane].active)
@@ -1947,7 +2237,7 @@ impl DotDir {
         }
     }
     pub fn archive_active(&self, pane: usize) -> bool {
-        self.pane_location(pane).local().is_none()
+        matches!(self.pane_location(pane), Location::Zip { .. })
     }
     pub fn cwd(&self, pane: usize) -> PathBuf {
         let location = self.pane_location(pane);
@@ -1956,9 +2246,9 @@ impl DotDir {
         } else {
             location
                 .host_path()
-                .parent()
+                .and_then(Path::parent)
                 .map(PathBuf::from)
-                .unwrap_or_default()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
         }
     }
     pub fn active_document(&self) -> Option<u64> {
@@ -1973,6 +2263,7 @@ impl DotDir {
     }
     pub fn reload(&mut self, id: u64) {
         let hidden = self.settings.show_hidden;
+        let filesystems = self.filesystems.clone();
         if let Some(d) = self.directory_by_id(id) {
             d.generation += 1;
             d.loading = true;
@@ -1984,12 +2275,20 @@ impl DotDir {
                 let _ = tx.send(Message::Directory(
                     id,
                     generation,
-                    read_location(&path, hidden, sort),
+                    read_location(&path, &filesystems, hidden, sort),
                 ));
             });
         }
     }
     pub fn refresh_all(&mut self) {
+        self.refresh_directories(|_| true);
+    }
+
+    pub fn refresh_provider_directories(&mut self) {
+        self.refresh_directories(|path| matches!(path, Location::Provider(_)));
+    }
+
+    fn refresh_directories(&mut self, matches: impl Fn(&Location) -> bool) {
         let ids = self
             .panes
             .iter()
@@ -2002,6 +2301,7 @@ impl DotDir {
                 }
             })
             .flatten()
+            .filter(|d| matches(&d.path))
             .map(|d| d.id)
             .collect::<Vec<_>>();
         for id in ids {
@@ -2152,6 +2452,10 @@ impl DotDir {
         let view = cx.weak_entity();
         window.on_next_frame(move |window, cx| {
             let _ = view.update(cx, |this, cx| {
+                if matches!(&this.modal, Some(Modal::PanelMenu(menu)) if menu.is_jump()) {
+                    this.jump_input.update(cx, |s, cx| s.focus(window, cx));
+                    return;
+                }
                 let input = match &this.modal {
                     Some(Modal::Palette | Modal::Search) => true,
                     Some(Modal::Prompt { kind, .. }) => !matches!(
@@ -2213,34 +2517,53 @@ impl DotDir {
             return;
         }
 
-        let (tab, load) = if duplicate {
-            self.duplicate_tab(source, index)
-        } else {
-            let fallback = self.pane_location(source);
-            let mut tab = self.panes[source].remove_tab(index);
-            tab.make_permanent();
-            self.open_request[source] += 1;
-            self.ensure_directory_tab(source, fallback);
-            // A preview in the destination can no longer follow a source that
-            // now lives beside it in the same pane.
-            for preview in &mut self.panes[destination].tabs {
-                if preview.preview_source == Some(id) {
-                    preview.make_permanent();
-                }
+        if duplicate {
+            self.insert_duplicated_tab(source, index, destination, slot, window, cx);
+            return;
+        }
+        let fallback = self.pane_location(source);
+        let mut tab = self.panes[source].remove_tab(index);
+        tab.make_permanent();
+        self.open_request[source] += 1;
+        self.ensure_directory_tab(source, fallback);
+        // A preview in the destination can no longer follow a source that
+        // now lives beside it in the same pane.
+        for preview in &mut self.panes[destination].tabs {
+            if preview.preview_source == Some(id) {
+                preview.make_permanent();
             }
-            (tab, None)
-        };
+        }
+        self.panes[destination].tabs.insert(slot, tab);
+        self.set_tab(destination, slot, window, cx);
+        self.reveal_column(destination, false);
+    }
 
+    pub(crate) fn duplicate_panel_tab(
+        &mut self,
+        pane: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = &self.panes[pane];
+        self.insert_duplicated_tab(pane, panel.active, pane, panel.tabs.len(), window, cx);
+    }
+
+    fn insert_duplicated_tab(
+        &mut self,
+        source: usize,
+        index: usize,
+        destination: usize,
+        slot: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (tab, load) = self.duplicate_tab(source, index);
         let tab_id = tab.id();
-        let directories = if duplicate {
-            match &tab.content {
-                TabContent::Directory(browser) => {
-                    browser.columns.iter().map(|column| column.id).collect()
-                }
-                _ => Vec::new(),
+        let directories = match &tab.content {
+            TabContent::Directory(browser) => {
+                browser.columns.iter().map(|column| column.id).collect()
             }
-        } else {
-            Vec::new()
+            _ => Vec::new(),
         };
         self.panes[destination].tabs.insert(slot, tab);
         self.set_tab(destination, slot, window, cx);
@@ -2250,6 +2573,61 @@ impl DotDir {
         self.reveal_column(destination, false);
         if let Some(path) = load {
             self.open_document_into(destination, path, true, Some(tab_id), window, cx);
+        }
+    }
+
+    fn open_directory_tab(
+        &mut self,
+        pane: usize,
+        path: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.id();
+        let panel = &mut self.panes[pane];
+        panel
+            .tabs
+            .push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
+                id, path,
+            ))));
+        let index = panel.tabs.len() - 1;
+        self.set_tab(pane, index, window, cx);
+        self.reload(id);
+    }
+
+    pub(crate) fn open_panel_location(
+        &mut self,
+        pane: usize,
+        path: Location,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if new_tab {
+            self.open_directory_tab(pane, path, window, cx);
+            return;
+        }
+        let index = self.panes[pane].active;
+        let tab = &self.panes[pane].tabs[index];
+        match tab.content {
+            TabContent::Directory(_) => self.navigate(pane, path, window, cx),
+            TabContent::Document(document)
+                if self
+                    .documents
+                    .get(&document)
+                    .is_some_and(|document| document.saving || document.dirty(cx)) =>
+            {
+                self.open_directory_tab(pane, path, window, cx);
+            }
+            _ => {
+                let tab_id = tab.id();
+                let id = self.id();
+                let browser = DirectoryBrowser::new(id, path);
+                self.panes[pane].tabs[index] = Tab::with_id(tab_id, TabContent::Directory(browser));
+                self.release_unused_documents();
+                self.set_tab(pane, index, window, cx);
+                self.reload(id);
+            }
         }
     }
 
@@ -2338,6 +2716,7 @@ impl DotDir {
             cx.new(|cx| {
                 EditorState::new(window, cx)
                     .language(language)
+                    .soft_wrap(doc.line_wrap.unwrap_or(true))
                     .default_value(text)
             })
         });
@@ -2537,7 +2916,10 @@ impl DotDir {
         cx.notify();
     }
     pub fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
-        let has_input = matches!(&modal, Modal::Palette | Modal::Search);
+        let has_input = matches!(
+            &modal,
+            Modal::Palette | Modal::Search | Modal::QuickPick { .. }
+        );
         self.modal = Some(modal);
         self.modal_error = None;
         self.palette_cursor = 0;
@@ -2552,6 +2934,21 @@ impl DotDir {
         }
         cx.notify();
     }
+
+    pub fn accept_quick_pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Modal::QuickPick { reply, .. }) = &self.modal {
+            let _ = reply.send(index);
+            self.dismiss(window, cx);
+        }
+    }
+
+    fn dismiss_quick_pick(&mut self, session: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(&self.modal, Some(Modal::QuickPick { session: owner, .. }) if *owner == session)
+        {
+            self.dismiss(window, cx);
+        }
+    }
+
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(Modal::Conflict { reply, .. }) = self.modal.take() {
             let _ = reply.send(ConflictResolution::Cancel);
@@ -2567,10 +2964,18 @@ impl DotDir {
     }
     pub fn error(&mut self, e: impl ToString, cx: &mut Context<Self>) {
         self.status = e.to_string();
+        self.extension_logs
+            .source("dotdir", "DotDir")
+            .error(&self.status);
         cx.notify();
     }
     pub fn run(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal.is_some() && !matches!(id, "escape" | "quit" | "palette") {
+        let switches_panel_menu = matches!(self.modal, Some(Modal::PanelMenu(_)))
+            && matches!(id, "left-panel-menu" | "right-panel-menu");
+        if self.modal.is_some()
+            && !switches_panel_menu
+            && !matches!(id, "escape" | "quit" | "palette")
+        {
             return;
         }
         if !self.command_available(id, cx) {
@@ -2589,6 +2994,8 @@ impl DotDir {
         }
         let (rows, columns) = self.layout(window);
         match id {
+            "left-panel-menu" => self.open_panel_menu(0, window, cx),
+            "right-panel-menu" => self.open_panel_menu(1, window, cx),
             "keep-preview" => {
                 if let Some((pane, index)) = self.preview_target() {
                     self.panes[pane].tabs[index].make_permanent();
@@ -2704,18 +3111,8 @@ impl DotDir {
                 }
             }
             "new-tab" => {
-                self.open_request[self.active] += 1;
-                let id = self.id();
                 let path = self.pane_location(self.active);
-                let p = &mut self.panes[self.active];
-                p.tabs
-                    .push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
-                        id, path,
-                    ))));
-                p.active = p.tabs.len() - 1;
-                self.reload(id);
-                self.focus_pane(self.active, window, cx);
-                self.persist();
+                self.open_directory_tab(self.active, path, window, cx);
             }
             "next-tab" => {
                 let p = &self.panes[self.active];
@@ -2727,14 +3124,22 @@ impl DotDir {
                 let id = p.tabs[p.active].id();
                 self.request_close_tab(self.active, id, window, cx);
             }
-            "location" => self.prompt(
-                PromptKind::Location,
-                "Go to directory",
-                "Enter a directory or ZIP archive path.".into(),
-                self.cwd(self.active).to_string_lossy().into_owned(),
-                window,
-                cx,
-            ),
+            "location" => {
+                let location = self.pane_location(self.active);
+                let path = if matches!(location, Location::Provider(_)) {
+                    location.display()
+                } else {
+                    self.cwd(self.active).display().to_string()
+                };
+                self.prompt(
+                    PromptKind::Location,
+                    "Go to directory",
+                    "Enter a directory, ZIP archive, or filesystem URI.".into(),
+                    path,
+                    window,
+                    cx,
+                );
+            }
             "mkdir" => self.prompt(
                 PromptKind::Mkdir,
                 "Make directory",
@@ -2843,7 +3248,7 @@ impl DotDir {
                     selected.len(),
                     directory.path.display()
                 );
-                let destination = if self.archive_active(1 - self.active) {
+                let destination = if self.pane_location(1 - self.active).local().is_none() {
                     String::new()
                 } else {
                     self.cwd(1 - self.active).display().to_string()
@@ -2887,6 +3292,22 @@ impl DotDir {
                     self.navigate(1 - self.active, path, window, cx);
                 }
             }
+            "toggle-line-wrap" => {
+                let Some(doc) = self
+                    .active_document()
+                    .and_then(|id| self.documents.get_mut(&id))
+                else {
+                    return;
+                };
+                let Some(wrapped) = doc.line_wrap else {
+                    return;
+                };
+                doc.line_wrap = Some(!wrapped);
+                for editor in std::iter::once(&doc.input).chain(doc.inactive_view.as_ref()) {
+                    editor.update(cx, |state, cx| state.set_soft_wrap(!wrapped, window, cx));
+                }
+                self.dismiss_hover(cx);
+            }
             "palette" => self.show_modal(Modal::Palette, window, cx),
             "settings" => self.show_modal(Modal::Settings, window, cx),
             "extensions" => self.show_modal(Modal::Extensions, window, cx),
@@ -2929,7 +3350,7 @@ impl DotDir {
                 }
             }
             "quit" => self.request_quit(window, cx),
-            id if id.starts_with("vscode:") => self.invoke_vscode(id, cx),
+            id if id.starts_with("vscode:") => self.invoke_vscode(id, window, cx),
             _ => {
                 if let Some((ext, c)) = self.extensions.iter().find_map(|e| {
                     e.contributions
@@ -3334,11 +3755,12 @@ impl DotDir {
             self.open_request[pane]
         };
         let tx = self.tx.clone();
+        let filesystems = self.filesystems.clone();
         if tab.is_none() {
             self.status = format!("Opening {}…", path.display());
         }
         std::thread::spawn(move || {
-            let result = path.read_preview();
+            let result = path.read_preview(&filesystems);
             let _ = tx.send(Message::Opened {
                 request,
                 pane,
