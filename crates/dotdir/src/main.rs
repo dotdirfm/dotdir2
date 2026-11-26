@@ -14,6 +14,7 @@ mod syntax;
 mod terminal;
 mod theme;
 mod ui;
+mod vscode;
 
 use gpui_kit::*;
 fn main() {

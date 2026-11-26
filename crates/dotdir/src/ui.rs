@@ -1098,6 +1098,35 @@ impl DotDir {
                     }
                     content = content.child(row);
                 }
+                for extension in &self.vscode_extensions {
+                    let id = extension.id.clone();
+                    let enabled = self.settings.vscode.enabled(&id);
+                    content = content.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .p(px(12.))
+                            .border_1()
+                            .border_color(p.border)
+                            .rounded(px(4.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(text(format!(
+                                        "{}  {}",
+                                        extension.title, extension.version
+                                    )))
+                                    .child(text(format!("VS Code · {id}")).text_color(p.muted)),
+                            )
+                            .child(self.button(
+                                SharedString::from(format!("vscode-extension-{id}")),
+                                if enabled { "Disable" } else { "Enable" },
+                                move |this, _, cx| this.toggle_vscode_extension(&id, cx),
+                                cx,
+                            )),
+                    );
+                }
                 for error in &self.extension_errors {
                     content = content.child(text(error.clone()).text_color(p.error));
                 }

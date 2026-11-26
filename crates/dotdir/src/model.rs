@@ -559,6 +559,7 @@ pub struct Settings {
     pub right_active: usize,
     pub active_pane: usize,
     pub terminal_height: f32,
+    pub vscode: crate::vscode::Settings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -576,6 +577,7 @@ impl Default for Settings {
             right_active: 0,
             active_pane: 0,
             terminal_height: 240.,
+            vscode: Default::default(),
         }
     }
 }

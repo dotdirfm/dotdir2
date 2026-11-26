@@ -23,6 +23,7 @@ pub(crate) fn language_for(path: &Path) -> &'static str {
         Some("ts" | "tsx" | "mts" | "cts") => "typescript",
         Some("json" | "jsonc") => "json",
         Some("toml") => "toml",
+        Some("yaml" | "yml") => "yaml",
         Some("css") => "css",
         Some("md") => "markdown",
         Some("sh" | "zsh" | "bash") => "bash",
@@ -55,6 +56,7 @@ mod tests {
                 "package main\nfunc main() { println(42) }\n",
             ),
             ("main.py", "python", "def answer():\n    return 42\n"),
+            ("config.yml", "yaml", "replicas: 42\n"),
             ("api.pyi", "python", "def answer() -> int: ...\n"),
             (
                 "main.pl",

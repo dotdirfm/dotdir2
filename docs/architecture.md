@@ -71,7 +71,7 @@ the file panes and application chrome are custom GPUI elements.
   before refreshing both panes. Completed filesystem changes are not rolled back.
 - Terminal sessions own real PTYs, Alacritty terminal grids, and parser workers.
   Rendering and keyboard input are native. Closing a terminal kills its child.
-- Each JavaScript extension has a QuickJS runtime on the extension worker.
+- Each DotDir JavaScript extension has a QuickJS runtime on the extension worker.
   The application only receives serializable contributions and UI data.
 - Media viewer entities own their gallery snapshot, file watcher, GPUI image
   source or native AVKit player. Directory enumeration runs in the background;
@@ -116,7 +116,23 @@ Build-option or vendored engine changes must bump `CACHE_ABI`.
 
 Install local extensions under the native config directory's `extensions/` folder.
 Reload through the Extensions dialog. This API does not claim compatibility with
-the original DOM-based viewers or the VS Code shim.
+the original DOM-based viewers.
+
+## VS Code extension host
+
+DotDir reads commands and configuration defaults from unpacked VS Code
+extension manifests. F11 enables individual packages. F1 shows commands from
+enabled packages when an editable text tab is active. The first command starts
+an installed Node.js executable and activates the extension's `main` module.
+Node provides module loading and its on-disk compilation cache. The host
+supplies a small `vscode` module with commands, configuration reads, and
+active-editor document and selection objects.
+
+Rust and Node exchange JSON messages over stdio. Rust owns the live text
+buffer and checks each edit against the original document, snapshot version,
+and UTF-16 ranges before applying it as one editor undo transaction. The host
+receives the updated document after each accepted edit. A stalled command
+times out and the next command starts a fresh process.
 
 ## Compatibility boundaries
 
@@ -128,8 +144,8 @@ WASM filesystem-provider loading and specialized PDF and SQLite surfaces are
 separate remaining porting work. Image/video viewing has a native renderer.
 Video and AVIF currently use macOS APIs. ZIP entry previews cover text, images,
 and hex. Language-server integration covers document sync, diagnostics, completion,
-hover, and definition. Project-wide watch registration and the VS Code
-JavaScript extension host are separate work.
+hover, and definition. Project-wide watch registration, VS Code language
+extension APIs, and VS Code webviews are separate work.
 
 Native text/hex opening is currently capped at 16 MiB. Search retains the first
 10,000 matching paths. User keybinding changes apply on restart. Platform-specific

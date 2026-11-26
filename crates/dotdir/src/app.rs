@@ -11,6 +11,7 @@ use crate::{
     syntax::language_for,
     terminal::Terminal,
     theme::Palette,
+    vscode,
 };
 use dotdir_core::{
     copy::{CancelToken, ConflictResolution, CopyEvent, CopyOptions},
@@ -32,6 +33,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const VSCODE_RUNNING: &str = "Running VS Code extension…";
+
 pub(crate) enum Message {
     IconTheme(u64, anyhow::Result<Box<IconTheme>>),
     Lsp(lsp::Notice),
@@ -52,6 +55,7 @@ pub(crate) enum Message {
     },
     Search(u64, FileSearchEvent),
     Extension(anyhow::Result<LoadedExtension>),
+    VsCode(vscode::Event),
     ExtensionReply {
         request: u64,
         target: Option<u64>,
@@ -241,6 +245,8 @@ impl DotDir {
     pub fn filtered_commands(&self, cx: &App) -> Vec<(String, String, String)> {
         let query = self.dialog_input.read(cx).value().to_lowercase();
         let state = self.command_state(cx);
+        let vscode_available =
+            self.vscode_document().is_some() && self.vscode_host.pending.is_none();
         COMMANDS
             .iter()
             .filter(|command| command.available(&state))
@@ -270,6 +276,13 @@ impl DotDir {
                     .filter(|c| c.viewer.is_none())
                     .map(|c| (c.id.clone(), c.title.clone(), "Extension".into()))
             }))
+            .chain(
+                self.vscode_commands()
+                    .filter(|_| vscode_available)
+                    .map(|(_, command)| {
+                        (command.id.clone(), command.title.clone(), "VS Code".into())
+                    }),
+            )
             .filter(|(id, title, _)| {
                 query
                     .split_whitespace()
@@ -315,6 +328,11 @@ impl DotDir {
     pub fn command_available(&self, id: &str, cx: &App) -> bool {
         if let Some(command) = COMMANDS.iter().find(|command| command.id == id) {
             return command.available(&self.command_state(cx));
+        }
+        if id.starts_with("vscode:") {
+            return self.vscode_document().is_some()
+                && self.vscode_host.pending.is_none()
+                && self.vscode_commands().any(|(_, command)| command.id == id);
         }
         // API v1 extension commands are global; viewer registrations aren't
         // executable commands. They still obey the shared modal execution gate.
@@ -409,7 +427,10 @@ impl DotDir {
             roots.push(bundle);
         }
         if let Some(base) = self.settings_path.parent() {
-            roots.push(base.join("extensions"));
+            let directory = base.join("extensions");
+            self.vscode_extensions = vscode::discover(&directory);
+            self.reset_vscode_host();
+            roots.push(directory);
         }
         let mut seen = std::collections::HashSet::new();
         for root in roots {
@@ -432,6 +453,178 @@ impl DotDir {
                 }
             }
         }
+    }
+
+    fn vscode_commands(
+        &self,
+    ) -> impl Iterator<Item = (&vscode::Extension, &vscode::ExtensionCommand)> {
+        self.vscode_extensions
+            .iter()
+            .filter(|extension| self.settings.vscode.enabled(&extension.id))
+            .flat_map(|extension| {
+                extension
+                    .commands
+                    .iter()
+                    .map(move |command| (extension, command))
+            })
+    }
+
+    fn vscode_document(&self) -> Option<&Document> {
+        if !self.panels_visible {
+            return None;
+        }
+        self.documents
+            .get(&self.active_document()?)
+            .filter(|document| !document.readonly && document.path.local().is_some())
+    }
+
+    pub fn toggle_vscode_extension(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.settings.vscode.enabled(id) {
+            self.settings
+                .vscode
+                .enabled
+                .retain(|entry| !entry.eq_ignore_ascii_case(id));
+            self.reset_vscode_host();
+        } else {
+            self.settings.vscode.enabled.push(id.into());
+        }
+        self.persist();
+        cx.notify();
+    }
+
+    fn reset_vscode_host(&mut self) {
+        self.vscode_host.reset();
+        if self.status == VSCODE_RUNNING {
+            self.status.clear();
+        }
+    }
+
+    fn invoke_vscode(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        let id = self.id();
+        let Some(document) = self.vscode_document() else {
+            return;
+        };
+        let Some((extension, command)) = self
+            .vscode_commands()
+            .find(|(_, command)| command.id == command_id)
+        else {
+            return;
+        };
+        let editor = document.input.read(cx);
+        let text = editor.text().clone();
+        let snapshot = vscode::Snapshot::new(
+            document.path.local().expect("local editor"),
+            document.version.get(),
+            &text,
+            editor.selected_range(),
+            editor.is_selection_reversed(),
+        );
+        let document_id = document.id;
+        let invocation = extension.invocation(command, &self.settings.vscode, id, snapshot);
+        match self
+            .vscode_host
+            .run(&self.settings.vscode, invocation, document_id, text)
+        {
+            Ok(()) => self.status = VSCODE_RUNNING.into(),
+            Err(error) => self.error(error, cx),
+        }
+        cx.notify();
+    }
+
+    fn handle_vscode(&mut self, event: vscode::Event, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.vscode_host.is_current(event.process) {
+            return;
+        }
+        let reply = match event.reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                let running = self.vscode_host.pending.is_some();
+                self.vscode_host.reset();
+                if running {
+                    self.error(error, cx);
+                }
+                return;
+            }
+        };
+        match reply {
+            vscode::Reply::Edit {
+                id,
+                serial,
+                version,
+                edits,
+            } => {
+                let updated = self.apply_vscode_edit(id, version, edits, window, cx);
+                if updated.is_none() && self.status == VSCODE_RUNNING {
+                    self.status = "VS Code extension edit rejected because the buffer changed or the edit was invalid".into();
+                }
+                if let Err(error) = self.vscode_host.acknowledge(id, serial, updated) {
+                    self.error(error, cx);
+                }
+            }
+            vscode::Reply::Done { id, error } => {
+                if self
+                    .vscode_host
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == id)
+                {
+                    self.vscode_host.pending = None;
+                    if let Some(error) = error {
+                        self.error(format!("VS Code extension: {error}"), cx);
+                    } else if self.status == VSCODE_RUNNING {
+                        self.status.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_vscode_edit(
+        &mut self,
+        id: u64,
+        version: u64,
+        edits: Vec<vscode::Edit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<vscode::Snapshot> {
+        let pending = self.vscode_host.pending.as_mut()?;
+        if id != pending.id || version != pending.version {
+            return None;
+        }
+        let document = self
+            .documents
+            .get(&pending.document)
+            .filter(|doc| !doc.readonly)?;
+        let path = document.path.local()?;
+        document.input.update(cx, |editor, cx| {
+            if editor.text() != &pending.text {
+                return None;
+            }
+            let batch = vscode::EditBatch::prepare(editor.text(), edits)?;
+            let unchanged = editor
+                .text()
+                .slice(batch.range.clone())
+                .bytes()
+                .eq(batch.text.bytes());
+            if !unchanged {
+                let selection = editor.selected_range();
+                let reversed = editor.is_selection_reversed();
+                let translated = batch.translate(selection.start)..batch.translate(selection.end);
+                editor.unmark_text(window, cx);
+                editor.set_selected_range(batch.range, cx);
+                editor.replace(batch.text, window, cx);
+                editor.set_selected_range_with_direction(translated, reversed, cx);
+                pending.version += 1;
+                pending.text = editor.text().clone();
+            }
+            Some(vscode::Snapshot::new(
+                path,
+                pending.version,
+                editor.text(),
+                editor.selected_range(),
+                editor.is_selection_reversed(),
+            ))
+        })
     }
     pub fn extension_context(&self) -> serde_json::Value {
         let source = if self.directory(self.active).is_some() {
@@ -608,6 +801,9 @@ impl DotDir {
     }
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        if self.vscode_host.expire() {
+            self.error("VS Code extension command timed out", cx);
+        }
         for _ in 0..200 {
             let Ok(message) = self.rx.try_recv() else {
                 break;
@@ -820,6 +1016,7 @@ impl DotDir {
                                         if matches!(event, InputEvent::Change)
                                             && let Some(doc) = this.documents.get(&id)
                                         {
+                                            doc.version.set(doc.version.get() + 1);
                                             if let Some(view) = &doc.inactive_view {
                                                 let text = input.read(cx).value();
                                                 view.update(cx, |editor, cx| {
@@ -856,6 +1053,7 @@ impl DotDir {
                                         input,
                                         inactive_view: None,
                                         saved: bytes,
+                                        version: Cell::new(1),
                                         dirty_cache: Cell::new(None),
                                         readonly,
                                         saving: false,
@@ -933,6 +1131,7 @@ impl DotDir {
                     }
                     Err(e) => self.extension_errors.push(e.to_string()),
                 },
+                Message::VsCode(event) => self.handle_vscode(event, window, cx),
                 Message::ExtensionReply {
                     request,
                     target,
@@ -1107,6 +1306,7 @@ pub(crate) struct Document {
     pub input: Entity<EditorState>,
     pub inactive_view: Option<Entity<EditorState>>,
     pub saved: Vec<u8>,
+    version: Cell<u64>,
     // Invalidated by text changes and successful saves, never by cursor movement
     // or redraws. Keep undo-to-saved detection without allocating the full text.
     dirty_cache: Cell<Option<bool>>,
@@ -1347,6 +1547,8 @@ pub(crate) struct DotDir {
     pub panels_visible: bool,
     pub extensions: Vec<LoadedExtension>,
     pub extension_host: ExtensionHost,
+    pub vscode_extensions: Vec<vscode::Extension>,
+    vscode_host: vscode::Host,
     language_servers: LanguageServers,
     pub hover: HoverHints,
     source_jump: [Option<(u64, lsp_types::Position)>; 2],
@@ -1395,6 +1597,7 @@ impl DotDir {
                 .parent()
                 .unwrap_or(Path::new("."))
                 .join("extensions"),
+            settings.vscode.node.clone(),
             move |notice| {
                 let _ = lsp_tx.send(Message::Lsp(notice));
             },
@@ -1461,8 +1664,12 @@ impl DotDir {
         });
         let cache = dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("dev.dotdir.native/quickjs");
-        let host = ExtensionHost::new(cache);
+            .join("dev.dotdir.native");
+        let host = ExtensionHost::new(cache.join("quickjs"));
+        let vscode_tx = tx.clone();
+        let vscode_host = vscode::Host::new(cache.join("node"), move |event| {
+            let _ = vscode_tx.send(Message::VsCode(event));
+        });
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
@@ -1513,6 +1720,8 @@ impl DotDir {
             panels_visible: true,
             extensions: vec![],
             extension_host: host,
+            vscode_extensions: vec![],
+            vscode_host,
             language_servers,
             hover: HoverHints::default(),
             source_jump: [None, None],
@@ -2635,6 +2844,7 @@ impl DotDir {
                 }
             }
             "quit" => self.request_quit(window, cx),
+            id if id.starts_with("vscode:") => self.invoke_vscode(id, cx),
             _ => {
                 if let Some((ext, c)) = self.extensions.iter().find_map(|e| {
                     e.contributions

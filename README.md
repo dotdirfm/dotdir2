@@ -145,6 +145,31 @@ add the matching native binary from the
 Rust projects use the same diagnostics, hover, completion, and definition
 features as TypeScript.
 
+**Red Hat YAML** starts when you open a `.yaml` or `.yml` file in Edit.
+DotDir runs the bundled YAML Language Server from the unpacked
+`redhat.vscode-yaml` extension using Node.js. It supports schema diagnostics,
+completions, and hover documentation, including local schemas referenced by a
+`# yaml-language-server: $schema=./schema.json` comment.
+
+**VS Code editor commands** run in a separate, on-demand Node.js process.
+DotDir uses Node.js 22.15 or newer from PATH, common macOS install locations,
+or nvm. To choose an executable, set `vscode.node` in `settings.json` to its
+absolute path.
+
+1. Unpack the [Sort Lines VSIX](https://marketplace.visualstudio.com/items?itemName=Tyriar.sort-lines)
+   into a subdirectory of `<config>/extensions` so that the subdirectory
+   contains `extension/package.json`. A package with `package.json` directly
+   in the subdirectory also works.
+2. Open **F11 → Reload Extensions**, then enable **Sort lines**.
+3. Open a text file with **F4**, select multiple lines, and run **Sort lines
+   (ascending, case sensitive)** from **F1**. Use **⌘Z** to undo the edit.
+
+The host supports command activation, the active editor and primary selection,
+document reads, and undoable text edits. It reads settings defaults from the
+extension manifest and accepts overrides in `vscode.configuration` using
+dotted keys such as `sortLines.ignoreUnselectedLastLine`. Enabled extensions
+run with the same OS permissions as DotDir.
+
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the
 gallery, **Space** to play/pause, and **Escape** to close. Native macOS video

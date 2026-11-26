@@ -47,6 +47,7 @@ type Notify = Arc<dyn Fn(Notice) + Send + Sync>;
 enum ServerKind {
     TypeScript,
     Rust,
+    Yaml,
 }
 
 impl ServerKind {
@@ -54,6 +55,7 @@ impl ServerKind {
         match self {
             Self::TypeScript => "TypeScript 7",
             Self::Rust => "rust-analyzer",
+            Self::Yaml => "YAML Language Server",
         }
     }
 
@@ -61,6 +63,7 @@ impl ServerKind {
         match self {
             Self::TypeScript => ("typescriptteam", "native-preview"),
             Self::Rust => ("rust-lang", "rust-analyzer"),
+            Self::Yaml => ("redhat", "vscode-yaml"),
         }
     }
 
@@ -88,6 +91,14 @@ impl ServerKind {
                     },
                 })
             }
+            Self::Yaml => Some(Project {
+                root: parent
+                    .ancestors()
+                    .find(|dir| dir.join(".git").exists())
+                    .unwrap_or(parent)
+                    .into(),
+                detached: None,
+            }),
         }
     }
 }
@@ -100,14 +111,20 @@ struct Project {
 
 pub struct LanguageServers {
     extensions: PathBuf,
+    node: Option<PathBuf>,
     sessions: HashMap<(ServerKind, Project), Weak<Connection>>,
     notify: Notify,
 }
 
 impl LanguageServers {
-    pub fn new(extensions: PathBuf, notify: impl Fn(Notice) + Send + Sync + 'static) -> Self {
+    pub fn new(
+        extensions: PathBuf,
+        node: Option<PathBuf>,
+        notify: impl Fn(Notice) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             extensions,
+            node,
             sessions: HashMap::new(),
             notify: Arc::new(notify),
         }
@@ -129,8 +146,14 @@ impl LanguageServers {
             let executable = installed_server(&self.extensions, kind)?
                 .canonicalize()
                 .ok()?;
-            let connection =
-                Connection::start(id, kind, executable, key.1.clone(), self.notify.clone());
+            let connection = Connection::start(
+                id,
+                kind,
+                executable,
+                self.node.clone(),
+                key.1.clone(),
+                self.notify.clone(),
+            );
             self.sessions.insert(key, Arc::downgrade(&connection));
             connection
         };
@@ -210,6 +233,10 @@ fn installed_server(root: &Path, kind: ServerKind) -> Option<PathBuf> {
                     let path = dir.join(format!("server/rust-analyzer{suffix}"));
                     path.is_file().then_some((path, true))
                 }
+                ServerKind::Yaml => {
+                    let path = dir.join("dist/languageserver.js");
+                    path.is_file().then_some((path, true))
+                }
             }?;
             Some((preferred, version, path))
         })
@@ -218,12 +245,13 @@ fn installed_server(root: &Path, kind: ServerKind) -> Option<PathBuf> {
 }
 
 fn language_for(path: &Path) -> Option<(ServerKind, &'static str)> {
-    let (kind, language) = match path.extension()?.to_str()? {
+    let (kind, language) = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "ts" | "mts" | "cts" => (ServerKind::TypeScript, "typescript"),
         "tsx" => (ServerKind::TypeScript, "typescriptreact"),
         "js" | "mjs" | "cjs" => (ServerKind::TypeScript, "javascript"),
         "jsx" => (ServerKind::TypeScript, "javascriptreact"),
         "rs" => (ServerKind::Rust, "rust"),
+        "yaml" | "yml" => (ServerKind::Yaml, "yaml"),
         _ => return None,
     };
     Some((kind, language))
@@ -549,6 +577,7 @@ impl Connection {
         id: u64,
         kind: ServerKind,
         executable: PathBuf,
+        node: Option<PathBuf>,
         project: Project,
         notify: Notify,
     ) -> Arc<Self> {
@@ -561,8 +590,26 @@ impl Connection {
             running: running.clone(),
         });
         std::thread::spawn(move || {
-            let result = Server::start(kind, &executable, &project.root, events, receiver)
-                .and_then(|mut server| server.run(&project, &notify));
+            let options = if kind == ServerKind::Yaml {
+                // The extension passes this directory to its bundled server.
+                executable
+                    .parent()
+                    .map(|dir| json!({"l10nPath": dir.join("l10n")}))
+            } else {
+                project
+                    .detached
+                    .as_ref()
+                    .map(|path| json!({"detachedFiles": [path]}))
+            };
+            let result = Server::start(
+                kind,
+                &executable,
+                node.as_deref(),
+                &project.root,
+                events,
+                receiver,
+            )
+            .and_then(|mut server| server.run(&project, options, &notify));
             running.store(false, Ordering::Relaxed);
             if let Err(error) = result {
                 notify(Notice::Failed {
@@ -652,11 +699,19 @@ impl Server {
     fn start(
         kind: ServerKind,
         executable: &Path,
+        node: Option<&Path>,
         root: &Path,
         events: mpsc::Sender<Event>,
         receiver: mpsc::Receiver<Event>,
     ) -> Result<Self> {
-        let mut command = Command::new(executable);
+        let program = if kind == ServerKind::Yaml {
+            crate::vscode::node_path(node).context(
+                "Node.js is required. Set vscode.node in settings.json to its executable",
+            )?
+        } else {
+            executable.into()
+        };
+        let mut command = Command::new(&program);
         match kind {
             ServerKind::TypeScript => {
                 command.args(["--lsp", "--stdio"]);
@@ -666,6 +721,12 @@ impl Server {
                     command.env("PATH", path);
                 }
             }
+            ServerKind::Yaml => {
+                command
+                    .arg(executable)
+                    .arg("--stdio")
+                    .env_remove("NODE_OPTIONS");
+            }
         }
         let mut child = command
             .current_dir(root)
@@ -673,7 +734,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("Could not start {}", executable.display()))?;
+            .with_context(|| format!("Could not start {}", program.display()))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (outgoing, queue) = mpsc::channel();
@@ -715,17 +776,13 @@ impl Server {
         })
     }
 
-    fn run(&mut self, project: &Project, notify: &Notify) -> Result<()> {
+    fn run(&mut self, project: &Project, options: Option<Value>, notify: &Notify) -> Result<()> {
         let root_uri = file_uri(&project.root).context("Invalid language server project path")?;
         let name = project
             .root
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let options = project
-            .detached
-            .as_ref()
-            .map(|path| json!({"detachedFiles": [path]}));
         self.workspace_folders = json!([{"uri": root_uri, "name": name}]);
         let init = self.request(
             "initialize",
@@ -1223,7 +1280,7 @@ mod tests {
         fs::write(&helper, "pub fn answer() -> u32 { 42 }\n").unwrap();
 
         let (events, notices) = mpsc::channel();
-        let mut servers = LanguageServers::new(installed_extensions_root(), move |notice| {
+        let mut servers = LanguageServers::new(installed_extensions_root(), None, move |notice| {
             let _ = events.send(notice);
         });
         let buffer = servers
@@ -1300,7 +1357,7 @@ mod tests {
         let input = "const answer: number = \"wrong\";\nanswer;\n";
         fs::write(&path, input).unwrap();
         let (events, notices) = mpsc::channel();
-        let mut typescript = LanguageServers::new(root, move |notice| {
+        let mut typescript = LanguageServers::new(root, None, move |notice| {
             let _ = events.send(notice);
         });
         let buffer = typescript
@@ -1331,5 +1388,65 @@ mod tests {
         buffer.change(Rope::from(input.replace("\"wrong\"", "42")));
         assert!(diagnostic(2).is_empty());
         assert_eq!(fs::read_to_string(path).unwrap(), input);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Red Hat YAML extension and Node.js"]
+    fn installed_yaml_validates_and_completes_against_a_local_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("sample.yml");
+        let source = "# yaml-language-server: $schema=./schema.json\nreplicas: wrong\n";
+        fs::write(&path, source).unwrap();
+        fs::write(
+            path.with_file_name("schema.json"),
+            json!({
+                "type": "object",
+                "properties": {
+                    "replicas": {"type": "integer", "description": "Number of instances"},
+                    "image": {"type": "string"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (events, notices) = mpsc::channel();
+        let mut servers = LanguageServers::new(installed_extensions_root(), None, move |notice| {
+            let _ = events.send(notice);
+        });
+        let buffer = servers.attach(1, &path, Rope::from(source)).unwrap();
+        let expect_diagnostics = |revision, matches: &dyn Fn(&[Diagnostic]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match notices
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    Notice::Diagnostics {
+                        document: 1,
+                        revision: actual,
+                        items,
+                    } if actual == revision && matches(&items) => break,
+                    Notice::Failed { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        };
+        expect_diagnostics(1, &|items| {
+            items.iter().any(|item| item.message.contains("integer"))
+        });
+        let hover = query(&buffer, "textDocument/hover", 1, 2);
+        assert_eq!(hover["contents"]["value"], "Number of instances");
+        let completion = query(&buffer, "textDocument/completion", 2, 0);
+        assert!(
+            completion["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["label"] == "image")
+        );
+
+        buffer.change(Rope::from(source.replace("wrong", "2")));
+        expect_diagnostics(2, &|items| items.is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap(), source);
     }
 }
