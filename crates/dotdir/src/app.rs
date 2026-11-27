@@ -8,7 +8,7 @@ use crate::{
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
     hex_file::{self, OpenedFile},
-    hex_view::{HexBuffer, HexView},
+    hex_view::{ByteViewMode, HexBuffer, HexView},
     hover::HoverHints,
     icon_theme::IconTheme,
     lsp::{self, LanguageServers},
@@ -38,7 +38,6 @@ use gpui_kit::{
 };
 use serde_json::json;
 use std::{
-    cell::Cell,
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
@@ -69,10 +68,12 @@ pub(crate) enum Message {
         path: Location,
         readonly: bool,
         tab: Option<u64>,
+        byte_mode: ByteViewMode,
         result: anyhow::Result<OpenedFile>,
     },
     Saved {
         id: u64,
+        version: u64,
         text: String,
         result: anyhow::Result<()>,
     },
@@ -563,6 +564,10 @@ impl DotDir {
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
             file: entry.is_some_and(|entry| !entry.directory && !entry.parent),
+            byte_viewer: self.panels_visible
+                && self
+                    .active_hex()
+                    .is_some_and(|(_, view)| view.read(cx).readonly),
             items: directory.is_some_and(|d| d.entries.iter().any(|e| !e.parent)),
             selection: directory
                 .is_some_and(|d| !d.marked.is_empty() || d.focused().is_some_and(|e| !e.parent)),
@@ -881,7 +886,7 @@ impl DotDir {
             let invocation = (id, buffer.session());
             let pane = self.active;
             let origin = document.id;
-            let version = document.version.get();
+            let version = document.version;
             let (anchor, active) = if reversed {
                 (selection.end, selection.start)
             } else {
@@ -921,7 +926,7 @@ impl DotDir {
                                     if this.modal.is_none()
                                         && this.active == pane
                                         && this.active_document() == Some(origin)
-                                        && this.documents[&origin].version.get() == version =>
+                                        && this.documents[&origin].version == version =>
                                 {
                                     match action {
                                         vscode::LanguageCommandResult::GoToLocation {
@@ -966,7 +971,7 @@ impl DotDir {
         }
         let snapshot = vscode::Snapshot::new(
             document.path.local().expect("local editor"),
-            document.version.get(),
+            document.version,
             &text,
             selection,
             reversed,
@@ -1447,6 +1452,7 @@ impl DotDir {
                     path,
                     readonly,
                     tab,
+                    byte_mode,
                     result,
                 } => {
                     let pane = match tab {
@@ -1518,7 +1524,8 @@ impl DotDir {
                                 })
                                 .unwrap_or_else(|| cx.new(|_| HexBuffer::new(file)));
                             let id = tab.unwrap_or_else(|| self.id());
-                            let content = self.hex_content(id, path, buffer, readonly, window, cx);
+                            let content =
+                                self.hex_content(id, path, buffer, readonly, byte_mode, window, cx);
                             self.install_content(pane, content, tab, window, cx);
                             if tab.is_none() {
                                 self.status.clear();
@@ -1546,9 +1553,10 @@ impl DotDir {
                                 let subscription =
                                     cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
                                         if matches!(event, InputEvent::Change)
-                                            && let Some(doc) = this.documents.get(&id)
+                                            && let Some(doc) = this.documents.get_mut(&id)
                                         {
-                                            doc.version.set(doc.version.get() + 1);
+                                            let was_dirty = doc.dirty();
+                                            doc.version += 1;
                                             if let Some(view) = &doc.inactive_view {
                                                 let text = input.read(cx).value();
                                                 view.update(cx, |editor, cx| {
@@ -1567,16 +1575,12 @@ impl DotDir {
                                             if this.hover.is_for_document(id) && this.hover.clear() {
                                                 cx.notify();
                                             }
-                                            let previous = doc.dirty_cache.replace(None);
                                             // The editor redraws itself. Rebuild the surrounding
                                             // panes only when their modified indicator changes.
-                                            let dirty = doc.dirty(cx);
-                                            if dirty {
+                                            if !was_dirty && doc.dirty() {
                                                 for tab in this.panes.iter_mut().flat_map(|pane| &mut pane.tabs) {
                                                     if matches!(tab.content, TabContent::Document(doc) if doc == id) { tab.make_permanent(); }
                                                 }
-                                            }
-                                            if previous != Some(dirty) {
                                                 cx.notify();
                                             }
                                         }
@@ -1589,8 +1593,8 @@ impl DotDir {
                                         input,
                                         inactive_view: None,
                                         saved: bytes,
-                                        version: Cell::new(1),
-                                        dirty_cache: Cell::new(None),
+                                        version: 1,
+                                        saved_version: 1,
                                         readonly,
                                         line_wrap: Some(true),
                                         saving: false,
@@ -1613,7 +1617,12 @@ impl DotDir {
                         }
                     }
                 }
-                Message::Saved { id, text, result } => {
+                Message::Saved {
+                    id,
+                    version,
+                    text,
+                    result,
+                } => {
                     if let Some(d) = self.documents.get_mut(&id) {
                         d.saving = false;
                         match result {
@@ -1622,7 +1631,9 @@ impl DotDir {
                                     buffer.save();
                                 }
                                 d.saved = text.into_bytes();
-                                d.dirty_cache.set(None);
+                                d.saved_version = version;
+                                // An edit and its Undo can both finish while a save is pending.
+                                d.reconcile_saved_text(cx);
                                 d.error = None;
                                 self.status = format!("Saved {}", d.path.display());
                                 if d.path.archive_member().is_some()
@@ -1897,10 +1908,8 @@ pub(crate) struct Document {
     pub input: Entity<EditorState>,
     pub inactive_view: Option<Entity<EditorState>>,
     pub saved: Vec<u8>,
-    version: Cell<u64>,
-    // Invalidated by text changes and successful saves, never by cursor movement
-    // or redraws. Keep undo-to-saved detection without allocating the full text.
-    dirty_cache: Cell<Option<bool>>,
+    version: u64,
+    saved_version: u64,
     pub readonly: bool,
     line_wrap: Option<bool>,
     pub saving: bool,
@@ -1926,24 +1935,27 @@ impl Document {
         });
     }
 
-    pub fn dirty(&self, cx: &App) -> bool {
-        if self.readonly {
+    pub fn dirty(&self) -> bool {
+        !self.readonly && self.version != self.saved_version
+    }
+
+    fn reconcile_saved_text(&mut self, cx: &App) -> bool {
+        if !self.dirty() {
             return false;
         }
-        if let Some(dirty) = self.dirty_cache.get() {
-            return dirty;
-        }
         let text = self.input.read(cx).text();
-        let mut offset = 0;
-        let matches = text.len() == self.saved.len()
-            && text.chunks().all(|chunk| {
-                let end = offset + chunk.len();
-                let matches = chunk.as_bytes() == &self.saved[offset..end];
-                offset = end;
-                matches
-            });
-        self.dirty_cache.set(Some(!matches));
-        !matches
+        if text.len() != self.saved.len() {
+            return false;
+        }
+        let mut remaining = self.saved.as_slice();
+        for chunk in text.chunks() {
+            let Some(rest) = remaining.strip_prefix(chunk.as_bytes()) else {
+                return false;
+            };
+            remaining = rest;
+        }
+        self.saved_version = self.version;
+        true
     }
 }
 pub(crate) enum TabContent {
@@ -2877,7 +2889,7 @@ impl DotDir {
             TabContent::Document(id) => self
                 .documents
                 .get(id)
-                .map(|doc| (&doc.path, doc.saving, doc.dirty(cx))),
+                .map(|doc| (&doc.path, doc.saving, doc.dirty())),
             TabContent::Hex { path, view, .. } => {
                 let buffer = view.read(cx).buffer.read(cx);
                 Some((path, buffer.saving, buffer.dirty()))
@@ -3301,6 +3313,7 @@ impl DotDir {
                         path.clone(),
                         view.buffer.clone(),
                         view.readonly,
+                        view.mode(),
                         window,
                         cx,
                     ),
@@ -4206,7 +4219,18 @@ impl DotDir {
                     }
                 }
             }
-            "view-hex" | "edit-hex" => {
+            "view-hex" | "view-dump" | "edit-hex" => {
+                let mode = if id == "view-dump" {
+                    ByteViewMode::Dump
+                } else {
+                    ByteViewMode::Hex
+                };
+                if let Some((_, view)) =
+                    self.active_hex().filter(|(_, view)| view.read(cx).readonly)
+                {
+                    view.clone()
+                        .update(cx, |view, cx| view.set_mode(mode, window, cx));
+                }
                 if let Some(path) = self
                     .directory(self.active)
                     .and_then(Directory::focused)
@@ -4216,9 +4240,9 @@ impl DotDir {
                     self.open_file_into(
                         self.active,
                         path,
-                        id == "view-hex",
+                        id != "edit-hex",
                         None,
-                        true,
+                        Some(mode),
                         window,
                         cx,
                     );
@@ -4613,11 +4637,13 @@ Selected entries will be permanently removed from the archive."
         path: Location,
         buffer: Entity<HexBuffer>,
         readonly: bool,
+        mode: ByteViewMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TabContent {
         let readonly = readonly || path.local().is_none();
-        let view = cx.new(|cx| HexView::new(buffer.clone(), readonly, self.palette, window, cx));
+        let view =
+            cx.new(|cx| HexView::new(buffer.clone(), readonly, mode, self.palette, window, cx));
         let subscription = cx.observe(&buffer, move |this, buffer, cx| {
             if !readonly
                 && buffer.read(cx).dirty()
@@ -4678,7 +4704,7 @@ Selected entries will be permanently removed from the archive."
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_file_into(pane, path, readonly, tab, false, window, cx);
+        self.open_file_into(pane, path, readonly, tab, None, window, cx);
     }
 
     fn open_file_into(
@@ -4687,7 +4713,7 @@ Selected entries will be permanently removed from the archive."
         path: Location,
         readonly: bool,
         tab: Option<u64>,
-        force_hex: bool,
+        byte_mode: Option<ByteViewMode>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4696,7 +4722,31 @@ Selected entries will be permanently removed from the archive."
             archive => archive,
         };
         let readonly = readonly || !path.editable();
-        if readonly && !force_hex {
+        if let Some(mode) = byte_mode
+            && tab.is_none()
+            && let Some((index, view)) =
+                self.panes[pane]
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, tab)| match &tab.content {
+                        TabContent::Hex {
+                            path: existing,
+                            view,
+                            ..
+                        } if *existing == path
+                            && view.read(cx).readonly == (readonly || path.local().is_none()) =>
+                        {
+                            Some((index, view.clone()))
+                        }
+                        _ => None,
+                    })
+        {
+            view.update(cx, |view, cx| view.set_mode(mode, window, cx));
+            self.set_tab(pane, index, window, cx);
+            return;
+        }
+        if readonly && byte_mode.is_none() {
             let bundled = MediaFilter::bundled();
             let builtin = bundled
                 .matches(path.name_path())
@@ -4826,7 +4876,11 @@ Selected entries will be permanently removed from the archive."
                 return;
             }
         }
-        if readonly && !force_hex && path.local().is_some() && image_format(&path).is_some() {
+        if readonly
+            && byte_mode.is_none()
+            && path.local().is_some()
+            && image_format(&path).is_some()
+        {
             if tab.is_none() {
                 self.open_request[pane] += 1;
             }
@@ -4844,7 +4898,9 @@ Selected entries will be permanently removed from the archive."
             );
             return;
         }
-        if !force_hex && let Some(doc) = self.documents.values_mut().find(|d| d.path == path) {
+        if byte_mode.is_none()
+            && let Some(doc) = self.documents.values_mut().find(|d| d.path == path)
+        {
             let id = doc.id;
             if !readonly {
                 doc.readonly = false;
@@ -4878,13 +4934,14 @@ Selected entries will be permanently removed from the archive."
             self.status = format!("Opening {}…", path.display());
         }
         std::thread::spawn(move || {
-            let result = hex_file::open(&path, readonly, force_hex, &filesystems);
+            let result = hex_file::open(&path, readonly, byte_mode.is_some(), &filesystems);
             let _ = tx.send(Message::Opened {
                 request,
                 pane,
                 path,
                 readonly,
                 tab,
+                byte_mode: byte_mode.unwrap_or_default(),
                 result,
             });
         });
@@ -5024,6 +5081,28 @@ Selected entries will be permanently removed from the archive."
         }
     }
 
+    pub fn reconcile_after_history(&self, id: u64, cx: &mut Context<Self>) {
+        let Some(document) = self.documents.get(&id) else {
+            return;
+        };
+        let before = document.version;
+        let view = cx.weak_entity();
+        // This listener runs during action capture. Queue behind the change events
+        // emitted by the editor during the subsequent action dispatch.
+        cx.defer(move |cx| {
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(document) = this.documents.get_mut(&id)
+                        && document.version != before
+                        && document.reconcile_saved_text(cx)
+                    {
+                        cx.notify();
+                    }
+                });
+            });
+        });
+    }
+
     pub fn save(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(d) = self.documents.get_mut(&id) {
             if d.readonly || d.saving {
@@ -5034,6 +5113,7 @@ Selected entries will be permanently removed from the archive."
             }
             d.saving = true;
             d.error = None;
+            let version = d.version;
             let (path, expected, text) = (
                 d.path.clone(),
                 d.saved.clone(),
@@ -5047,7 +5127,12 @@ Selected entries will be permanently removed from the archive."
                 } else {
                     path.save_archive_member(&expected, &text, &filesystems)
                 };
-                let _ = tx.send(Message::Saved { id, text, result });
+                let _ = tx.send(Message::Saved {
+                    id,
+                    version,
+                    text,
+                    result,
+                });
             });
             cx.notify();
         }

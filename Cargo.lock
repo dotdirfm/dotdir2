@@ -2272,8 +2272,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "604d277dd339c63d13a3016d22a84622cc7511fdfd8e88573c0709088ede3500"
+source = "git+https://github.com/longbridge/gpui-kit?rev=c77088781e9197e23392f66c0f1a9674868ec5b6#c77088781e9197e23392f66c0f1a9674868ec5b6"
 dependencies = [
  "aho-corasick",
  "anyhow",

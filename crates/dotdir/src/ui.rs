@@ -15,7 +15,7 @@ use gpui_kit::{
         Icon, IconName,
         button::Button,
         checkbox::Checkbox,
-        input::{Editor, Input},
+        input::{Editor, Input, Redo, Undo},
         menu::{DropdownMenu, PopupMenuItem},
     },
     prelude::FluentBuilder,
@@ -426,7 +426,7 @@ impl DotDir {
                     let doc = &self.documents[id];
                     let (mut label, icon) =
                         self.file_tab_label(doc.path.file_name().unwrap_or_default(), false);
-                    if doc.dirty(cx) {
+                    if doc.dirty() {
                         label.insert_str(0, "● ");
                     }
                     (label, icon)
@@ -661,7 +661,7 @@ impl DotDir {
                         "Saving…".into()
                     } else if doc.readonly {
                         "Read only".into()
-                    } else if doc.dirty(cx) {
+                    } else if doc.dirty() {
                         "Modified · F2 / ⌘S to save".into()
                     } else {
                         "Saved".into()
@@ -684,6 +684,15 @@ impl DotDir {
                             .min_h_0()
                             .overflow_hidden()
                             .font_family("Menlo")
+                            .when(!readonly, |editor| {
+                                editor
+                                    .capture_action(cx.listener(move |this, _: &Undo, _, cx| {
+                                        this.reconcile_after_history(id, cx);
+                                    }))
+                                    .capture_action(cx.listener(move |this, _: &Redo, _, cx| {
+                                        this.reconcile_after_history(id, cx);
+                                    }))
+                            })
                             .child(
                                 Editor::new(&state)
                                     .h(relative(1.))

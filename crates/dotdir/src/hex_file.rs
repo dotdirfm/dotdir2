@@ -68,10 +68,10 @@ fn is_binary(bytes: &[u8], complete: bool) -> bool {
 pub fn open(
     path: &Location,
     readonly: bool,
-    force_hex: bool,
+    force_bytes: bool,
     filesystems: &Filesystems,
 ) -> Result<OpenedFile> {
-    if !force_hex
+    if !force_bytes
         && readonly
         && path.local().is_none()
         && let Some(format) = image_format(path)
@@ -96,7 +96,7 @@ pub fn open(
         }
     };
     let len = file.source.len();
-    if force_hex {
+    if force_bytes {
         return Ok(OpenedFile::Hex(file));
     }
     let sample = file.source.read(0, PAGE_BYTES)?;

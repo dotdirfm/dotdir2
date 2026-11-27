@@ -162,6 +162,13 @@ available on macOS. Video playback on Windows and Linux requires libmpv.
 Press **F3** to view a binary file and **F4** to edit a local binary file.
 **View as Hex** and **Edit as Hex** in the command palette can also open any
 supported file as bytes. Use the offset field to jump to a hexadecimal address.
+**View as Dump** fills the pane with one character per byte. It shows printable
+ASCII as-is, ASCII control bytes as DOS-style glyphs, NUL as a blank, and bytes
+above `0x7f` as bullets. Use **Hex** and **Dump** in the read-only byte viewer to
+switch views without changing the current byte offset.
+The byte inspector shows the current byte in hexadecimal and decimal. Choose
+2, 4, or 8 bytes to read an unsigned integer starting at the cursor in little
+or big endian order.
 Type hex digits to overwrite bytes, then press **F2** to save only the changed
 ranges. Hex previews read data on demand, and local binary files can exceed
 the text editor's 16 MiB limit.

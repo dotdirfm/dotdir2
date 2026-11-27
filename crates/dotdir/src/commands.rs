@@ -22,6 +22,7 @@ pub struct CommandState {
     pub entry: bool,
     pub real_entry: bool,
     pub file: bool,
+    pub byte_viewer: bool,
     pub items: bool,
     pub selection: bool,
     pub parent: bool,
@@ -53,6 +54,7 @@ pub enum Availability {
     Entry,
     RealEntry,
     File,
+    ViewBytes,
     LocalFile,
     EditableFile,
     Items,
@@ -89,6 +91,7 @@ impl Availability {
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
             Self::File => state.directory && state.file,
+            Self::ViewBytes => Self::File.matches(state) || state.byte_viewer,
             Self::LocalFile => state.directory && state.file && local,
             Self::EditableFile => {
                 state.directory && state.file && (local || state.archive_editable)
@@ -258,8 +261,15 @@ pub const COMMANDS: &[Command] = &[
         id: "view-hex",
         title: "View as Hex",
         key: "",
-        context: "FilePane",
-        availability: Availability::File,
+        context: "FilePane || PreviewPane",
+        availability: Availability::ViewBytes,
+    },
+    Command {
+        id: "view-dump",
+        title: "View as Dump",
+        key: "",
+        context: "FilePane || PreviewPane",
+        availability: Availability::ViewBytes,
     },
     Command {
         id: "edit-hex",
