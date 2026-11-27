@@ -279,6 +279,10 @@ to an Intel SDK that runs under Rosetta. Edit supports diagnostics for unsaved
 changes, hovers, completions (**Ctrl+Space**), and Go to Definition
 (**⌘⌥↓**, **⌘-click**, or **F1**).
 
+Click a diagnostic marker on the editor scrollbar to jump to the issue. Go to
+Definition reuses an italic preview tab for definitions in other files.
+Double-click its header to keep the tab.
+
 **rust-analyzer** runs the JavaScript client from an unpacked
 `rust-lang.rust-analyzer` VSIX when enabled through **F11**. The package should
 include its native server, or you can set `rust-analyzer.server.path` in

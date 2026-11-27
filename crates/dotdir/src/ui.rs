@@ -26,6 +26,8 @@ use std::{ffi::OsStr, time::Duration};
 
 pub(crate) const PANEL_MARGIN: f32 = 4.;
 const TAB_BORDER_WIDTH: Pixels = px(1.);
+const TAB_BAR_HEIGHT: Pixels = px(28.);
+const PANE_CORNER_RADIUS: Pixels = px(8.);
 
 struct TabDrag {
     id: u64,
@@ -82,21 +84,32 @@ impl Render for TabDragPreview {
     }
 }
 
-fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>) {
+fn tab_meets_pane_edge(scroll: &ScrollHandle, index: usize) -> bool {
+    scroll.bounds_for_item(index).is_some_and(|tab| {
+        (tab.left() + scroll.offset().x - scroll.bounds().left()).abs() < px(0.01)
+    })
+}
+
+fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>, flush_left: bool) {
     let radius = px(7.).min(bounds.size.height / 2.);
     let left = bounds.left();
     let right = bounds.right();
     let top = bounds.top();
     let bottom = bounds.bottom();
 
-    // The lower corners turn out into the pane, and the upper corners turn in.
     path.move_to(point(left, bottom));
-    path.curve_to(
-        point(left + radius, bottom - radius),
-        point(left + radius, bottom),
-    );
-    path.line_to(point(left + radius, top + radius));
-    path.curve_to(point(left + radius * 2., top), point(left + radius, top));
+    let left_side = if flush_left {
+        left
+    } else {
+        // Turn outward to meet the divider when there is room beside the tab.
+        path.curve_to(
+            point(left + radius, bottom - radius),
+            point(left + radius, bottom),
+        );
+        left + radius
+    };
+    path.line_to(point(left_side, top + radius));
+    path.curve_to(point(left_side + radius, top), point(left_side, top));
     path.line_to(point(right - radius * 2., top));
     path.curve_to(
         point(right - radius, top + radius),
@@ -106,37 +119,55 @@ fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>) {
     path.curve_to(point(right, bottom), point(right - radius, bottom));
 }
 
-fn tab_surface(color: Hsla, selected: bool, border: Hsla) -> impl IntoElement {
+fn tab_surface(
+    color: Hsla,
+    border: Hsla,
+    selected: Option<(ScrollHandle, usize)>,
+) -> impl IntoElement {
+    let is_selected = selected.is_some();
     let shape = canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
+            let flush_left = selected
+                .as_ref()
+                .is_some_and(|(scroll, index)| tab_meets_pane_edge(scroll, *index));
             let divider_top = bounds.bottom() - TAB_BORDER_WIDTH;
-            let edge_bottom = if selected {
+            let edge_bottom = if is_selected {
                 // Cover the divider beneath the selected tab and center the curved
                 // outline on the divider so the two meet at its ends.
+                let divider_left = if flush_left {
+                    bounds.left() + TAB_BORDER_WIDTH
+                } else {
+                    bounds.left()
+                };
                 window.paint_quad(fill(
-                    Bounds::new(
-                        point(bounds.left(), divider_top),
-                        size(bounds.size.width, TAB_BORDER_WIDTH),
-                    ),
+                    Bounds::from_corners(point(divider_left, divider_top), bounds.bottom_right()),
                     color,
                 ));
                 divider_top + TAB_BORDER_WIDTH / 2.
             } else {
                 divider_top
             };
-            let edge_bounds =
-                Bounds::from_corners(bounds.origin, point(bounds.right(), edge_bottom));
+            // Keep strokes at the viewport edge inside the scroll clip.
+            let left = if flush_left {
+                bounds.left() + TAB_BORDER_WIDTH / 2.
+            } else {
+                bounds.left()
+            };
+            let edge_bounds = Bounds::from_corners(
+                point(left, bounds.top() + TAB_BORDER_WIDTH / 2.),
+                point(bounds.right(), edge_bottom),
+            );
             let mut path = PathBuilder::fill();
-            trace_tab_edge(&mut path, edge_bounds);
+            trace_tab_edge(&mut path, edge_bounds, flush_left);
             path.close();
             if let Ok(path) = path.build() {
                 window.paint_path(path, color);
             }
 
-            if selected {
+            if is_selected {
                 let mut edge = PathBuilder::stroke(TAB_BORDER_WIDTH);
-                trace_tab_edge(&mut edge, edge_bounds);
+                trace_tab_edge(&mut edge, edge_bounds, flush_left);
                 if let Ok(edge) = edge.build() {
                     window.paint_path(edge, border);
                 }
@@ -148,7 +179,7 @@ fn tab_surface(color: Hsla, selected: bool, border: Hsla) -> impl IntoElement {
     div()
         .absolute()
         .inset_0()
-        .when(!selected, |surface| {
+        .when(!is_selected, |surface| {
             surface.invisible().group_hover("file-tab", |s| s.visible())
         })
         .child(shape)
@@ -470,13 +501,18 @@ impl DotDir {
         let tab = self.panes[pane].tabs[selected_index].id();
         let dark = p.mode.is_dark();
         let rail = p.bg.blend(black().opacity(if dark { 0.25 } else { 0.08 }));
-        let tab_border = p.bg.blend(if dark {
-            white().opacity(0.14)
+        let outline = if active {
+            p.command_bg.blend(p.accent.opacity(0.55))
         } else {
-            black().opacity(0.18)
-        });
+            p.bg.blend(if dark {
+                white().opacity(0.14)
+            } else {
+                black().opacity(0.18)
+            })
+        };
         let scroll = &mut self.tab_strip_scrolls[pane];
         scroll.follow(selected_index, tab, cx.reduce_motion(), window);
+        let scroll = scroll.handle.clone();
         let mut tabs = div()
             .id(("pane-tabs", pane))
             .role(Role::TabList)
@@ -486,7 +522,7 @@ impl DotDir {
             .h_full()
             .overflow_hidden()
             .overflow_x_scroll()
-            .track_scroll(&scroll.handle)
+            .track_scroll(&scroll)
             .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, _| {
                 let scroll = &mut this.tab_strip_scrolls[pane];
                 let delta = event.delta.pixel_delta(window.line_height());
@@ -560,6 +596,7 @@ impl DotDir {
                     .min_w(px(64.))
                     .max_w(px(200.))
                     .px(px(11.))
+                    .when(index == 0, |tab| tab.pl(px(13.)))
                     .text_color(tab_fg)
                     .text_size(px(12.))
                     .cursor_pointer()
@@ -586,7 +623,11 @@ impl DotDir {
                             this.request_close_tab(pane, id, window, cx);
                         }
                     }))
-                    .child(tab_surface(surface, selected, tab_border))
+                    .child(tab_surface(
+                        surface,
+                        outline,
+                        selected.then(|| (scroll.clone(), index)),
+                    ))
                     .when(
                         !selected && index + 1 < tab_count && index + 1 != selected_index,
                         |tab| {
@@ -703,23 +744,12 @@ impl DotDir {
                 }
             }))
             .flex()
-            .h(px(28.))
+            .h(TAB_BAR_HEIGHT)
             .flex_shrink_0()
             .items_center()
             .gap(px(3.))
-            .px(px(4.))
+            .pr(px(5.))
             .pt(px(3.))
-            .rounded_t(px(7.))
-            .bg(rail)
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(TAB_BORDER_WIDTH)
-                    .bg(tab_border),
-            )
             .child(
                 tabs.child(
                     div()
@@ -780,6 +810,10 @@ impl DotDir {
                 let id = *id;
                 let (state, readonly) = self.editor_for_pane(pane, id, window, cx);
                 let doc = &self.documents[&id];
+                let scrollbar =
+                    doc.diagnostics
+                        .scrollbar_renderer(&state, pane, id, cx.weak_entity());
+                state.update(cx, |editor, _| editor.set_scrollbar_renderer(scrollbar));
                 let code_action_gutter = doc.path.local().is_some() && doc.lsp.is_some();
                 let breadcrumbs = self.render_breadcrumbs(pane, &doc.path, true, cx);
                 let status = doc.error.clone().unwrap_or_else(|| {
@@ -955,22 +989,51 @@ impl DotDir {
         };
         div()
             .when(
-                self.panes[pane].tabs[self.panes[pane].active].preview,
+                self.panes[pane].tabs[self.panes[pane].active]
+                    .preview_source
+                    .is_some(),
                 |s| s.key_context("PreviewTab"),
             )
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
-            .border_1()
-            .border_color(if active {
-                p.accent.opacity(0.55)
-            } else {
-                p.border
-            })
-            .rounded(px(8.))
-            .bg(p.bg)
+            .child(
+                // Extend the rail beneath the frame's upper corners so the
+                // background outside each curve stays filled.
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(TAB_BAR_HEIGHT + PANE_CORNER_RADIUS - TAB_BORDER_WIDTH)
+                    .rounded_t(PANE_CORNER_RADIUS)
+                    .bg(rail),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let mut corners = Corners::all(PANE_CORNER_RADIUS);
+                        if tab_meets_pane_edge(&scroll, selected_index) {
+                            corners.top_left = px(0.);
+                        }
+                        window.paint_quad(quad(
+                            bounds,
+                            corners,
+                            p.bg,
+                            Edges::all(TAB_BORDER_WIDTH),
+                            outline,
+                            BorderStyle::Solid,
+                        ));
+                    },
+                )
+                .absolute()
+                .inset_0()
+                .top(TAB_BAR_HEIGHT - TAB_BORDER_WIDTH),
+            )
             .child(tab_bar)
             .child(
                 div()
@@ -978,6 +1041,8 @@ impl DotDir {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
+                    .px(TAB_BORDER_WIDTH)
+                    .pb(TAB_BORDER_WIDTH)
                     .capture_any_mouse_down(cx.listener(
                         move |this, event: &MouseDownEvent, window, cx| {
                             this.focus_pane_from_click(pane, event, window, cx);

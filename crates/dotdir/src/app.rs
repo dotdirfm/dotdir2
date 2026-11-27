@@ -1926,7 +1926,7 @@ pub(crate) struct Document {
     pub path: Location,
     pub input: Entity<EditorState>,
     inactive_view: Option<InactiveEditor>,
-    diagnostics: DiagnosticDecorations,
+    pub(crate) diagnostics: DiagnosticDecorations,
     pub saved: Vec<u8>,
     version: u64,
     saved_version: u64,
@@ -2067,6 +2067,7 @@ pub(crate) struct Tab {
     id: u64,
     load_request: u64,
     preview_path: Option<Location>,
+    source_position: Option<lsp_types::Position>,
 }
 impl Tab {
     pub fn new(content: TabContent) -> Self {
@@ -2077,6 +2078,7 @@ impl Tab {
             preview_source: None,
             load_request: 0,
             preview_path: None,
+            source_position: None,
         }
     }
     pub fn id(&self) -> u64 {
@@ -2094,6 +2096,9 @@ impl Tab {
     }
     fn follows_changed_file(&self, source: u64, path: &Option<Location>) -> bool {
         self.preview && self.preview_source == Some(source) && &self.preview_path != path
+    }
+    fn is_definition_preview(&self) -> bool {
+        self.preview && self.preview_source.is_none()
     }
     fn begin_preview_load(&mut self, path: Option<Location>, request: u64) {
         self.preview_path = path.clone();
@@ -3126,18 +3131,24 @@ impl DotDir {
         cx.notify();
     }
 
-    fn focus_active_content(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = &self.panes[self.active];
-        match pane.tabs.get(pane.active).map(|tab| &tab.content) {
-            Some(TabContent::Document(id)) => {
-                if let Some(d) = self.documents.get(id) {
+    fn focus_active_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = &mut self.panes[self.active];
+        let Some(tab) = pane.tabs.get_mut(pane.active) else {
+            self.focus.focus(window, cx);
+            return;
+        };
+        match tab.content {
+            TabContent::Document(id) => {
+                if let Some(position) = tab.source_position.take() {
+                    self.reveal_source_position(id, position, window, cx);
+                } else if let Some(d) = self.documents.get(&id) {
                     d.input.update(cx, |s, cx| s.focus(window, cx));
                 }
             }
-            Some(TabContent::Media { view, .. }) => {
+            TabContent::Media { ref view, .. } => {
                 window.focus(&view.read(cx).focus_handle(cx), cx);
             }
-            Some(TabContent::Hex { view, .. }) => {
+            TabContent::Hex { ref view, .. } => {
                 let focus = view.read(cx).focus_handle().clone();
                 if !focus.contains_focused(window, cx) {
                     focus.focus(window, cx);
@@ -4593,7 +4604,11 @@ Selected entries will be permanently removed from the archive."
     fn start_preview(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
         let source_id = self.panes[source].tabs[self.panes[source].active].id();
         let pane = 1 - source;
-        if let Some(index) = self.panes[pane].tabs.iter().position(|tab| tab.preview) {
+        if let Some(index) = self.panes[pane]
+            .tabs
+            .iter()
+            .position(|tab| tab.preview && tab.preview_source.is_some())
+        {
             self.panes[pane].tabs[index].preview_source = Some(source_id);
             self.panes[pane].active = index;
         } else {
@@ -5148,7 +5163,7 @@ Selected entries will be permanently removed from the archive."
                         if this.active_document() != Some(id) {
                             return;
                         }
-                        this.open_source_at(pane, destination, target, window, cx);
+                        this.open_definition_preview(pane, destination, target, window, cx);
                     });
                 });
                 true
@@ -5165,6 +5180,52 @@ Selected entries will be permanently removed from the archive."
         cx: &mut Context<Self>,
     ) {
         self.open_source_at(pane, path.into(), position, window, cx);
+    }
+
+    fn open_definition_preview(
+        &mut self,
+        pane: usize,
+        path: Location,
+        position: Option<lsp_types::Position>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = match path {
+            Location::Local(path) => Location::Local(path.canonicalize().unwrap_or(path)),
+            path => path,
+        };
+        let existing = self.panes[pane].tabs.iter().position(|tab| {
+            matches!(tab.content, TabContent::Document(id) if self.documents[&id].path == path)
+        });
+        if let Some(index) = existing {
+            self.panes[pane].tabs[index].source_position = position;
+            self.set_tab(pane, index, window, cx);
+            return;
+        }
+        let index = if let Some(index) = self.panes[pane]
+            .tabs
+            .iter()
+            .position(Tab::is_definition_preview)
+        {
+            index
+        } else {
+            let id = self.id();
+            let mut tab = Tab::new(TabContent::Pending {
+                id,
+                path: None,
+                error: None,
+            });
+            tab.preview = true;
+            self.panes[pane].insert_after_active(tab);
+            self.panes[pane].active
+        };
+        let tab = &mut self.panes[pane].tabs[index];
+        tab.begin_preview_load(Some(path.clone()), 0);
+        tab.source_position = position;
+        let id = tab.id();
+        self.release_unused_documents();
+        self.set_tab(pane, index, window, cx);
+        self.open_document_into(pane, path, false, Some(id), window, cx);
     }
 
     fn open_source_at(
@@ -5202,6 +5263,7 @@ Selected entries will be permanently removed from the archive."
         if let Some(doc) = self.documents.get(&id) {
             doc.input.update(cx, |editor, cx| {
                 let position = lsp::editor_position(editor.text(), position);
+                editor.unfold_at(position, cx);
                 editor.set_cursor_position(position, window, cx);
             });
         }
