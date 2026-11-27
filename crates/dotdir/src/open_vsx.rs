@@ -18,11 +18,19 @@ const REGISTRY: &str = "https://open-vsx.org";
 const PAGE_SIZE: usize = 24;
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
+const VSIX_MANIFEST: &str = "extension.vsixmanifest";
+const MAX_VSIX_MANIFEST: u64 = 1024 * 1024;
 
 pub(crate) enum Event {
     Searched(u64, Result<SearchPage>),
     Selected(u64, Result<Box<Detail>>),
-    Installed(String, Result<Box<Installed>>),
+    Installed(InstallSource, Result<Box<Installed>>),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum InstallSource {
+    OpenVsx(String),
+    Vsix,
 }
 
 #[derive(Clone, Deserialize)]
@@ -88,6 +96,7 @@ pub(crate) struct Installed {
     pub root: PathBuf,
     pub color_theme: bool,
     pub icon_theme: bool,
+    pub local_vsix: bool,
 }
 
 #[derive(Default)]
@@ -101,12 +110,19 @@ pub(crate) struct Market {
     pub video: Option<crate::marketplace::MarketVideo>,
     pub search_request: Option<u64>,
     pub detail_request: Option<u64>,
-    pub installing: Option<String>,
+    pub installing: Option<InstallSource>,
     pub search_error: Option<String>,
     pub detail_error: Option<String>,
     pub install_error: Option<(String, String)>,
+    pub vsix_result: Option<Result<String, String>>,
     pub results_scroll: ScrollHandle,
     pub details_scroll: ScrollHandle,
+}
+
+impl Market {
+    pub fn installing_open_vsx(&self, id: &str) -> bool {
+        matches!(&self.installing, Some(InstallSource::OpenVsx(current)) if current == id)
+    }
 }
 
 pub(crate) fn search(query: &str, offset: usize) -> Result<SearchPage> {
@@ -237,12 +253,12 @@ fn target_platform() -> Option<&'static str> {
 
 impl Entry {
     pub fn installable(&self) -> bool {
-        self.files.download.is_some()
-            && self
-                .target_platform
-                .as_deref()
-                .is_none_or(|target| target == "universal" || Some(target) == target_platform())
+        self.files.download.is_some() && supports_platform(self.target_platform.as_deref())
     }
+}
+
+fn supports_platform(target: Option<&str>) -> bool {
+    target.is_none_or(|target| target == "universal" || Some(target) == target_platform())
 }
 
 fn valid_name(value: &str) -> bool {
@@ -322,32 +338,11 @@ pub(crate) fn install(entry: &Entry, directory: &Path) -> Result<Installed> {
         entry.installable(),
         "This release is unavailable for this platform"
     );
-    ensure!(
-        valid_name(&entry.namespace) && valid_name(&entry.name),
-        "Invalid extension identifier"
-    );
-    ensure!(
-        !entry.version.is_empty()
-            && entry.version.len() <= 128
-            && entry
-                .version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')),
-        "Invalid extension version"
-    );
-    let platform = entry
-        .target_platform
-        .as_deref()
-        .filter(|target| *target != "universal");
-    let suffix = platform.map_or_else(String::new, |target| format!("-{target}"));
-    let destination = directory.join(format!("{}-{}{suffix}", entry.id(), entry.version));
+    let destination = install_destination(entry, directory)?;
     if destination.exists() {
         return check_manifest(&destination.join("extension"), entry);
     }
-    fs::create_dir_all(directory)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".dotdir-vsix-")
-        .tempdir_in(directory.parent().context("Missing profile directory")?)?;
+    let staging = stage_install(directory)?;
     let mut download = tempfile::tempfile_in(staging.path())?;
     let url = entry
         .files
@@ -374,11 +369,128 @@ pub(crate) fn install(entry: &Entry, directory: &Path) -> Result<Installed> {
         );
         download.rewind()?;
     }
-    let unpacked = staging.path().join("package");
+    install_package(download, directory, staging.path(), Some(entry))
+}
+
+pub(crate) fn install_from_vsix(path: &Path, directory: &Path) -> Result<Installed> {
+    ensure!(
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("vsix")),
+        "Choose a .vsix file"
+    );
+    ensure!(path.is_file(), "Choose a regular .vsix file");
+    let file = File::open(path).context("Could not open the VSIX file")?;
+    ensure!(
+        file.metadata()?.len() <= MAX_DOWNLOAD,
+        "VSIX exceeds the size limit"
+    );
+    let staging = stage_install(directory)?;
+    install_package(file, directory, staging.path(), None)
+}
+
+fn stage_install(directory: &Path) -> Result<tempfile::TempDir> {
+    fs::create_dir_all(directory)?;
+    tempfile::Builder::new()
+        .prefix(".dotdir-vsix-")
+        .tempdir_in(directory.parent().context("Missing profile directory")?)
+        .context("Could not create the VSIX staging directory")
+}
+
+fn install_destination(entry: &Entry, directory: &Path) -> Result<PathBuf> {
+    ensure!(
+        valid_name(&entry.namespace) && valid_name(&entry.name),
+        "Invalid extension identifier"
+    );
+    ensure!(
+        !entry.version.is_empty()
+            && entry.version.len() <= 128
+            && entry
+                .version
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+') }),
+        "Invalid extension version"
+    );
+    let platform = entry.target_platform.as_deref();
+    ensure!(
+        supports_platform(platform),
+        "This VSIX targets {}",
+        platform.unwrap_or_default()
+    );
+    let suffix = platform
+        .filter(|target| *target != "universal")
+        .map_or_else(String::new, |target| format!("-{target}"));
+    let name = format!("{}-{}{suffix}", entry.id(), entry.version);
+    ensure!(valid_file_name(&name), "Invalid extension directory name");
+    Ok(directory.join(name))
+}
+
+fn install_package(
+    file: File,
+    directory: &Path,
+    staging: &Path,
+    expected: Option<&Entry>,
+) -> Result<Installed> {
+    let mut archive = ZipArchive::new(file).context("Invalid VSIX archive")?;
+    let metadata = expected
+        .is_none()
+        .then(|| read_vsix_manifest(&mut archive))
+        .transpose()?;
+    let manifest = metadata
+        .as_deref()
+        .map(roxmltree::Document::parse)
+        .transpose()
+        .context("Invalid VSIX manifest")?;
+    let identity = manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .root_element()
+                .children()
+                .find(|node| node.has_tag_name("Metadata"))
+                .and_then(|metadata| {
+                    metadata
+                        .children()
+                        .find(|node| node.has_tag_name("Identity"))
+                })
+                .context("Missing VSIX identity")
+        })
+        .transpose()?;
+    let platform = identity.and_then(|identity| identity.attribute("TargetPlatform"));
+    ensure!(
+        supports_platform(platform),
+        "This VSIX targets {}",
+        platform.unwrap_or_default()
+    );
+    let unpacked = staging.join("package");
     let root = unpacked.join("extension");
     fs::create_dir_all(&root)?;
-    unpack(download, &root)?;
-    let mut package = check_manifest(&root, entry)?;
+    if let Some(metadata) = &metadata {
+        fs::write(unpacked.join(VSIX_MANIFEST), metadata)?;
+    }
+    unpack(&mut archive, &root)?;
+    let mut package = if let Some(expected) = expected {
+        check_manifest(&root, expected)?
+    } else {
+        read_installed(&root)?
+    };
+    if let Some(identity) = identity {
+        ensure!(
+            identity
+                .attribute("Publisher")
+                .is_some_and(|value| value.eq_ignore_ascii_case(&package.entry.namespace))
+                && identity
+                    .attribute("Id")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&package.entry.name))
+                && identity.attribute("Version") == Some(package.entry.version.as_str()),
+            "The VSIX identity does not match extension/package.json"
+        );
+        package.entry.target_platform = platform.map(str::to_owned);
+    }
+    let entry = expected.unwrap_or(&package.entry);
+    let destination = install_destination(entry, directory)?;
+    if destination.exists() {
+        return check_manifest(&destination.join("extension"), entry);
+    }
     match fs::rename(&unpacked, &destination) {
         Ok(()) => {
             package.root = destination.join("extension");
@@ -389,8 +501,22 @@ pub(crate) fn install(entry: &Entry, directory: &Path) -> Result<Installed> {
     }
 }
 
-fn unpack(file: File, root: &Path) -> Result<()> {
-    let mut archive = ZipArchive::new(file).context("Invalid VSIX archive")?;
+fn read_vsix_manifest(archive: &mut ZipArchive<File>) -> Result<String> {
+    let mut metadata = String::new();
+    archive
+        .by_name(VSIX_MANIFEST)
+        .context("Missing extension.vsixmanifest")?
+        .take(MAX_VSIX_MANIFEST + 1)
+        .read_to_string(&mut metadata)
+        .context("Could not read the VSIX manifest")?;
+    ensure!(
+        metadata.len() as u64 <= MAX_VSIX_MANIFEST,
+        "VSIX manifest exceeds the size limit"
+    );
+    Ok(metadata)
+}
+
+fn unpack(archive: &mut ZipArchive<File>, root: &Path) -> Result<()> {
     let mut remaining = MAX_UNPACKED;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
@@ -473,7 +599,7 @@ fn check_manifest(root: &Path, expected: &Entry) -> Result<Installed> {
     let installed = read_installed(root)?;
     ensure!(
         installed.entry.id() == expected.id() && installed.entry.version == expected.version,
-        "VSIX package identity differs from the selected Open VSX release"
+        "VSIX package identity differs from the expected extension"
     );
     Ok(installed)
 }
@@ -515,6 +641,10 @@ fn read_installed(root: &Path) -> Result<Installed> {
         root: root.to_path_buf(),
         color_theme: has("themes"),
         icon_theme: has("iconThemes"),
+        local_vsix: root.file_name().is_some_and(|name| name == "extension")
+            && root
+                .parent()
+                .is_some_and(|parent| parent.join(VSIX_MANIFEST).is_file()),
     })
 }
 
@@ -578,15 +708,13 @@ mod tests {
         let root = dir.path().join("example.package-1.2.0/extension");
         fs::create_dir_all(&root).unwrap();
         let manifest = r#"{"publisher":"example","name":"package","version":"1.2.0","contributes":{"themes":[{}]}}"#;
-        unpack(
-            package_file(&[
-                ("extension/package.json", manifest),
-                ("extension/themes/colors.json", "{}"),
-                ("[Content_Types].xml", "<ignored/>"),
-            ]),
-            &root,
-        )
+        let mut archive = ZipArchive::new(package_file(&[
+            ("extension/package.json", manifest),
+            ("extension/themes/colors.json", "{}"),
+            ("[Content_Types].xml", "<ignored/>"),
+        ]))
         .unwrap();
+        unpack(&mut archive, &root).unwrap();
         let packages = installed(dir.path());
         let package = &packages["example.package"];
         assert_eq!(package.root, root);
@@ -601,7 +729,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("extension");
         fs::create_dir(&root).unwrap();
-        assert!(unpack(package_file(&[("extension/../package.json", "{}")]), &root).is_err());
+        let mut archive =
+            ZipArchive::new(package_file(&[("extension/../package.json", "{}")])).unwrap();
+        assert!(unpack(&mut archive, &root).is_err());
         assert!(!root.join("../package.json").exists());
+    }
+
+    fn save_vsix(path: &Path, version: &str, target: &str, package_version: &str) {
+        let metadata = format!(
+            r#"<PackageManifest xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"><Metadata><Identity Publisher="Example" Id="package" Version="{version}" TargetPlatform="{target}"/></Metadata></PackageManifest>"#
+        );
+        let manifest = serde_json::json!({
+            "publisher": "example", "name": "package",
+            "version": package_version, "main": "./main.js",
+            "activationEvents": ["onLanguage:typescript"],
+        })
+        .to_string();
+        let mut source = package_file(&[
+            (VSIX_MANIFEST, &metadata),
+            ("extension/package.json", &manifest),
+            ("extension/main.js", "exports.activate = () => {};"),
+        ]);
+        io::copy(&mut source, &mut File::create(path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn imports_a_local_vsix_and_discovers_its_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.VSIX");
+        let extensions = dir.path().join("extensions");
+        save_vsix(&path, "1.0.0", "universal", "1.0.0");
+        let package = install_from_vsix(&path, &extensions).unwrap();
+        assert_eq!(
+            package.root,
+            extensions.join("example.package-1.0.0/extension")
+        );
+        assert!(installed(&extensions)["example.package"].local_vsix);
+        let extensions_found = crate::vscode::discover(&extensions, &Default::default());
+        assert_eq!(extensions_found[0].id, "example.package");
+        assert_eq!(
+            install_from_vsix(&path, &extensions).unwrap().root,
+            package.root
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_and_mismatched_local_packages_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.vsix");
+        let extensions = dir.path().join("extensions");
+        save_vsix(&path, "1.0.0", "other-platform", "1.0.0");
+        assert!(
+            install_from_vsix(&path, &extensions)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("targets other-platform")
+        );
+        save_vsix(&path, "2.0.0", "universal", "1.0.0");
+        assert!(
+            install_from_vsix(&path, &extensions)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("identity")
+        );
+        assert_eq!(fs::read_dir(extensions).unwrap().count(), 0);
     }
 }

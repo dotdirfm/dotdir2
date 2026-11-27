@@ -2,7 +2,7 @@ use crate::{
     app::{DotDir, Message, Modal},
     archive::VirtualFile,
     media_native::NativeMedia,
-    open_vsx::{self, Entry, Event, Installed},
+    open_vsx::{self, Detail, Entry, Event, InstallSource, Installed},
     open_vsx_media::{Readme, ReadmeVideo, VIDEO_BLOCK},
     ui::text,
 };
@@ -15,7 +15,7 @@ use gpui_kit::{
     *,
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -121,6 +121,7 @@ impl DotDir {
             return;
         }
         self.market.installed_only = installed;
+        self.market.selected = None;
         self.market.results_scroll.set_offset(point(px(0.), px(0.)));
         if installed {
             self.market.search_request = None;
@@ -197,12 +198,28 @@ impl DotDir {
             return;
         }
         self.clear_market_media(cx);
-        let request = self.id();
         self.market.selected = Some(entry.clone());
-        self.market.detail_request = Some(request);
         self.market.detail = None;
         self.market.detail_error = None;
         self.market.details_scroll.set_offset(point(px(0.), px(0.)));
+        if self.market.installed_only
+            && self
+                .market
+                .installed
+                .get(&entry.id())
+                .is_some_and(|package| package.local_vsix)
+        {
+            self.market.detail_request = None;
+            self.market.detail = Some(Detail {
+                release: entry,
+                readme: None,
+                icon: None,
+            });
+            cx.notify();
+            return;
+        }
+        let request = self.id();
+        self.market.detail_request = Some(request);
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(Message::Market(Event::Selected(
@@ -335,15 +352,63 @@ impl DotDir {
         else {
             return;
         };
-        let id = entry.id();
-        self.market.installing = Some(id.clone());
         self.market.install_error = None;
+        self.start_extension_install(
+            InstallSource::OpenVsx(entry.id()),
+            move |directory| open_vsx::install(&entry, directory),
+            cx,
+        );
+    }
+
+    pub(crate) fn choose_vsix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.market.installing.is_some() {
+            return;
+        }
+        self.market.installing = Some(InstallSource::Vsix);
+        self.market.vsix_result = None;
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select a .vsix file".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let selection = selection.await;
+            let _ = this.update_in(cx, |this, _, cx| match selection {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => {
+                    let path = paths.remove(0);
+                    this.start_extension_install(
+                        InstallSource::Vsix,
+                        move |directory| open_vsx::install_from_vsix(&path, directory),
+                        cx,
+                    );
+                }
+                Ok(Err(error)) => {
+                    this.handle_marketplace(Event::Installed(InstallSource::Vsix, Err(error)), cx);
+                }
+                _ => {
+                    this.market.installing = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_extension_install(
+        &mut self,
+        source: InstallSource,
+        install: impl FnOnce(&Path) -> anyhow::Result<Installed> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.market.installing = Some(source.clone());
         let tx = self.tx.clone();
         let directory = self.extensions_directory();
         std::thread::spawn(move || {
             let _ = tx.send(Message::Market(Event::Installed(
-                id,
-                open_vsx::install(&entry, &directory).map(Box::new),
+                source,
+                install(&directory).map(Box::new),
             )));
         });
         cx.notify();
@@ -372,7 +437,7 @@ impl DotDir {
                     Err(error) => self.market.detail_error = Some(format!("{error:#}")),
                 }
             }
-            Event::Installed(id, result) => {
+            Event::Installed(source, result) => {
                 self.market.installing = None;
                 match result {
                     Ok(package) => {
@@ -381,10 +446,13 @@ impl DotDir {
                             package.entry.title(),
                             package.entry.version
                         );
+                        if source == InstallSource::Vsix {
+                            self.market.vsix_result = Some(Ok(self.status.clone()));
+                        }
                         let directory = self.extensions_directory();
                         self.market.installed = open_vsx::installed(&directory);
                         self.load_vscode_extensions(&directory);
-                        let reload = self.settings.vscode.enabled(&id);
+                        let reload = self.settings.vscode.enabled(&package.entry.id());
                         if reload {
                             self.reset_vscode_host();
                         }
@@ -392,8 +460,16 @@ impl DotDir {
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
-                        self.market.install_error = Some((id, message.clone()));
-                        self.error(format!("Open VSX install: {message}"), cx);
+                        match source {
+                            InstallSource::OpenVsx(id) => {
+                                self.market.install_error = Some((id, message.clone()));
+                                self.error(format!("Open VSX install: {message}"), cx);
+                            }
+                            InstallSource::Vsix => {
+                                self.market.vsix_result = Some(Err(message.clone()));
+                                self.error(format!("VSIX install: {message}"), cx);
+                            }
+                        }
                     }
                 }
             }
@@ -564,7 +640,7 @@ impl DotDir {
         for entry in entries {
             let id = entry.id();
             let is_selected = selected.as_ref() == Some(&id);
-            let row_status = if self.market.installing.as_ref() == Some(&id) {
+            let row_status = if self.market.installing_open_vsx(&id) {
                 Some("Installing…")
             } else if self.market.installed.contains_key(&id) {
                 Some("Installed")
@@ -823,14 +899,18 @@ impl DotDir {
         }
         let page = release.page_url();
         let external = page.clone();
-        let mut actions = self
-            .market_install_controls(release, installed, cx)
-            .child(self.button(
-                "open-vsx-page",
-                "Open in Open VSX ↗",
-                move |_, _, cx| cx.open_url(&external),
-                cx,
-            ));
+        let local_vsix =
+            self.market.installed_only && installed.is_some_and(|package| package.local_vsix);
+        let mut actions =
+            self.market_install_controls(release, installed, cx)
+                .when(!local_vsix, |actions| {
+                    actions.child(self.button(
+                        "open-vsx-page",
+                        "Open in Open VSX ↗",
+                        move |_, _, cx| cx.open_url(&external),
+                        cx,
+                    ))
+                });
         if let Some(package) = installed {
             if package.color_theme {
                 let root = package.root.clone();
@@ -998,7 +1078,7 @@ impl DotDir {
             .items_center()
             .gap(px(6.))
             .text_size(px(12.));
-        if self.market.installing.as_ref() == Some(&id) {
+        if self.market.installing_open_vsx(&id) {
             return actions.child(text("Installing…").text_color(p.accent));
         }
         let update = installed.is_some_and(|package| {

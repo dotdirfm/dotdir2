@@ -199,6 +199,10 @@ enable or disable executable extensions, and apply installed color or file
 icon themes. Extension commands and features depend on DotDir's VS Code API
 support.
 
+Use **F11 → Install from VSIX…** to install a local VSIX from a publisher or
+private registry. Choose the package for your platform, then enable the
+extension through **F11** if it provides commands or a language server.
+
 **TypeScript 7** runs the JavaScript client from an unpacked
 `TypeScriptTeam.native-preview` VSIX. Enable it through **F11** and set
 `js/ts.experimental.useTsgo` to `true` in `vscode.configuration`. Use a VSIX

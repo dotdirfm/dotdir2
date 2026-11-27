@@ -1479,6 +1479,7 @@ dependencies = [
  "regex",
  "resvg 0.46.0",
  "ring",
+ "roxmltree 0.21.2",
  "same-file",
  "schemars",
  "serde",

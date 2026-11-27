@@ -1625,6 +1625,22 @@ impl DotDir {
                 content = content.child(self.render_marketplace(window, cx));
             }
             Modal::Extensions => {
+                let install_vsix = match self.market.installing.as_ref() {
+                    None => self
+                        .button(
+                            "install-vsix",
+                            "Install from VSIX…",
+                            |this, window, cx| this.choose_vsix(window, cx),
+                            cx,
+                        )
+                        .into_any_element(),
+                    Some(crate::open_vsx::InstallSource::Vsix) => text("Installing VSIX…")
+                        .text_color(p.muted)
+                        .into_any_element(),
+                    Some(_) => text("Another installation is running")
+                        .text_color(p.muted)
+                        .into_any_element(),
+                };
                 content = content.child(
                     div()
                         .flex()
@@ -1639,6 +1655,7 @@ impl DotDir {
                             )
                             .border_color(p.accent),
                         )
+                        .child(install_vsix)
                         .child(self.button(
                             "extension-logs",
                             "Extension Logs",
@@ -1667,6 +1684,12 @@ impl DotDir {
                             cx,
                         )),
                 );
+                content = content.when_some(self.market.vsix_result.as_ref(), |content, result| {
+                    content.child(match result {
+                        Ok(message) => text(message.clone()).text_color(p.accent),
+                        Err(message) => text(message.clone()).text_color(p.error),
+                    })
+                });
                 content = content.child(self.icon_theme_controls("extension-icons", cx));
                 for format in crate::archive_extensions::BUNDLED.iter() {
                     let suffixes = format

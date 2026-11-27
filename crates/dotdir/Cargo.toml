@@ -51,6 +51,7 @@ percent-encoding = "2"
 tempfile = "3"
 same-file = "1"
 ring = "0.17"
+roxmltree = "0.21"
 zip.workspace = true
 jsonc-parser = { version = "0.34", features = ["serde"] }
 plist = "1.10"
