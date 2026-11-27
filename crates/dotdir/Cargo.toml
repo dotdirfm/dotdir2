@@ -56,6 +56,12 @@ jsonc-parser = { version = "0.34", features = ["serde"] }
 plist = "1.10"
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }
 sha2 = "0.10"
+markdown = "1"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+resvg = { version = "0.46", default-features = false, features = ["text"] }
+smallvec = "1"
 
 [dev-dependencies]
 tar = { version = "0.4.46", default-features = false }

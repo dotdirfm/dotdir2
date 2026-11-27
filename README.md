@@ -192,7 +192,9 @@ password only for the operation in progress. Passwords are never stored on disk.
 
 Open **F11 → Browse Open VSX…** to browse or search the registry by name,
 extension ID, or Open VSX page URL. Select a result to read its README and
-install a compatible release. Use **Installed** to find local packages,
+install a compatible release. README screenshots and animated GIFs render
+inline. Direct video embeds play on macOS, with a browser link also available.
+Use **Installed** to find local packages,
 enable or disable executable extensions, and apply installed color or file
 icon themes. Extension commands and features depend on DotDir's VS Code API
 support.

@@ -16,6 +16,7 @@ mod media;
 mod media_native;
 mod model;
 mod open_vsx;
+mod open_vsx_media;
 mod operations;
 mod panel_menu;
 mod panels;

@@ -3824,6 +3824,7 @@ impl DotDir {
                 input.update(cx, |input, cx| input.set_value("", window, cx));
             }
             Some(Modal::CreateArchive(dialog)) => dialog.clear_secrets(window, cx),
+            Some(Modal::OpenVsx) => self.clear_market_media(cx),
             _ => {}
         }
         if let Some(search) = &self.search {

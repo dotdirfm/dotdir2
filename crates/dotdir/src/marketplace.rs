@@ -1,15 +1,38 @@
 use crate::{
     app::{DotDir, Message, Modal},
+    archive::VirtualFile,
+    media_native::NativeMedia,
     open_vsx::{self, Entry, Event, Installed},
+    open_vsx_media::{Readme, ReadmeVideo, VIDEO_BLOCK},
     ui::text,
 };
 use gpui_kit::{
-    component::{input::Input, text::TextView},
+    component::{
+        input::Input,
+        text::{MarkdownNode, TextView},
+    },
     prelude::FluentBuilder,
     *,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use url::Url;
+
+pub(crate) struct MarketVideo {
+    block: usize,
+    request: u64,
+    state: VideoState,
+    _task: Task<()>,
+}
+
+enum VideoState {
+    Loading,
+    Playing(NativeMedia),
+    Error(String),
+}
 
 impl DotDir {
     fn extensions_directory(&self) -> PathBuf {
@@ -155,6 +178,7 @@ impl DotDir {
         if let Some(first) = entries.into_iter().next() {
             self.select_market_entry(first, cx);
         } else {
+            self.clear_market_media(cx);
             self.market.selected = None;
             self.market.detail = None;
             self.market.detail_request = None;
@@ -172,6 +196,7 @@ impl DotDir {
         {
             return;
         }
+        self.clear_market_media(cx);
         let request = self.id();
         self.market.selected = Some(entry.clone());
         self.market.detail_request = Some(request);
@@ -184,6 +209,95 @@ impl DotDir {
                 request,
                 open_vsx::details(&entry).map(Box::new),
             )));
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn clear_market_media(&mut self, cx: &mut Context<Self>) {
+        self.market.video = None;
+        if let Some(readme) = self
+            .market
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.readme.as_ref())
+        {
+            readme.clear_images(cx);
+        }
+    }
+
+    fn play_market_video(
+        &mut self,
+        block: usize,
+        video: ReadmeVideo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = self.id();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = video.load().await;
+            let started = this
+                .update_in(cx, |this, window, cx| {
+                    let Some(video) = this
+                        .market
+                        .video
+                        .as_mut()
+                        .filter(|video| video.request == request)
+                    else {
+                        return false;
+                    };
+                    let result = result.and_then(|(bytes, extension)| {
+                        NativeMedia::from_video(VirtualFile::memory(bytes), extension, window, cx)
+                    });
+                    video.state = match result {
+                        Ok(native) => VideoState::Playing(native),
+                        Err(error) => VideoState::Error(format!("{error:#}")),
+                    };
+                    cx.notify();
+                    matches!(video.state, VideoState::Playing(_))
+                })
+                .unwrap_or(false);
+            if !started {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let pending = this
+                    .update_in(cx, |this, _, cx| {
+                        let Some(video) = this
+                            .market
+                            .video
+                            .as_mut()
+                            .filter(|video| video.request == request)
+                        else {
+                            return false;
+                        };
+                        let VideoState::Playing(native) = &video.state else {
+                            return false;
+                        };
+                        let error = match native.playback_status() {
+                            Some(Ok(())) => return false,
+                            Some(Err(error)) => error,
+                            None if Instant::now() < deadline => return true,
+                            None => "The video codec could not be loaded.".into(),
+                        };
+                        video.state = VideoState::Error(error);
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(false);
+                if !pending {
+                    break;
+                }
+            }
+        });
+        self.market.video = Some(MarketVideo {
+            block,
+            request,
+            state: VideoState::Loading,
+            _task: task,
         });
         cx.notify();
     }
@@ -285,6 +399,149 @@ impl DotDir {
             }
             _ => {}
         }
+    }
+}
+
+impl DotDir {
+    fn market_readme(
+        &self,
+        id: &str,
+        release: &Entry,
+        readme: Arc<Readme>,
+        cx: &Context<Self>,
+    ) -> TextView {
+        let registry = Url::parse(&release.page_url()).ok();
+        let view = cx.weak_entity();
+        let palette = self.palette;
+        TextView::markdown(
+            SharedString::from(format!("open-vsx-readme-{id}-{}", release.version)),
+            readme.body.clone(),
+        )
+        .selectable(true)
+        .code_block_actions(|_, _, _| div().size_0())
+        .image_source({
+            let readme = readme.clone();
+            move |source| readme.image(source.as_ref())
+        })
+        .markdown_block_parser({
+            let readme = readme.clone();
+            move |node, _| {
+                readme
+                    .video(node)
+                    .map(|video| MarkdownNode::new(VIDEO_BLOCK, video).accessibility_label("Video"))
+            }
+        })
+        .markdown_block_renderer(VIDEO_BLOCK, move |node, _, cx| {
+            let Some(video) = node.data::<ReadmeVideo>() else {
+                return div();
+            };
+            let url = video.url().to_owned();
+            let key = node.source_range().map_or(0, |range| range.start);
+            let state = view
+                .read_with(cx, |this, _| {
+                    let playing = this
+                        .market
+                        .video
+                        .as_ref()
+                        .filter(|entry| entry.block == key)?;
+                    Some(match &playing.state {
+                        VideoState::Loading => (None, Some("Loading video…".into()), true),
+                        VideoState::Playing(native) => (Some(native.view()), None, true),
+                        VideoState::Error(error) => (None, Some(error.clone()), false),
+                    })
+                })
+                .ok()
+                .flatten();
+            let (native, status, started) = state.unwrap_or_default();
+            let control = if started {
+                "Close video"
+            } else if cfg!(target_os = "macos") {
+                "Play video"
+            } else {
+                "Open video ↗"
+            };
+            let button = |id, label: &'static str| {
+                div()
+                    .id((id, key))
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .text_color(palette.accent)
+                    .hover(move |s| s.bg(palette.selected))
+                    .rounded(px(3.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .child(label)
+            };
+            let poster = native.is_none().then(|| video.poster.as_deref()).flatten();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .min_w_0()
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(button("readme-video-control", control).on_click({
+                            let view = view.clone();
+                            let video = video.clone();
+                            move |_, window, cx| {
+                                if !cfg!(target_os = "macos") {
+                                    cx.open_url(video.url());
+                                    return;
+                                }
+                                let _ = view.update(cx, |this, cx| {
+                                    if started {
+                                        this.market.video = None;
+                                        cx.notify();
+                                    } else {
+                                        this.play_market_video(key, video.clone(), window, cx);
+                                    }
+                                });
+                            }
+                        }))
+                        .when(cfg!(target_os = "macos"), |s| {
+                            s.child(
+                                button("readme-video-external", "Open in browser ↗")
+                                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                            )
+                        }),
+                )
+                .when_some(native, |s, native| {
+                    s.child(
+                        div()
+                            .relative()
+                            .overflow_hidden()
+                            .w_full()
+                            .h(px(270.))
+                            .child(native),
+                    )
+                })
+                .when_some(poster, |s, poster| {
+                    s.child(
+                        img(readme.image(poster))
+                            .max_w_full()
+                            .max_h(px(270.))
+                            .object_fit(ObjectFit::Contain),
+                    )
+                })
+                .when_some(status, |s, status| {
+                    s.child(text(status).text_color(palette.muted))
+                })
+        })
+        .on_link_click(move |href, _, _, cx| {
+            if let Some(url) = Url::parse(href.as_ref())
+                .ok()
+                .or_else(|| registry.as_ref()?.join(href.as_ref()).ok())
+                && url.scheme() == "https"
+            {
+                cx.open_url(url.as_str());
+            }
+        })
     }
 }
 
@@ -649,7 +906,6 @@ impl DotDir {
                         ),
                 ),
         );
-        let registry = Url::parse(&page).ok();
         panel
             .child(
                 div()
@@ -721,31 +977,8 @@ impl DotDir {
                         )))
                     })
                     .when_some(
-                        detail.and_then(|detail| detail.readme.as_deref()),
-                        |s, readme| {
-                            s.child(
-                                TextView::markdown(
-                                    SharedString::from(format!(
-                                        "open-vsx-readme-{id}-{}",
-                                        release.version
-                                    )),
-                                    readme.to_owned(),
-                                )
-                                .selectable(true)
-                                .code_block_actions(|_, _, _| div().size_0())
-                                .on_link_click(
-                                    move |href, _, _, cx| {
-                                        if let Some(url) = Url::parse(href.as_ref())
-                                            .ok()
-                                            .or_else(|| registry.as_ref()?.join(href.as_ref()).ok())
-                                            && url.scheme() == "https"
-                                        {
-                                            cx.open_url(url.as_str());
-                                        }
-                                    },
-                                ),
-                            )
-                        },
+                        detail.and_then(|detail| detail.readme.clone()),
+                        |s, readme| s.child(self.market_readme(&id, release, readme, cx)),
                     ),
             )
             .into_any_element()

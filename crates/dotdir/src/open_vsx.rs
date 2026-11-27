@@ -1,3 +1,4 @@
+use crate::open_vsx_media::Readme;
 use anyhow::{Context, Result, ensure};
 use gpui_kit::{Image, ImageFormat, ScrollHandle};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -38,6 +39,7 @@ pub(crate) struct Entry {
     #[serde(default)]
     pub pre_release: bool,
     pub target_platform: Option<String>,
+    repository: Option<String>,
     #[serde(default)]
     files: Files,
 }
@@ -77,7 +79,7 @@ pub(crate) struct SearchPage {
 
 pub(crate) struct Detail {
     pub release: Entry,
-    pub readme: Option<String>,
+    pub readme: Option<Arc<Readme>>,
     pub icon: Option<Arc<Image>>,
 }
 
@@ -96,6 +98,7 @@ pub(crate) struct Market {
     pub installed_only: bool,
     pub selected: Option<Entry>,
     pub detail: Option<Detail>,
+    pub video: Option<crate::marketplace::MarketVideo>,
     pub search_request: Option<u64>,
     pub detail_request: Option<u64>,
     pub installing: Option<String>,
@@ -141,12 +144,14 @@ pub(crate) fn search(query: &str, offset: usize) -> Result<SearchPage> {
 pub(crate) fn details(entry: &Entry) -> Result<Detail> {
     let release =
         release(&entry.namespace, &entry.name)?.context("No Open VSX release is available")?;
-    let readme = release
-        .files
-        .readme
-        .as_deref()
-        .and_then(|url| bytes(url, 512 * 1024).ok())
-        .and_then(|data| String::from_utf8(data).ok());
+    let readme = release.files.readme.as_deref().and_then(|url| {
+        let body = String::from_utf8(bytes(url, 512 * 1024).ok()?).ok()?;
+        Some(Arc::new(Readme::new(
+            body,
+            Url::parse(url).ok()?,
+            release.repository.as_deref(),
+        )))
+    });
     let icon = release
         .files
         .icon
@@ -293,7 +298,7 @@ fn asset_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_bytes(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_bytes(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     reader.take(limit + 1).read_to_end(&mut data)?;
     ensure!(
@@ -504,6 +509,7 @@ fn read_installed(root: &Path) -> Result<Installed> {
             average_rating: None,
             pre_release: false,
             target_platform: None,
+            repository: None,
             files: Files::default(),
         },
         root: root.to_path_buf(),
