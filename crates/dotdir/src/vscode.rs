@@ -3,7 +3,10 @@ use crate::{
     vscode_nls::{ExtensionLocalization, Locale},
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use gpui_kit::component::input::{Rope, RopeExt};
+use gpui_kit::{
+    Context, EntityInputHandler, Window,
+    component::input::{EditorState, Rope, RopeExt},
+};
 use lsp_types::Position;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -465,6 +468,16 @@ pub(crate) struct Edit {
     text: String,
 }
 
+impl From<lsp_types::TextEdit> for Edit {
+    fn from(edit: lsp_types::TextEdit) -> Self {
+        Self {
+            start: edit.range.start,
+            end: edit.range.end,
+            text: edit.new_text,
+        }
+    }
+}
+
 pub(crate) struct EditBatch {
     edits: Vec<(Range<usize>, String)>,
     pub range: Range<usize>,
@@ -513,6 +526,30 @@ impl EditBatch {
             delta += text.len() as isize - range.len() as isize;
         }
         offset.saturating_add_signed(delta)
+    }
+
+    pub(crate) fn apply(
+        self,
+        editor: &mut EditorState,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) -> bool {
+        if editor
+            .text()
+            .slice(self.range.clone())
+            .bytes()
+            .eq(self.text.bytes())
+        {
+            return false;
+        }
+        let selection = editor.selected_range();
+        let reversed = editor.is_selection_reversed();
+        let translated = self.translate(selection.start)..self.translate(selection.end);
+        editor.unmark_text(window, cx);
+        editor.set_selected_range(self.range, cx);
+        editor.replace(self.text, window, cx);
+        editor.set_selected_range_with_direction(translated, reversed, cx);
+        true
     }
 }
 

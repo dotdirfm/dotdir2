@@ -7,16 +7,19 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use gpui_kit::{
-    App, Task, Window,
-    component::input::{CompletionProvider, DefinitionProvider, Rope, RopeExt},
+    App, Entity, SharedString, Task, Window,
+    base::input::DiagnosticSet,
+    component::input::{
+        CodeActionProvider, CompletionProvider, DefinitionProvider, EditorState, Rope, RopeExt,
+    },
 };
 use lsp_types::{
-    CompletionContext, CompletionResponse, CompletionTextEdit, Diagnostic, GotoDefinitionResponse,
-    Hover, LocationLink, Position, Range,
+    CodeAction, CompletionContext, CompletionResponse, CompletionTextEdit, Diagnostic,
+    GotoDefinitionResponse, Hover, LocationLink, Position, Range,
 };
 use serde_json::{Value, json};
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -57,6 +60,11 @@ pub enum Notice {
     },
     Failed {
         session: u64,
+        error: String,
+    },
+    CodeActionFailed {
+        session: u64,
+        document: u64,
         error: String,
     },
 }
@@ -269,6 +277,15 @@ pub struct Buffer {
     connection: Arc<Connection>,
     text: RefCell<Rope>,
     revision: Cell<i32>,
+    diagnostics: RefCell<Option<DiagnosticSet>>,
+    code_actions: RefCell<Option<ListedActions>>,
+    action_generation: Cell<u64>,
+    next_action_request: Cell<u64>,
+}
+
+struct ListedActions {
+    range: std::ops::Range<usize>,
+    actions: Vec<CodeAction>,
 }
 
 impl Buffer {
@@ -291,6 +308,10 @@ impl Buffer {
             connection,
             text: RefCell::new(text),
             revision: Cell::new(1),
+            diagnostics: RefCell::new(None),
+            code_actions: RefCell::new(None),
+            action_generation: Cell::new(0),
+            next_action_request: Cell::new(0),
         }))
     }
 
@@ -320,6 +341,36 @@ impl Buffer {
         self.revision.get()
     }
 
+    pub(crate) fn diagnostics(&self) -> Ref<'_, Option<DiagnosticSet>> {
+        self.diagnostics.borrow()
+    }
+
+    pub(crate) fn set_diagnostics(&self, items: Vec<Diagnostic>) {
+        let diagnostics = (!items.is_empty()).then(|| {
+            let mut diagnostics = DiagnosticSet::new(&self.text.borrow());
+            diagnostics.extend(items);
+            diagnostics
+        });
+        self.diagnostics.replace(diagnostics);
+        self.invalidate_code_actions();
+    }
+
+    fn invalidate_code_actions(&self) {
+        self.code_actions.borrow_mut().take();
+        self.action_generation.set(self.action_generation.get() + 1);
+    }
+
+    pub(crate) fn action_generation(&self) -> u64 {
+        self.action_generation.get()
+    }
+
+    pub(crate) fn has_code_actions(&self, range: &std::ops::Range<usize>) -> bool {
+        self.code_actions
+            .borrow()
+            .as_ref()
+            .is_some_and(|list| &list.range == range && !list.actions.is_empty())
+    }
+
     pub fn change(&self, text: Rope) {
         let mut previous = self.text.borrow_mut();
         // Editor snapshots share rope chunks. Comparing their identity avoids
@@ -332,6 +383,8 @@ impl Buffer {
         if !same_snapshot {
             let revision = self.revision.get() + 1;
             self.revision.set(revision);
+            self.diagnostics.borrow_mut().take();
+            self.invalidate_code_actions();
             *previous = text.clone();
             let _ = self.connection.send(Event::Change {
                 id: self.id,
@@ -433,6 +486,58 @@ impl Buffer {
     fn position_params(&self, text: &Rope, offset: usize) -> Value {
         json!({"textDocument": {"uri": self.uri}, "position": wire_position(text, offset)})
     }
+
+    pub(crate) fn list_code_actions(
+        self: &Rc<Self>,
+        text: &Rope,
+        range: std::ops::Range<usize>,
+        cx: &App,
+    ) -> Task<Result<Vec<CodeAction>>> {
+        self.change(text.clone());
+        if let Some(list) = self
+            .code_actions
+            .borrow()
+            .as_ref()
+            .filter(|list| list.range == range)
+        {
+            return Task::ready(Ok(list.actions.clone()));
+        }
+        let revision = self.revision();
+        let generation = self.action_generation();
+        let request_id = self.next_action_request.get() + 1;
+        self.next_action_request.set(request_id);
+        let request = self.query(
+            text,
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": self.uri},
+                "version": revision,
+                "range": Range::new(wire_position(text, range.start), wire_position(text, range.end)),
+            }),
+            cx,
+        );
+        let buffer = Rc::downgrade(self);
+        cx.spawn(async move |_| {
+            let mut actions: Vec<CodeAction> =
+                serde_json::from_value::<Option<_>>(request.await?)?.unwrap_or_default();
+            let buffer = buffer.upgrade().context("Editor is closed")?;
+            ensure!(
+                buffer.action_generation() == generation,
+                "Code actions expired"
+            );
+            actions.sort_by_key(|action| action.is_preferred != Some(true));
+            for action in &mut actions {
+                action.data = Some(json!({"revision": revision, "wire": action.data.take()}));
+            }
+            if buffer.next_action_request.get() == request_id {
+                *buffer.code_actions.borrow_mut() = Some(ListedActions {
+                    range,
+                    actions: actions.clone(),
+                });
+            }
+            Ok(actions)
+        })
+    }
 }
 
 impl Drop for Buffer {
@@ -442,6 +547,110 @@ impl Drop for Buffer {
 }
 
 pub struct EditorProvider(pub Rc<Buffer>);
+
+impl CodeActionProvider for EditorProvider {
+    fn id(&self) -> SharedString {
+        format!("dotdir-lsp-{}", self.0.session()).into()
+    }
+
+    fn code_actions(
+        &self,
+        state: Entity<EditorState>,
+        range: std::ops::Range<usize>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Vec<CodeAction>>> {
+        let editor = state.read(cx);
+        self.0.list_code_actions(
+            editor.text(),
+            crate::quick_actions::action_range(&self.0, editor.text(), range),
+            cx,
+        )
+    }
+
+    fn perform_code_action(
+        &self,
+        state: Entity<EditorState>,
+        mut action: CodeAction,
+        _: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let buffer = self.0.clone();
+        let state = state.downgrade();
+        let provider_id = self.id();
+        window.spawn(cx, async move |cx| {
+            let result: Result<()> = async {
+                // GPUI invokes the provider while it holds a mutable editor lease.
+                let (text, revision, resolution) = cx.update(|_, cx| -> Result<_> {
+                    let editor = state.upgrade().context("Editor is closed")?;
+                    let text = editor.read(cx).text().clone();
+                    buffer.change(text.clone());
+                    let revision = buffer.revision();
+                    let data = action.data.take().unwrap_or_default();
+                    ensure!(
+                        data["revision"].as_i64() == Some(i64::from(revision)),
+                        "The buffer changed. Open Code Actions again."
+                    );
+                    action.data = data.get("wire").filter(|value| !value.is_null()).cloned();
+                    let resolution = action
+                        .edit
+                        .is_none()
+                        .then(|| buffer.query(&text, "codeAction/resolve", json!(action), cx));
+                    Ok((text, revision, resolution))
+                })??;
+                if let Some(request) = resolution {
+                    action = serde_json::from_value(request.await?)?;
+                }
+                let mut edit = action.edit.context("Code action did not supply an edit")?;
+                let changes = edit
+                    .changes
+                    .take()
+                    .filter(|changes| changes.len() == 1)
+                    .context("Code action requires changes outside this editor")?;
+                ensure!(
+                    edit.document_changes.is_none() && edit.change_annotations.is_none(),
+                    "Unsupported workspace edit"
+                );
+                let (_, edits) = changes
+                    .into_iter()
+                    .find(|(uri, _)| uri.as_str() == buffer.uri)
+                    .context("Code action targets a different file")?;
+                cx.update(|window, cx| {
+                    let state = state.upgrade().context("Editor is closed")?;
+                    state.update(cx, |editor, cx| {
+                        ensure!(
+                            editor.is_editable()
+                                && buffer.revision() == revision
+                                && editor.text() == &text
+                                && editor
+                                    .lsp()
+                                    .code_action_providers
+                                    .iter()
+                                    .any(|provider| provider.id() == provider_id),
+                            "The buffer changed. Open Code Actions again."
+                        );
+                        let batch = vscode::EditBatch::prepare(
+                            editor.text(),
+                            edits.into_iter().map(Into::into).collect(),
+                        )
+                        .context("Invalid code action edits")?;
+                        batch.apply(editor, window, cx);
+                        Ok(())
+                    })
+                })??;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = buffer
+                    .connection
+                    .send(Event::CodeActionError(buffer.id, format!("{error:#}")));
+            }
+            Ok(())
+        })
+    }
+}
 
 impl DefinitionProvider for EditorProvider {
     fn definitions(
@@ -691,6 +900,7 @@ type Reply = async_channel::Sender<Result<Value>>;
 
 enum Event {
     ArchiveChanged(PathBuf),
+    CodeActionError(u64, String),
     Open {
         id: u64,
         uri: String,
@@ -924,6 +1134,14 @@ impl Server {
 
     fn handle_event(&mut self, event: Event, notify: &Notify) -> Result<()> {
         match event {
+            Event::CodeActionError(document, error) => {
+                self.log.error(&format!("Code action: {error}"));
+                notify(Notice::CodeActionFailed {
+                    session: self.id,
+                    document,
+                    error,
+                });
+            }
             Event::ArchiveChanged(path) => {
                 self.notify("dotdir/archiveChanged", json!({"uri": file_uri(&path)}))?;
             }
@@ -1951,6 +2169,44 @@ mod tests {
                 _ => {}
             }
         }
+        let missing_member = "export class Foo implements Bar {\n}\ninterface Bar { x: number; }\n";
+        reopened.change(Rope::from(missing_member));
+        diagnostic(2, 2, &|items| !items.is_empty());
+        let actions = reopened
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": {"uri": reopened.uri},
+                    "version": 2,
+                    "range": Range::new(Position::new(0, 14), Position::new(0, 14)),
+                }),
+            )
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        let action = actions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["kind"] == "quickfix")
+            .unwrap_or_else(|| panic!("Expected TypeScript interface fix, got {actions}"));
+        let action = if action.get("edit").is_some() {
+            action.clone()
+        } else {
+            reopened
+                .request("codeAction/resolve", action.clone())
+                .unwrap()
+                .recv_blocking()
+                .unwrap()
+                .unwrap()
+        };
+        let edits = action["edit"]["changes"][&reopened.uri].as_array().unwrap();
+        assert!(edits.iter().any(|edit| {
+            edit["newText"]
+                .as_str()
+                .is_some_and(|text| text.contains("x: number;"))
+        }));
     }
 
     #[test]

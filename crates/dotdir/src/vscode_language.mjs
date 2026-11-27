@@ -157,6 +157,42 @@ function memento(directory, filename) {
   };
 }
 
+class TextEdit {
+  constructor(range, newText) { Object.assign(this, { range, newText }); }
+  static replace(range, text) { return new TextEdit(range, text); }
+  static insert(position, text) { return TextEdit.replace(new Range(position, position), text); }
+  static delete(range) { return TextEdit.replace(range, ''); }
+}
+
+class WorkspaceEdit {
+  documents = new Map();
+  hasResourceChanges = false;
+  set(uri, edits) {
+    const key = uri.toString();
+    this.documents.set(key, [uri, [...(this.documents.get(key)?.[1] ?? []), ...edits]]);
+  }
+  entries() { return [...this.documents.values()]; }
+  replace(uri, range, text) { this.set(uri, [TextEdit.replace(range, text)]); }
+  insert(uri, position, text) { this.set(uri, [TextEdit.insert(position, text)]); }
+  delete(uri, range) { this.set(uri, [TextEdit.delete(range)]); }
+  createFile() { this.hasResourceChanges = true; }
+  renameFile() { this.hasResourceChanges = true; }
+  deleteFile() { this.hasResourceChanges = true; }
+}
+
+function bufferEdits(edit, uri) {
+  if (edit.hasResourceChanges) return;
+  const entries = edit.entries();
+  if (entries.length !== 1 || entries[0][0].toString() !== uri) return;
+  const changes = [];
+  for (const entry of entries[0][1]) {
+    const [item, metadata] = Array.isArray(entry) ? entry : [entry];
+    if (metadata?.needsConfirmation || !item?.range || typeof item.newText !== 'string') return;
+    changes.push({ range: item.range, newText: item.newText });
+  }
+  if (changes.length) return { changes: { [uri]: changes } };
+}
+
 class LanguageSession {
   documents = new Map();
   providers = new Map();
@@ -171,6 +207,8 @@ class LanguageSession {
   diagnosticCollections = new Set();
   folders = [];
   requests = new Map();
+  codeActions = new Map();
+  nextCodeAction = 0;
   nextQuickPick = 0;
 
   constructor(api) {
@@ -318,6 +356,9 @@ class LanguageSession {
       CancellationError: class CancellationError extends Error {},
       Diagnostic: class Diagnostic { constructor(range, message, severity = 0) { Object.assign(this, { range, message, severity }); } },
       DiagnosticRelatedInformation: class DiagnosticRelatedInformation { constructor(location, message) { Object.assign(this, { location, message }); } },
+      TextEdit, WorkspaceEdit,
+      CodeAction: class CodeAction { constructor(title, kind) { Object.assign(this, { title, kind }); } },
+      CodeActionTriggerKind: enumValues(['Invoke', 'Automatic'], 1),
       CompletionItem: class CompletionItem { constructor(label, kind) { Object.assign(this, { label, kind }); } },
       CompletionList: class CompletionList { constructor(items = [], isIncomplete = false) { Object.assign(this, { items, isIncomplete }); } },
       SnippetString: class SnippetString { constructor(value = '') { this.value = value; } },
@@ -355,7 +396,7 @@ class LanguageSession {
     })) api.CodeActionKind[name] = new api.CodeActionKind(value);
     // These value types are subclassed when language clients load. Providers
     // for their corresponding features are registered independently here.
-    for (const name of ['CallHierarchyItem', 'CodeAction', 'CodeLens', 'DocumentLink', 'InlayHint', 'SymbolInformation', 'TypeHierarchyItem']) {
+    for (const name of ['CallHierarchyItem', 'CodeLens', 'DocumentLink', 'InlayHint', 'SymbolInformation', 'TypeHierarchyItem']) {
       api[name] = class {};
     }
   }
@@ -541,6 +582,52 @@ class LanguageSession {
     };
   }
 
+  async listCodeActions(params, token) {
+    const uri = params.textDocument.uri;
+    const document = this.documents.get(uri);
+    if (!document || document.version !== params.version) return [];
+    const range = makeRange(params.range);
+    const diagnostics = [...this.diagnosticCollections]
+      .flatMap(items => items.get(uri) ?? [])
+      .filter(item => !item.range.end.isBefore(range.start) && !item.range.start.isAfter(range.end));
+    const unresolved = new Map();
+    const result = [];
+    for (const { selector, provider } of this.providers.get('CodeActions') ?? []) {
+      if (!documentMatches(selector, document)) continue;
+      const items = await provider.provideCodeActions(document, range, { diagnostics, triggerKind: 1 }, token);
+      if (token.isCancellationRequested || document.version !== params.version) return [];
+      for (const action of items ?? []) {
+        if (!action.title || action.disabled || action.command) continue;
+        const item = { title: action.title, kind: action.kind?.value, isPreferred: action.isPreferred };
+        if (action.edit) {
+          item.edit = bufferEdits(action.edit, uri);
+          if (!item.edit) continue;
+        } else if (provider.resolveCodeAction) {
+          const id = ++this.nextCodeAction;
+          unresolved.set(id, { action, provider });
+          item.data = { uri, version: params.version, id };
+        } else {
+          continue;
+        }
+        result.push(item);
+      }
+    }
+    this.codeActions.set(uri, unresolved);
+    return result;
+  }
+
+  async resolveCodeAction(item, token) {
+    const { uri, version, id } = item.data;
+    const document = this.documents.get(uri);
+    const pending = this.codeActions.get(uri)?.get(id);
+    if (!pending || document?.version !== version) throw new Error('Code action expired');
+    const action = await pending.provider.resolveCodeAction(pending.action, token);
+    if (document.version !== version) throw new Error('Code action expired');
+    const edit = action?.edit && bufferEdits(action.edit, uri);
+    if (!edit || action.command || action.disabled) throw new Error('Code action requires changes outside this editor');
+    return { ...item, edit };
+  }
+
   send(message) {
     if (this.disconnected) return;
     const body = JSON.stringify({ jsonrpc: '2.0', ...message });
@@ -666,6 +753,7 @@ class LanguageSession {
     if (method === 'textDocument/didChange') {
       const document = this.documents.get(params.textDocument.uri);
       if (!document) return;
+      this.codeActions.delete(params.textDocument.uri);
       const contentChanges = params.contentChanges.map(({ range, text }) => {
         const start = range ? document.offsetAt(range.start) : 0;
         const end = range ? document.offsetAt(range.end) : document.text.length;
@@ -685,6 +773,7 @@ class LanguageSession {
     if (method === 'textDocument/didClose') {
       const document = this.documents.get(params.textDocument.uri);
       this.documents.delete(params.textDocument.uri);
+      this.codeActions.delete(params.textDocument.uri);
       if (document) { document.isClosed = true; this.close.fire(document); }
       if (document && this.editor?.document === document) {
         const next = [...this.documents.values()].at(-1);
@@ -705,6 +794,11 @@ class LanguageSession {
       await this.commands.executeCommand(params.command);
       return this.commandRequest.result;
     }
+    if (method === 'textDocument/codeAction') {
+      await this.activating;
+      return this.listCodeActions(params, token);
+    }
+    if (method === 'codeAction/resolve') return this.resolveCodeAction(params, token);
     const selected = providerKinds.get(method);
     if (!selected) return;
     await this.activating;

@@ -1,4 +1,4 @@
-use crate::archive::{ArchiveFormats, Location, SavedLocation};
+use crate::archive::{Location, SavedLocation};
 use crate::filesystems::Filesystems;
 use dotdir_core::ops::{EntryInfo, EntryKind};
 use serde::{Deserialize, Serialize};
@@ -671,7 +671,7 @@ impl Settings {
                 Presentation::Details
             })
     }
-    pub fn load(path: &Path, formats: &ArchiveFormats) -> Self {
+    pub fn load(path: &Path) -> Self {
         let mut s = std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
@@ -687,14 +687,6 @@ impl Settings {
                 Presentation::Details
             }; 2],
         );
-        for pane in [&mut s.left, &mut s.right] {
-            pane.retain(|location| location.clone().restore(formats).is_some());
-            if pane.is_empty() {
-                pane.push(SavedLocation::Local(
-                    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
-                ));
-            }
-        }
         s
     }
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -990,12 +982,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut settings = Settings::load(&settings_path, &crate::archive_extensions::BUNDLED);
+        let mut settings = Settings::load(&settings_path);
         assert_eq!(settings.presentation(0), Presentation::Details);
         assert_eq!(settings.presentation(1), Presentation::Details);
         settings.presentations = Some([Presentation::Icons, Presentation::Columns]);
         settings.save(&settings_path).unwrap();
-        let restored = Settings::load(&settings_path, &crate::archive_extensions::BUNDLED);
+        let restored = Settings::load(&settings_path);
         assert_eq!(restored.presentation(0), Presentation::Icons);
         assert_eq!(restored.presentation(1), Presentation::Columns);
     }

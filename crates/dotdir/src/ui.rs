@@ -5,7 +5,7 @@ use crate::{
     media::VIEWER_TITLE,
     model::*,
     operations::OperationKind,
-    selection_inspector, terminal,
+    quick_actions, selection_inspector, terminal,
     theme::Palette,
 };
 use dotdir_core::copy::{ConflictPolicy, ConflictResolution, SymlinkMode};
@@ -780,6 +780,7 @@ impl DotDir {
                 let id = *id;
                 let (state, readonly) = self.editor_for_pane(pane, id, window, cx);
                 let doc = &self.documents[&id];
+                let code_action_gutter = doc.path.local().is_some() && doc.lsp.is_some();
                 let breadcrumbs = self.render_breadcrumbs(pane, &doc.path, true, cx);
                 let status = doc.error.clone().unwrap_or_else(|| {
                     if doc.saving {
@@ -808,6 +809,9 @@ impl DotDir {
                             .flex_1()
                             .min_h_0()
                             .overflow_hidden()
+                            .when(code_action_gutter, |editor| {
+                                editor.pl(quick_actions::GUTTER_WIDTH)
+                            })
                             .font_family("Menlo")
                             .when(!readonly, |editor| {
                                 editor
@@ -824,6 +828,14 @@ impl DotDir {
                                     .appearance(false)
                                     .bordered(false)
                                     .readonly(readonly),
+                            )
+                            .children(
+                                doc.lsp
+                                    .as_ref()
+                                    .filter(|_| active && !readonly && self.show_quick_action(id))
+                                    .map(|buffer| {
+                                        quick_actions::button(&state, buffer, p.accent, p.selected)
+                                    }),
                             ),
                     )
                     .child(

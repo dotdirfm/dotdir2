@@ -5,7 +5,7 @@ use crate::{
     archive_typescript,
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
-    diagnostic_ruler::{self, DiagnosticRuler},
+    diagnostics::{DiagnosticDecorations, DiagnosticStyles},
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
     folder_sizes::{FolderSizeEvent, FolderSizes},
@@ -19,6 +19,7 @@ use crate::{
     open_vsx,
     operations::*,
     panel_menu::{JumpStep, PanelMenu},
+    quick_actions::QuickActions,
     selection_inspector::{self, SelectionSnapshot},
     syntax::language_for,
     terminal::Terminal,
@@ -1084,19 +1085,7 @@ impl DotDir {
                 return None;
             }
             let batch = vscode::EditBatch::prepare(editor.text(), edits)?;
-            let unchanged = editor
-                .text()
-                .slice(batch.range.clone())
-                .bytes()
-                .eq(batch.text.bytes());
-            if !unchanged {
-                let selection = editor.selected_range();
-                let reversed = editor.is_selection_reversed();
-                let translated = batch.translate(selection.start)..batch.translate(selection.end);
-                editor.unmark_text(window, cx);
-                editor.set_selected_range(batch.range, cx);
-                editor.replace(batch.text, window, cx);
-                editor.set_selected_range_with_direction(translated, reversed, cx);
+            if batch.apply(editor, window, cx) {
                 pending.version += 1;
                 pending.text = editor.text().clone();
             }
@@ -1333,7 +1322,7 @@ impl DotDir {
                         Ok(theme) => {
                             theme.apply(cx);
                             self.palette = theme.palette;
-                            self.refresh_diagnostic_rulers(cx);
+                            self.refresh_diagnostic_decorations(cx);
                             self.dismiss_hover(cx);
                             self.status = format!("Color theme: {}", theme.name);
                             self.color_theme_name = Some(theme.name);
@@ -1399,15 +1388,9 @@ impl DotDir {
                                 1 => format!("{name} · 1 diagnostic"),
                                 count => format!("{name} · {count} diagnostics"),
                             });
-                            doc.input.update(cx, |state, cx| {
-                                let text = state.text().clone();
-                                if let Some(diagnostics) = state.diagnostics_mut() {
-                                    diagnostics.reset(&text);
-                                    diagnostics.extend(items);
-                                    cx.notify();
-                                }
-                            });
-                            doc.refresh_diagnostic_ruler(cx);
+                            buffer.set_diagnostics(items);
+                            doc.refresh_diagnostic_decorations(cx);
+                            self.refresh_hover_diagnostics(document);
                         }
                     }
                     lsp::Notice::Failed { session, error } => {
@@ -1418,6 +1401,20 @@ impl DotDir {
                                 .is_some_and(|buffer| buffer.session() == session)
                         }) {
                             doc.clear_language_server(Some(error.clone()), cx);
+                        }
+                    }
+                    lsp::Notice::CodeActionFailed {
+                        session,
+                        document,
+                        error,
+                    } => {
+                        if self
+                            .documents
+                            .get(&document)
+                            .and_then(|doc| doc.lsp.as_ref())
+                            .is_some_and(|buffer| buffer.session() == session)
+                        {
+                            self.status = format!("Code action: {error}");
                         }
                     }
                 },
@@ -1569,7 +1566,7 @@ impl DotDir {
                                         {
                                             let was_dirty = doc.dirty();
                                             doc.version += 1;
-                                            doc.clear_diagnostic_ruler(cx);
+                                            doc.clear_diagnostic_decorations(cx);
                                             if let Some(view) = &doc.inactive_view {
                                                 let text = input.read(cx).value();
                                                 view.input.update(cx, |editor, cx| {
@@ -1605,7 +1602,7 @@ impl DotDir {
                                         path,
                                         input,
                                         inactive_view: None,
-                                        diagnostic_ruler: DiagnosticRuler::default(),
+                                        diagnostics: DiagnosticDecorations::default(),
                                         saved: bytes,
                                         version: 1,
                                         saved_version: 1,
@@ -1910,6 +1907,7 @@ impl DotDir {
         {
             self.extension_log_scroll.scroll_to_bottom();
         }
+        changed |= self.update_quick_actions(window, cx);
         if changed || logs_changed {
             cx.notify();
             window.refresh();
@@ -1918,7 +1916,7 @@ impl DotDir {
 }
 struct InactiveEditor {
     input: Entity<EditorState>,
-    diagnostic_ruler: DiagnosticRuler,
+    diagnostics: DiagnosticDecorations,
 }
 
 pub(crate) struct Document {
@@ -1926,7 +1924,7 @@ pub(crate) struct Document {
     pub path: Location,
     pub input: Entity<EditorState>,
     inactive_view: Option<InactiveEditor>,
-    diagnostic_ruler: DiagnosticRuler,
+    diagnostics: DiagnosticDecorations,
     pub saved: Vec<u8>,
     version: u64,
     saved_version: u64,
@@ -1943,18 +1941,30 @@ impl Document {
         self.inactive_view.as_ref().map(|view| &view.input)
     }
 
-    fn refresh_diagnostic_ruler(&mut self, cx: &mut App) {
-        let marks = diagnostic_ruler::marks(self.input.read(cx), cx);
-        if let Some(view) = &mut self.inactive_view {
-            view.diagnostic_ruler.set(&view.input, marks.clone(), cx);
-        }
-        self.diagnostic_ruler.set(&self.input, marks, cx);
+    fn diagnostic_styles(&self, cx: &App) -> DiagnosticStyles {
+        self.lsp
+            .as_ref()
+            .and_then(|buffer| {
+                let diagnostics = buffer.diagnostics();
+                diagnostics
+                    .as_ref()
+                    .map(|set| DiagnosticStyles::new(self.input.read(cx).text(), set, cx))
+            })
+            .unwrap_or_default()
     }
 
-    fn clear_diagnostic_ruler(&mut self, cx: &mut App) {
-        self.diagnostic_ruler.clear(cx);
+    fn refresh_diagnostic_decorations(&mut self, cx: &mut App) {
+        let styles = self.diagnostic_styles(cx);
         if let Some(view) = &mut self.inactive_view {
-            view.diagnostic_ruler.clear(cx);
+            view.diagnostics.set(&view.input, styles.clone(), cx);
+        }
+        self.diagnostics.set(&self.input, styles, cx);
+    }
+
+    fn clear_diagnostic_decorations(&mut self, cx: &mut App) {
+        self.diagnostics.clear(cx);
+        if let Some(view) = &mut self.inactive_view {
+            view.diagnostics.clear(cx);
         }
     }
 
@@ -1966,13 +1976,11 @@ impl Document {
             lsp.completion_provider = None;
             lsp.hover_provider = None;
             lsp.definition_provider = None;
+            lsp.code_action_providers.clear();
             lsp.show_document = None;
-            if let Some(diagnostics) = state.diagnostics_mut() {
-                diagnostics.clear();
-            }
             cx.notify();
         });
-        self.clear_diagnostic_ruler(cx);
+        self.clear_diagnostic_decorations(cx);
     }
 
     pub fn dirty(&self) -> bool {
@@ -2166,6 +2174,45 @@ impl TabStripScroll {
 }
 
 impl Pane {
+    fn restore(paths: &[SavedLocation], saved_active: usize, next_id: &mut u64) -> Self {
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (index, path) in paths.iter().enumerate() {
+            if let Some(location) = path.clone().restore(&ARCHIVE_FORMATS) {
+                if index <= saved_active {
+                    active = tabs.len();
+                }
+                tabs.push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
+                    *next_id, location,
+                ))));
+                *next_id += 1;
+            }
+        }
+        if tabs.is_empty() {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            tabs.push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
+                *next_id,
+                home.into(),
+            ))));
+            *next_id += 1;
+        }
+        Self { tabs, active }
+    }
+
+    fn saved_directories(&self) -> (Vec<SavedLocation>, usize) {
+        let mut paths = Vec::new();
+        let mut active = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if let TabContent::Directory(browser) = &tab.content {
+                if index <= self.active {
+                    active = paths.len();
+                }
+                paths.push(SavedLocation::from(&browser.current().path));
+            }
+        }
+        (paths, active)
+    }
+
     fn insert_after_active(&mut self, tab: Tab) {
         let index = (self.active + 1).min(self.tabs.len());
         self.tabs.insert(index, tab);
@@ -2405,6 +2452,7 @@ pub(crate) struct DotDir {
     vscode_language_command: Option<(u64, u64)>,
     language_servers: LanguageServers,
     pub hover: HoverHints,
+    pub(crate) quick_actions: QuickActions,
     source_jump: [Option<(u64, lsp_types::Position)>; 2],
     pub extension_errors: Vec<String>,
     pub extension_logs: ExtensionLogs,
@@ -2436,7 +2484,7 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut settings = Settings::load(&settings_path, &ARCHIVE_FORMATS);
+        let mut settings = Settings::load(&settings_path);
         if let Some(path) = initial {
             if let Some(path) = path
                 .to_str()
@@ -2448,15 +2496,19 @@ impl DotDir {
             } else if path.is_dir() {
                 settings.left = vec![SavedLocation::Local(path.clone())];
                 settings.right = vec![SavedLocation::Local(path)];
+                settings.left_active = 0;
+                settings.right_active = 0;
             } else if path.is_file()
                 && let Some(format) = ARCHIVE_FORMATS.for_path(&path)
             {
                 let path = path.canonicalize().unwrap_or(path);
                 if let Some(parent) = path.parent() {
                     settings.right = vec![SavedLocation::Local(parent.into())];
+                    settings.right_active = 0;
                 }
                 if let Ok(root) = Archive::mount_location(path.into(), format) {
                     settings.left = vec![SavedLocation::from(&root)];
+                    settings.left_active = 0;
                 }
             }
         }
@@ -2546,30 +2598,10 @@ impl DotDir {
             }),
         ];
         let mut next_id = 1;
-        let panes = [settings.left.clone(), settings.right.clone()].map(|paths| {
-            let mut locations: Vec<_> = paths
-                .into_iter()
-                .filter_map(|path| path.restore(&ARCHIVE_FORMATS))
-                .collect();
-            if locations.is_empty() {
-                locations.push(
-                    dirs::home_dir()
-                        .unwrap_or_else(|| PathBuf::from("/"))
-                        .into(),
-                );
-            }
-            Pane {
-                tabs: locations
-                    .into_iter()
-                    .map(|path| {
-                        let d = DirectoryBrowser::new(next_id, path);
-                        next_id += 1;
-                        Tab::new(TabContent::Directory(d))
-                    })
-                    .collect(),
-                active: 0,
-            }
-        });
+        let panes = [
+            Pane::restore(&settings.left, settings.left_active, &mut next_id),
+            Pane::restore(&settings.right, settings.right_active, &mut next_id),
+        ];
         let cache = extension_cache_directory();
         let vscode_tx = tx.clone();
         let vscode_host =
@@ -2642,6 +2674,7 @@ impl DotDir {
             vscode_language_command: None,
             language_servers,
             hover: HoverHints::default(),
+            quick_actions: QuickActions::default(),
             source_jump: [None, None],
             extension_errors: vec![],
             filesystems: {
@@ -2673,8 +2706,6 @@ impl DotDir {
             shutting_down: false,
             quit_pending: false,
         };
-        this.panes[0].active = this.settings.left_active.min(this.panes[0].tabs.len() - 1);
-        this.panes[1].active = this.settings.right_active.min(this.panes[1].tabs.len() - 1);
         this.load_extensions();
         let ids = this
             .panes
@@ -2817,15 +2848,15 @@ impl DotDir {
         self.settings.theme = id.into();
         self.palette = Palette::named(id);
         self.palette.apply(cx);
-        self.refresh_diagnostic_rulers(cx);
+        self.refresh_diagnostic_decorations(cx);
         self.dismiss_hover(cx);
         self.persist();
         cx.notify();
     }
 
-    fn refresh_diagnostic_rulers(&mut self, cx: &mut App) {
+    fn refresh_diagnostic_decorations(&mut self, cx: &mut App) {
         for doc in self.documents.values_mut() {
-            doc.refresh_diagnostic_ruler(cx);
+            doc.refresh_diagnostic_decorations(cx);
         }
     }
 
@@ -3449,7 +3480,7 @@ impl DotDir {
         if !shared || self.active == pane {
             return (doc.input.clone(), doc.readonly);
         }
-        let view = doc.inactive_view.get_or_insert_with(|| {
+        if doc.inactive_view.is_none() {
             let text = doc.input.read(cx).value();
             let language = language_for(doc.path.name_path());
             let input = cx.new(|cx| {
@@ -3458,13 +3489,11 @@ impl DotDir {
                     .soft_wrap(doc.line_wrap.unwrap_or(true))
                     .default_value(text)
             });
-            let mut diagnostic_ruler = DiagnosticRuler::default();
-            diagnostic_ruler.set(&input, diagnostic_ruler::marks(doc.input.read(cx), cx), cx);
-            InactiveEditor {
-                input,
-                diagnostic_ruler,
-            }
-        });
+            let mut diagnostics = DiagnosticDecorations::default();
+            diagnostics.set(&input, doc.diagnostic_styles(cx), cx);
+            doc.inactive_view = Some(InactiveEditor { input, diagnostics });
+        }
+        let view = doc.inactive_view.as_ref().unwrap();
         (view.input.clone(), true)
     }
     pub fn layout_for(&self, pane: usize, window: &Window) -> PanelLayout {
@@ -5081,9 +5110,13 @@ Selected entries will be permanently removed from the archive."
         doc.lsp = Some(buffer.clone());
         let provider = Rc::new(lsp::EditorProvider(buffer));
         let buffer = Rc::downgrade(&provider.0);
+        let code_actions = doc.path.local().is_some();
         doc.input.update(cx, |state, _| {
             let lsp = state.lsp_mut();
             lsp.completion_provider = Some(provider.clone());
+            if code_actions {
+                lsp.code_action_providers.push(provider.clone());
+            }
             lsp.definition_provider = Some(provider);
             lsp.show_document = Some(Rc::new(move |params, window, cx| {
                 let Some(destination) = buffer
@@ -5345,33 +5378,8 @@ Selected entries will be permanently removed from the archive."
         }
     }
     pub fn persist(&mut self) {
-        let paths = |p: &Pane| {
-            p.tabs
-                .iter()
-                .filter_map(|t| {
-                    if let TabContent::Directory(d) = &t.content {
-                        Some(SavedLocation::from(&d.current().path))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        self.settings.left = paths(&self.panes[0]);
-        self.settings.right = paths(&self.panes[1]);
-        for (i, pane) in self.panes.iter().enumerate() {
-            let index = pane
-                .tabs
-                .iter()
-                .take(pane.active)
-                .filter(|t| matches!(&t.content, TabContent::Directory(_)))
-                .count();
-            if i == 0 {
-                self.settings.left_active = index;
-            } else {
-                self.settings.right_active = index;
-            }
-        }
+        (self.settings.left, self.settings.left_active) = self.panes[0].saved_directories();
+        (self.settings.right, self.settings.right_active) = self.panes[1].saved_directories();
         self.settings.active_pane = self.active;
         if let Err(e) = self.settings.save(&self.settings_path) {
             eprintln!("Cannot save session: {e}");
@@ -5381,7 +5389,10 @@ Selected entries will be permanently removed from the archive."
 
 #[cfg(test)]
 mod tab_tests {
-    use super::{Pane, Tab, TabContent, parse_copy_destinations, quote_copy_destination};
+    use super::{
+        DirectoryBrowser, Pane, SavedLocation, Tab, TabContent, parse_copy_destinations,
+        quote_copy_destination,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -5426,6 +5437,61 @@ mod tab_tests {
         assert_eq!(pane.tabs[pane.active].id(), 2);
         pane.remove_tab(pane.active);
         assert_eq!(pane.tabs[pane.active].id(), 3);
+    }
+
+    #[test]
+    fn restored_tab_selection_skips_missing_directories_without_shifting_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let selected = temp.path().join("selected");
+        let last = temp.path().join("last");
+        for path in [&first, &selected, &last] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let paths = [
+            first.clone(),
+            temp.path().join("missing"),
+            selected.clone(),
+            last,
+        ]
+        .map(SavedLocation::Local);
+        let mut next_id = 1;
+        let pane = Pane::restore(&paths, 2, &mut next_id);
+        assert_eq!(pane.tabs.len(), 3);
+        let active_path = |pane: &Pane| match &pane.tabs[pane.active].content {
+            TabContent::Directory(browser) => browser.current().path.local().unwrap().to_path_buf(),
+            _ => panic!("Expected a directory tab"),
+        };
+        assert_eq!(active_path(&pane), selected);
+        let pane = Pane::restore(&paths, 1, &mut next_id);
+        assert_eq!(active_path(&pane), first);
+    }
+
+    #[test]
+    fn saving_with_a_file_tab_active_keeps_the_preceding_directory_selected() {
+        let folder = |id, path: &str| {
+            Tab::new(TabContent::Directory(DirectoryBrowser::new(
+                id,
+                PathBuf::from(path).into(),
+            )))
+        };
+        let mut pane = Pane {
+            tabs: vec![
+                folder(1, "first"),
+                folder(2, "selected"),
+                Tab::new(TabContent::Document(3)),
+                folder(4, "last"),
+            ],
+            active: 2,
+        };
+        let (paths, active) = pane.saved_directories();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(active, 1);
+        assert!(
+            matches!(&paths[active], SavedLocation::Local(path) if path == &PathBuf::from("selected"))
+        );
+        pane.active = 1;
+        assert_eq!(pane.saved_directories().1, active);
     }
 
     #[test]
