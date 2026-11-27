@@ -70,7 +70,7 @@ impl DotDir {
         let document = self.documents.get(&id)?;
         let revision = document.lsp.as_ref()?.revision();
         let editor = if pane != self.active {
-            document.inactive_view.as_ref().unwrap_or(&document.input)
+            document.inactive_editor().unwrap_or(&document.input)
         } else {
             &document.input
         };

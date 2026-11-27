@@ -8,6 +8,7 @@ mod archive_passwords;
 mod archive_typescript;
 mod column_scroll;
 mod commands;
+mod diagnostic_ruler;
 mod extension_logs;
 mod filesystems;
 mod folder_sizes;

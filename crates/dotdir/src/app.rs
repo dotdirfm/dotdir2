@@ -5,6 +5,7 @@ use crate::{
     archive_typescript,
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
+    diagnostic_ruler::{self, DiagnosticRuler},
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
     folder_sizes::{FolderSizeEvent, FolderSizes},
@@ -1332,6 +1333,7 @@ impl DotDir {
                         Ok(theme) => {
                             theme.apply(cx);
                             self.palette = theme.palette;
+                            self.refresh_diagnostic_rulers(cx);
                             self.dismiss_hover(cx);
                             self.status = format!("Color theme: {}", theme.name);
                             self.color_theme_name = Some(theme.name);
@@ -1405,6 +1407,7 @@ impl DotDir {
                                     cx.notify();
                                 }
                             });
+                            doc.refresh_diagnostic_ruler(cx);
                         }
                     }
                     lsp::Notice::Failed { session, error } => {
@@ -1566,9 +1569,10 @@ impl DotDir {
                                         {
                                             let was_dirty = doc.dirty();
                                             doc.version += 1;
+                                            doc.clear_diagnostic_ruler(cx);
                                             if let Some(view) = &doc.inactive_view {
                                                 let text = input.read(cx).value();
-                                                view.update(cx, |editor, cx| {
+                                                view.input.update(cx, |editor, cx| {
                                                     let scroll = editor.scroll_offset();
                                                     editor.set_value(text, window, cx);
                                                     editor.set_scroll_offset(scroll, cx);
@@ -1601,6 +1605,7 @@ impl DotDir {
                                         path,
                                         input,
                                         inactive_view: None,
+                                        diagnostic_ruler: DiagnosticRuler::default(),
                                         saved: bytes,
                                         version: 1,
                                         saved_version: 1,
@@ -1911,11 +1916,17 @@ impl DotDir {
         }
     }
 }
+struct InactiveEditor {
+    input: Entity<EditorState>,
+    diagnostic_ruler: DiagnosticRuler,
+}
+
 pub(crate) struct Document {
     pub id: u64,
     pub path: Location,
     pub input: Entity<EditorState>,
-    pub inactive_view: Option<Entity<EditorState>>,
+    inactive_view: Option<InactiveEditor>,
+    diagnostic_ruler: DiagnosticRuler,
     pub saved: Vec<u8>,
     version: u64,
     saved_version: u64,
@@ -1928,6 +1939,25 @@ pub(crate) struct Document {
     pub _subscription: Subscription,
 }
 impl Document {
+    pub(crate) fn inactive_editor(&self) -> Option<&Entity<EditorState>> {
+        self.inactive_view.as_ref().map(|view| &view.input)
+    }
+
+    fn refresh_diagnostic_ruler(&mut self, cx: &mut App) {
+        let marks = diagnostic_ruler::marks(self.input.read(cx), cx);
+        if let Some(view) = &mut self.inactive_view {
+            view.diagnostic_ruler.set(&view.input, marks.clone(), cx);
+        }
+        self.diagnostic_ruler.set(&self.input, marks, cx);
+    }
+
+    fn clear_diagnostic_ruler(&mut self, cx: &mut App) {
+        self.diagnostic_ruler.clear(cx);
+        if let Some(view) = &mut self.inactive_view {
+            view.diagnostic_ruler.clear(cx);
+        }
+    }
+
     fn clear_language_server(&mut self, status: Option<String>, cx: &mut App) {
         self.lsp = None;
         self.lsp_status = status;
@@ -1942,6 +1972,7 @@ impl Document {
             }
             cx.notify();
         });
+        self.clear_diagnostic_ruler(cx);
     }
 
     pub fn dirty(&self) -> bool {
@@ -2786,10 +2817,18 @@ impl DotDir {
         self.settings.theme = id.into();
         self.palette = Palette::named(id);
         self.palette.apply(cx);
+        self.refresh_diagnostic_rulers(cx);
         self.dismiss_hover(cx);
         self.persist();
         cx.notify();
     }
+
+    fn refresh_diagnostic_rulers(&mut self, cx: &mut App) {
+        for doc in self.documents.values_mut() {
+            doc.refresh_diagnostic_ruler(cx);
+        }
+    }
+
     pub fn id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -3086,8 +3125,7 @@ impl DotDir {
                 return None;
             }
             self.documents[&id]
-                .inactive_view
-                .as_ref()
+                .inactive_editor()
                 .filter(|mirror| mirror.read(cx).input_bounds().contains(&event.position))
                 .map(|mirror| (id, mirror.clone()))
         });
@@ -3414,14 +3452,20 @@ impl DotDir {
         let view = doc.inactive_view.get_or_insert_with(|| {
             let text = doc.input.read(cx).value();
             let language = language_for(doc.path.name_path());
-            cx.new(|cx| {
+            let input = cx.new(|cx| {
                 EditorState::new(window, cx)
                     .language(language)
                     .soft_wrap(doc.line_wrap.unwrap_or(true))
                     .default_value(text)
-            })
+            });
+            let mut diagnostic_ruler = DiagnosticRuler::default();
+            diagnostic_ruler.set(&input, diagnostic_ruler::marks(doc.input.read(cx), cx), cx);
+            InactiveEditor {
+                input,
+                diagnostic_ruler,
+            }
         });
-        (view.clone(), true)
+        (view.input.clone(), true)
     }
     pub fn layout_for(&self, pane: usize, window: &Window) -> PanelLayout {
         let height: f32 = window.viewport_size().height.into();
@@ -4402,7 +4446,7 @@ Selected entries will be permanently removed from the archive."
                     return;
                 };
                 doc.line_wrap = Some(!wrapped);
-                for editor in std::iter::once(&doc.input).chain(doc.inactive_view.as_ref()) {
+                for editor in std::iter::once(&doc.input).chain(doc.inactive_editor()) {
                     editor.update(cx, |state, cx| state.set_soft_wrap(!wrapped, window, cx));
                 }
                 self.dismiss_hover(cx);
