@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, RwLock},
 };
 
@@ -30,14 +29,12 @@ pub(crate) fn launch(extension: &vscode::Extension, settings: &vscode::Settings)
     let configured_node = settings.node.clone();
     Launch {
         name: "TypeScript 7 (Archive)".into(),
+        script: HOST,
         command: Box::new(move || {
             let node = vscode::node_path(configured_node.as_deref())
                 .context("Node.js 22.15 or newer is required for TypeScript in archives")?;
-            let mut command = Command::new(node);
-            command
-                .args(["--input-type=module", "--eval", HOST])
-                .env_remove("NODE_OPTIONS")
-                .env("NODE_DISABLE_COMPILE_CACHE", "1");
+            let mut command = vscode::node_command(&node);
+            command.env("NODE_DISABLE_COMPILE_CACHE", "1");
             Ok(command)
         }),
         options: json!({"extensionRoot": extension.directory()}),

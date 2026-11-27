@@ -96,6 +96,7 @@ impl Project {
 
 pub(crate) struct Launch {
     pub name: String,
+    pub script: &'static str,
     pub command: Box<dyn FnOnce() -> Result<Command> + Send>,
     pub options: Value,
 }
@@ -635,20 +636,30 @@ impl Connection {
         });
         std::thread::spawn(move || {
             log.append(&format!("Starting in {}", project.root.display()));
-            let result = (launch.command)()
-                .and_then(|command| {
-                    Server::start(
-                        id,
-                        command,
-                        &project.root,
-                        events,
-                        receiver,
-                        log.clone(),
-                        commands,
-                        archive,
-                    )
-                })
-                .and_then(|mut server| server.run(&project, launch.options, &notify));
+            let result = (launch.command)().and_then(|mut command| {
+                // The bundled host can exceed the Windows command line limit.
+                let mut script = tempfile::Builder::new()
+                    .prefix("dotdir-")
+                    .suffix(".mjs")
+                    .tempfile()
+                    .context("Creating the language host script")?;
+                script
+                    .write_all(launch.script.as_bytes())
+                    .context("Writing the language host script")?;
+                let script = script.into_temp_path();
+                command.arg(&*script);
+                let mut server = Server::start(
+                    id,
+                    command,
+                    &project.root,
+                    events,
+                    receiver,
+                    log.clone(),
+                    commands,
+                    archive,
+                )?;
+                server.run(&project, launch.options, &notify)
+            });
             running.store(false, Ordering::Relaxed);
             if let Err(error) = result {
                 log.error(&format!("{error:#}"));

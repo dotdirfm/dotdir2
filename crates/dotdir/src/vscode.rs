@@ -332,12 +332,15 @@ impl Extension {
         let configured_node = settings.node.clone();
         crate::lsp::Launch {
             name: self.title.clone(),
+            script: LANGUAGE_HOST,
             command: Box::new(move || {
                 let node = node_path(configured_node.as_deref()).context(
                     "Node.js 22.15 or newer is required. Set vscode.node in settings.json to its executable",
                 )?;
-                let mut command = host_command(&node, &cache, LANGUAGE_HOST);
-                command.env("DOTDIR_VSCODE_LANGUAGE", "1");
+                let mut command = node_command(&node);
+                command
+                    .env("DOTDIR_VSCODE_LANGUAGE", "1")
+                    .env("NODE_COMPILE_CACHE", &cache);
                 Ok(command)
             }),
             options: json!({
@@ -758,12 +761,23 @@ impl Process {
     }
 }
 
-pub(crate) fn host_command(node: &Path, cache: &Path, script: &str) -> Command {
+pub(crate) fn node_command(node: &Path) -> Command {
     let mut command = Command::new(node);
+    command.env_remove("NODE_OPTIONS");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+pub(crate) fn host_command(node: &Path, cache: &Path, script: &str) -> Command {
+    let mut command = node_command(node);
     command
         .args(["--input-type=module", "--eval", script])
         .env_remove("DOTDIR_VSCODE_LANGUAGE")
-        .env_remove("NODE_OPTIONS")
         .env("NODE_COMPILE_CACHE", cache);
     command
 }
@@ -834,10 +848,7 @@ pub(crate) fn node_path(configured: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn compatible_node(path: &Path) -> bool {
-    let output = Command::new(path)
-        .arg("--version")
-        .env_remove("NODE_OPTIONS")
-        .output();
+    let output = node_command(path).arg("--version").output();
     output
         .ok()
         .filter(|result| result.status.success())

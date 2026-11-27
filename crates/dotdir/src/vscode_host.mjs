@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createRequire, flushCompileCache, registerHooks } from 'node:module';
+import { createRequire, flushCompileCache, registerHooks, syncBuiltinESMExports } from 'node:module';
+import childProcess from 'node:child_process';
 import { basename, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -319,6 +320,26 @@ const api = {
   }
 };
 const languageSession = process.env.DOTDIR_VSCODE_LANGUAGE === '1' ? new LanguageSession(api) : undefined;
+if (languageSession && process.platform === 'win32') {
+  // Language clients use pipes for their servers. Hide those console windows,
+  // while preserving detached launches, inherited handles, and explicit choices.
+  const { spawn } = childProcess;
+  childProcess.spawn = (file, args, options) => {
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      options = args;
+      args = undefined;
+    }
+    const stdio = options?.stdio;
+    const piped = stdio == null || stdio === 'pipe' || stdio === 'overlapped' || stdio === 'ignore'
+      || (Array.isArray(stdio) && stdio.every(mode =>
+        mode == null || ['pipe', 'overlapped', 'ignore', 'ipc'].includes(mode)));
+    if (piped && !options?.detached && options?.windowsHide === undefined) {
+      options = { ...options, windowsHide: true };
+    }
+    return spawn(file, args, options);
+  };
+  syncBuiltinESMExports();
+}
 const apiKey = Symbol.for('dotdir.vscode.api');
 globalThis[apiKey] = api;
 const apiUrl = pathToFileURL(resolve('.dotdir-vscode-api.cjs')).href;
@@ -345,9 +366,9 @@ async function disposeSubscriptions(subscriptions) {
 }
 
 async function activate(job, request, context = {}) {
-  const root = realpathSync(request.root);
+  const root = realpathSync.native(request.root);
   const require = createRequire(resolve(root, 'package.json'));
-  const entry = realpathSync(require.resolve(resolve(root, request.main)));
+  const entry = realpathSync.native(require.resolve(resolve(root, request.main)));
   const inside = relative(root, entry);
   if (inside === '..' || inside.startsWith('..' + sep) || isAbsolute(inside)) {
     throw new Error('Extension entry point is outside its package');
