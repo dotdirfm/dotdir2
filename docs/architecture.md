@@ -97,14 +97,16 @@ the file panes and application chrome are custom GPUI elements.
   before refreshing both panes. Completed filesystem changes are not rolled back.
 - Terminal sessions own real PTYs, Alacritty terminal grids, and parser workers.
   Rendering and keyboard input are native. Closing a terminal kills its child.
-- Each DotDir JavaScript extension has a QuickJS runtime on the extension worker.
-  The application only receives serializable contributions and UI data.
-- Media viewer entities own their gallery snapshot, file watcher, GPUI image
-  source or native AVKit player. The gallery uses the same virtual directory
-  listing as the file panels. Virtual images decode from bytes and the AVKit
-  player requests ranges from a seekable virtual file through AVFoundation's
-  resource loader. Directory enumeration and virtual reads run in the
-  background. Native players pause when hidden or dropped, and stay in Rust.
+- The archive providers, Image & Video Viewer, and Selection Inspector are
+  compiled into the app. The QuickJS worker starts when a user installs a
+  DotDir JavaScript extension in their profile and DotDir loads it. The app only
+  receives serializable contributions and UI data from that worker.
+- Media viewer entities own their gallery snapshot, file watcher, and image
+  source or video player. The gallery uses the same virtual directory listing
+  as the file panels. Virtual images decode from bytes. AVKit on macOS and
+  libmpv on Windows and Linux read virtual videos through DotDir's seekable
+  file interface. Directory enumeration and virtual reads run in the
+  background. Playback pauses when a viewer is hidden and stops when it closes.
 
 ## Extension API v1
 
@@ -113,7 +115,7 @@ Top-level code calls `dotdir.registerCommand(id, title, callback)` or
 `dotdir.registerPanel(id, title, callback)`. The callback receives a context
 containing the active path, opposite path and selected entry metadata, plus an
 event (`null` when opened, `{id: "button-id"}` for panel buttons). Return an object
-with `message` and/or `panel`. See `extensions/selection-info`.
+with `message` and/or `panel`. See `examples/selection-info`.
 
 `dotdir.registerViewer(id, title, {renderer: "media", patterns, priority})` adds
 a declarative file viewer. Patterns match basenames without case sensitivity;
@@ -121,7 +123,9 @@ the highest priority wins. The host validates and owns the renderer, navigation,
 file watching and playback. Viewer registrations are not commands and do not
 expose filesystem, process or media objects to JavaScript. The initial renderer
 is `media`; see `extensions/image-viewer` for the port of the old image/video
-extension. This typed boundary can also be used by a future WASM transport.
+extension. The bundled viewer registers its file types in Rust and uses the
+same gallery and playback path as a third-party media viewer contribution.
+This typed boundary can also be used by a future WASM transport.
 
 The semantic panel tree supports column, row, text, button and table nodes.
 The host validates depth and dimensions, then renders real GPUI controls. This is

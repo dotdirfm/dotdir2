@@ -1,12 +1,14 @@
-//! Small platform bridge: AVKit controls and the system AVIF decoder on macOS.
-//! No browser or bundled codec library is involved.
+//! Platform media backends. macOS uses AVKit and the system AVIF decoder.
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub use crate::media_mpv::NativeMedia;
 #[cfg(target_os = "macos")]
 mod platform {
     use crate::archive::VirtualFile;
     use anyhow::{Context, Result, ensure};
     use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
     use dotdir_core::copy::CancelToken;
-    use gpui_kit::{App, NativeView, Window, rgb};
+    use gpui_kit::{App, FocusHandle, Focusable, NativeView, Window, rgb};
     use objc2::{
         AnyThread, DefinedClass, MainThreadMarker, class, define_class, msg_send,
         rc::Retained,
@@ -273,6 +275,9 @@ mod platform {
         pub fn view(&self) -> NativeView {
             self.view.clone()
         }
+        pub fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.view.focus_handle(cx)
+        }
         pub fn toggle_play(&self) {
             if let Some(player) = &self.player {
                 // SAFETY: the retained AVPlayer is used only on the main thread.
@@ -352,11 +357,11 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod platform {
     use crate::archive::VirtualFile;
     use anyhow::{Result, bail};
-    use gpui_kit::{App, NativeView, Window};
+    use gpui_kit::{App, FocusHandle, NativeView, Window};
     use std::path::Path;
     pub struct NativeMedia;
     impl NativeMedia {
@@ -374,6 +379,9 @@ mod platform {
         pub fn view(&self) -> NativeView {
             unreachable!()
         }
+        pub fn focus_handle(&self, _: &App) -> FocusHandle {
+            unreachable!()
+        }
         pub fn toggle_play(&self) {}
         pub fn set_visible(&mut self, _: bool) {}
         pub fn playback_status(&self) -> Option<Result<(), String>> {
@@ -381,4 +389,5 @@ mod platform {
         }
     }
 }
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub use platform::NativeMedia;

@@ -2,8 +2,8 @@
 
 A native Rust/GPUI port of DotDir. The interface follows the existing app's
 Ayu colors, compact column-based file panes, tabs, breadcrumbs, command line and
-function-key bar. JavaScript extensions run on QuickJS. No Deno or browser shell
-is used.
+function-key bar. Built-in extensions are compiled into the app. DotDir
+JavaScript extensions use QuickJS.
 
 ## Run
 
@@ -15,22 +15,29 @@ Omit the path to restore the previous directory tabs. The project pins Rust
 1.100.0 and GPUI Kit 0.11.0. Rustup installs the project toolchain automatically.
 On macOS, install full Xcode and its command-line tools for GPUI/Metal builds.
 
-Build a local, ad-hoc signed macOS app:
+Build a runnable package on the platform where you plan to run it:
 
 ```sh
-scripts/bundle-macos.sh        # optimized
-scripts/bundle-macos.sh debug  # faster builds for development
+cargo dist        # optimized release
+cargo dist debug  # faster build for development
 ```
+
+| Platform | Run this artifact |
+| --- | --- |
+| macOS | `dist/macos/DotDir Native.app` |
+| Windows | `dist/windows/dotdir.exe` |
+| Linux | `dist/linux/dotdir` |
+
+Each build replaces that platform's package. The built-in extensions are part
+of the executable. The macOS bundle is signed ad hoc for local use. Linux and
+Windows builds need the platform prerequisites described by
+[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
 Release builds optimize for executable size, use full link-time optimization,
 and strip symbols. They take longer to compile. A Rust panic terminates the
 process; ordinary application errors and JavaScript exceptions remain handled.
 Development and test builds retain panic unwinding.
 See the [release size measurements](docs/release-size.md) for the build comparison.
-
-Open `dist/DotDir Native.app`. This is a local development bundle, not a notarized
-distribution. Linux/Windows builds need the platform prerequisites described by
-[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
 ## Keyboard
 
@@ -149,8 +156,8 @@ images and videos in the same archive folder.
 Browsing and previews use no temporary files. Text, hex, and image previews are
 limited to 16 MiB per entry. Video and nested archive reads use direct seeks for
 plain TAR and stored ZIP or 7z entries. Other entries that need random access
-use up to 64 MiB each in memory. Native video and AVIF support are currently
-available on macOS.
+use up to 64 MiB each in memory. System AVIF decoding is available on macOS.
+Video playback on Windows and Linux requires libmpv.
 
 ZIP, 7z, and TAR support browsing, previews, extraction, and creation. ZIP
 also supports editing existing archives.
@@ -279,10 +286,14 @@ previewing files in DotDir. [Filesystem extension API](docs/architecture.md#file
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the
-gallery, **Space** to play/pause, and **Escape** to close. Native macOS video
-controls provide seeking and volume; hidden tabs pause playback. SVG, TIFF and
-system-decoded AVIF are included. Codec availability follows macOS; unsupported
-files show an error and an external-open action. See the
+gallery, **Space** to play/pause, and **Escape** to close. The video controls
+provide seeking and volume, and hidden tabs pause playback. macOS uses AVKit
+and the system AVIF decoder. On Windows, put an architecture-matched
+`libmpv-2.dll` next to DotDir or in its profile directory. On Linux, install the
+system package that provides `libmpv.so.2`. On either platform you can set
+`DOTDIR_LIBMPV` to the library’s absolute path. See [mpv’s installation
+guide](https://mpv.io/installation/) for runtime sources. Unsupported local
+files show an external-open action. See the
 [media viewer notes](extensions/image-viewer/README.md).
 
 For VS Code colors, open **F9 → Load VS Code Color Theme…** and enter a JSON,
@@ -301,10 +312,14 @@ settings; keep that directory installed. **Use built-in icons** restores the
 default appearance. Font-based icon themes and VS Code configuration commands
 are not supported; the extension's JavaScript is not executed.
 
-Open F11 and run **Selection Inspector**, or find it with F1. It executes a
-QuickJS module and displays native GPUI controls, including interactive buttons.
-The bundled example is in `extensions/selection-info`. User extensions are loaded
-from `<config>/extensions/<extension-name>/extension.json`.
+Open **F11 → Selection Inspector**, or find it with F1. The built-in inspector
+opens in the opposite pane and can refresh the selection without leaving the
+tab. **Selection: Show Summary** reports the selected item count.
+
+DotDir loads JavaScript extensions from
+`<config>/extensions/<extension-name>/extension.json`. Copy
+[`examples/selection-info`](examples/selection-info) there to try the QuickJS
+version of the inspector.
 
 See [architecture](docs/architecture.md) for API v1, bytecode caching, ownership,
 and the draft WASM-panel contract. The original DOM/Monaco extensions require

@@ -302,6 +302,20 @@ pub const COMMANDS: &[Command] = &[
         availability: Availability::Always,
     },
     Command {
+        id: crate::selection_inspector::INSPECT,
+        title: crate::selection_inspector::TITLE,
+        key: "",
+        context: "DotDir",
+        availability: Availability::Always,
+    },
+    Command {
+        id: crate::selection_inspector::SUMMARY,
+        title: crate::selection_inspector::SUMMARY_TITLE,
+        key: "",
+        context: "DotDir",
+        availability: Availability::Always,
+    },
+    Command {
         id: "terminal",
         title: "Toggle Terminal",
         key: "f12",

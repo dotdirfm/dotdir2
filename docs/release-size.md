@@ -18,7 +18,7 @@ one codegen unit, no debug information, symbol stripping, and abort-on-panic.
 The native UI, editors and syntax parsers, image decoders, PTY terminal,
 QuickJS extension host, and external icon-theme support remain enabled.
 
-Build with `cargo build --release` or `scripts/bundle-macos.sh`. To repeat
+Build with `cargo build --release` or package it with `cargo dist`. To repeat
 the other optimizer comparison, run:
 
 ```sh

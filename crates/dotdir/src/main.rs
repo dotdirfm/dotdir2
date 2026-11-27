@@ -15,6 +15,8 @@ mod icon_theme;
 mod lsp;
 mod marketplace;
 mod media;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod media_mpv;
 mod media_native;
 mod model;
 mod open_vsx;
@@ -22,6 +24,7 @@ mod open_vsx_media;
 mod operations;
 mod panel_menu;
 mod panels;
+mod selection_inspector;
 mod syntax;
 mod terminal;
 mod theme;

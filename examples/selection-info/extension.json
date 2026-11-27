@@ -1,0 +1,7 @@
+{
+  "id": "example.selection-info",
+  "name": "Selection Inspector (QuickJS Example)",
+  "version": "1.0.0",
+  "api_version": 1,
+  "main": "main.js"
+}

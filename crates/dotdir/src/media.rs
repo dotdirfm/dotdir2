@@ -12,24 +12,57 @@ use gpui_kit::*;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
+
+pub(crate) const VIEWER_TITLE: &str = "Image & Video Viewer";
+pub(crate) const VIEWER_PRIORITY: i32 = 10;
+const IMAGE_PATTERNS: &[&str] = &[
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.webp", "*.ico", "*.svg", "*.avif", "*.tiff",
+    "*.tif",
+];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "webm", "ogv", "ogg", "mov"];
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const EXTRA_VIDEO_EXTENSIONS: &[&str] = &["mkv", "avi", "mpeg", "mpg", "wmv", "flv"];
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+const EXTRA_VIDEO_EXTENSIONS: &[&str] = &[];
+
+fn video_extensions() -> impl Iterator<Item = &'static str> {
+    VIDEO_EXTENSIONS
+        .iter()
+        .chain(EXTRA_VIDEO_EXTENSIONS)
+        .copied()
+}
 
 #[derive(Clone)]
 pub struct MediaFilter {
     matcher: GlobSet,
 }
 impl MediaFilter {
-    pub fn new(patterns: &[String]) -> anyhow::Result<Self> {
+    pub fn new(patterns: impl IntoIterator<Item = impl AsRef<str>>) -> anyhow::Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
-            builder.add(GlobBuilder::new(pattern).case_insensitive(true).build()?);
+            builder.add(
+                GlobBuilder::new(pattern.as_ref())
+                    .case_insensitive(true)
+                    .build()?,
+            );
         }
         Ok(Self {
             matcher: builder.build()?,
+        })
+    }
+    pub(crate) fn bundled() -> &'static Self {
+        static FILTER: OnceLock<MediaFilter> = OnceLock::new();
+        FILTER.get_or_init(|| {
+            let patterns = IMAGE_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .chain(video_extensions().map(|extension| format!("*.{extension}")));
+            Self::new(patterns).expect("valid bundled media patterns")
         })
     }
     pub fn matches(&self, path: &Path) -> bool {
@@ -67,14 +100,12 @@ pub fn image_format(path: &Location) -> Option<ImageFormat> {
 }
 
 pub fn is_video(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "mp4" | "m4v" | "mov" | "webm" | "ogv" | "ogg"
-    )
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            video_extensions()
+                .any(|video_extension| extension.eq_ignore_ascii_case(video_extension))
+        })
 }
 
 #[derive(Default)]
@@ -146,7 +177,7 @@ impl EventEmitter<MediaEvent> for MediaViewer {}
 impl Focusable for MediaViewer {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.backend {
-            Backend::Native(n) => n.view().focus_handle(cx),
+            Backend::Native(n) => n.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -280,7 +311,9 @@ impl MediaViewer {
         .into();
         self.backend = Backend::Loading;
 
-        if let Some(local) = self.path.local() {
+        if let Some(local) = self.path.local()
+            && (!video || !cfg!(any(target_os = "windows", target_os = "linux")))
+        {
             if video || avif {
                 let native = NativeMedia::new(local, video, window, cx);
                 self.set_native(native, video, window, cx);
@@ -394,7 +427,7 @@ impl MediaViewer {
                                 false
                             }
                             None if started.elapsed() > Duration::from_secs(20) => {
-                                this.set_error("The video could not be loaded. Its format or codec may not be supported by macOS.".into());
+                                this.set_error("The video could not be loaded. Its format or codec may not be supported.".into());
                                 cx.emit(MediaEvent::Changed);
                                 cx.notify();
                                 false
@@ -411,6 +444,9 @@ impl MediaViewer {
         cx.notify();
     }
     pub fn set_visible(&mut self, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
         self.visible = visible;
         if let Backend::Native(native) = &mut self.backend {
             native.set_visible(visible);
@@ -598,11 +634,25 @@ mod tests {
     #[test]
     fn gallery_filters_formats_and_preserves_directory_sort() {
         let temp = tempfile::tempdir().unwrap();
-        for name in ["b.MP4", "a.svg", "z.txt", ".hidden.png"] {
+        let hidden = temp.path().join(".hidden.png");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0002;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .attributes(FILE_ATTRIBUTE_HIDDEN)
+                .open(hidden)
+                .unwrap();
+        }
+        #[cfg(not(windows))]
+        std::fs::write(hidden, "").unwrap();
+        for name in ["b.MP4", "a.svg", "z.txt"] {
             std::fs::write(temp.path().join(name), "").unwrap();
         }
         std::fs::create_dir(temp.path().join("folder.png")).unwrap();
-        let filter = MediaFilter::new(&["*.png".into(), "*.svg".into(), "*.mp4".into()]).unwrap();
+        let filter = MediaFilter::bundled();
         let paths = filter
             .gallery(
                 &temp.path().into(),
@@ -620,6 +670,12 @@ mod tests {
         );
         assert!(is_video(paths[1].name_path()));
         assert!(!is_video(paths[0].name_path()));
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            let matroska = std::path::Path::new("video.MKV");
+            assert!(filter.matches(matroska));
+            assert!(is_video(matroska));
+        }
     }
     #[test]
     fn gallery_does_not_wrap_and_recovers_after_current_file_removed() {

@@ -2,9 +2,10 @@ use crate::{
     app::*,
     archive::Location,
     commands::{COMMANDS, function_key_command},
+    media::VIEWER_TITLE,
     model::*,
     operations::OperationKind,
-    terminal,
+    selection_inspector, terminal,
     theme::Palette,
 };
 use dotdir_core::copy::{ConflictPolicy, ConflictResolution, SymlinkMode};
@@ -439,6 +440,10 @@ impl DotDir {
                 TabContent::Panel { title, .. } => {
                     (title.clone(), TabIcon::Glyph(IconName::LayoutDashboard))
                 }
+                TabContent::SelectionInspector { .. } => (
+                    selection_inspector::TITLE.into(),
+                    TabIcon::Glyph(IconName::LayoutDashboard),
+                ),
                 TabContent::Pending { path, .. } => path
                     .as_ref()
                     .and_then(Location::file_name)
@@ -725,6 +730,42 @@ impl DotDir {
                     ),
                 )
                 .into_any_element(),
+            TabContent::SelectionInspector { snapshot, .. } => div()
+                .id(("selection-inspector", pane))
+                .when(active, |s| s.track_focus(&self.focus))
+                .key_context("ExtensionPane")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .gap(px(12.))
+                .p(px(16.))
+                .child(text(selection_inspector::TITLE))
+                .child(text(snapshot.path.clone()).text_color(p.muted))
+                .child(
+                    self.render_panel_table(
+                        ["Name", "Kind", "Size"].map(str::to_owned).into(),
+                        snapshot
+                            .entries
+                            .iter()
+                            .map(|entry| {
+                                vec![
+                                    entry.name.clone(),
+                                    if entry.directory { "Directory" } else { "File" }.into(),
+                                    entry.size.to_string(),
+                                ]
+                            })
+                            .collect(),
+                    ),
+                )
+                .child(self.button(
+                    "refresh-selection-inspector",
+                    "Refresh selection",
+                    move |this, _, cx| this.refresh_selection_inspector(pane, cx),
+                    cx,
+                ))
+                .into_any_element(),
             TabContent::Panel {
                 node,
                 extension,
@@ -826,24 +867,34 @@ impl DotDir {
                 )
                 .into_any_element(),
             PanelNode::Table { columns, rows } => {
-                let mut table = div().flex().flex_col().border_1().border_color(p.border);
-                let header = div().flex().bg(p.input).children(
-                    columns
-                        .into_iter()
-                        .map(|c| text(c).flex_1().p(px(8.)).font_weight(FontWeight::SEMIBOLD)),
-                );
-                table = table.child(header);
-                for (i, row) in rows.into_iter().enumerate() {
-                    table = table.child(
-                        div()
-                            .flex()
-                            .when(i % 2 == 0, |s| s.bg(p.selected))
-                            .children(row.into_iter().map(|c| text(c).flex_1().p(px(8.)))),
-                    );
-                }
-                table.into_any_element()
+                self.render_panel_table(columns, rows).into_any_element()
             }
         }
+    }
+
+    fn render_panel_table(&self, columns: Vec<String>, rows: Vec<Vec<String>>) -> Div {
+        let p = self.palette;
+        let header = div()
+            .flex()
+            .bg(p.input)
+            .children(columns.into_iter().map(|column| {
+                text(column)
+                    .flex_1()
+                    .p(px(8.))
+                    .font_weight(FontWeight::SEMIBOLD)
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(p.border)
+            .child(header)
+            .children(rows.into_iter().enumerate().map(|(index, row)| {
+                div()
+                    .flex()
+                    .when(index % 2 == 0, |s| s.bg(p.selected))
+                    .children(row.into_iter().map(|cell| text(cell).flex_1().p(px(8.))))
+            }))
     }
 
     fn render_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1716,6 +1767,42 @@ impl DotDir {
                                     .text_color(p.muted),
                             ),
                     );
+                }
+                for (title, actions) in [
+                    (VIEWER_TITLE, &[("View selected file", "view")][..]),
+                    (
+                        selection_inspector::TITLE,
+                        &[
+                            (selection_inspector::TITLE, selection_inspector::INSPECT),
+                            (
+                                selection_inspector::SUMMARY_TITLE,
+                                selection_inspector::SUMMARY,
+                            ),
+                        ][..],
+                    ),
+                ] {
+                    let mut row = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .p(px(12.))
+                        .border_1()
+                        .border_color(p.border)
+                        .rounded(px(4.))
+                        .child(text(title).font_weight(FontWeight::SEMIBOLD))
+                        .child(text("Bundled extension").text_color(p.muted));
+                    for &(label, command) in actions {
+                        row = row.child(self.button(
+                            SharedString::from(format!("bundled-{command}")),
+                            label,
+                            move |this, window, cx| {
+                                this.dismiss(window, cx);
+                                this.run(command, window, cx);
+                            },
+                            cx,
+                        ));
+                    }
+                    content = content.child(row);
                 }
                 for e in &self.extensions {
                     let mut row = div()

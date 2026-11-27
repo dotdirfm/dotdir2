@@ -10,11 +10,12 @@ use crate::{
     hover::HoverHints,
     icon_theme::IconTheme,
     lsp::{self, LanguageServers},
-    media::{MediaEvent, MediaFilter, MediaViewer, image_format},
+    media::{MediaEvent, MediaFilter, MediaViewer, VIEWER_PRIORITY, image_format},
     model::*,
     open_vsx,
     operations::*,
     panel_menu::{JumpStep, PanelMenu},
+    selection_inspector::{self, SelectionSnapshot},
     syntax::language_for,
     terminal::Terminal,
     theme::Palette,
@@ -44,6 +45,12 @@ use std::{
 };
 
 const VSCODE_RUNNING: &str = "Running VS Code extension…";
+
+fn extension_cache_directory() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dev.dotdir.native")
+}
 
 pub(crate) enum Message {
     Market(open_vsx::Event),
@@ -668,63 +675,55 @@ impl DotDir {
         let mut filesystems = self
             .filesystems
             .rebuild_providers(self.extension_logs.clone());
-        let mut roots = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions")];
-        if let Some(bundle) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("../Resources/extensions")))
-        {
-            roots.push(bundle);
-        }
-        if let Some(base) = self.settings_path.parent() {
-            let directory = base.join("extensions");
-            self.load_vscode_extensions(&directory);
-            self.reset_vscode_host();
-            roots.push(directory);
-        }
+        let directory = self.settings_path.with_file_name("extensions");
+        self.load_vscode_extensions(&directory);
+        self.reset_vscode_host();
+        let mut paths = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
         let mut seen = std::collections::HashSet::new();
-        for root in roots {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                let mut paths = entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .collect::<Vec<_>>();
-                paths.sort_unstable();
-                for path in paths {
-                    if !path.join("extension.json").is_file() {
-                        continue;
-                    }
-                    if !seen.insert(path.canonicalize().unwrap_or(path.clone())) {
-                        continue;
-                    }
-                    if let Some(manifest) = std::fs::read(path.join("extension.json"))
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .filter(|manifest| manifest["runtime"].as_str() == Some("node"))
-                    {
-                        let result = serde_json::from_value(manifest)
-                            .map_err(Into::into)
-                            .and_then(|package| {
-                                filesystems.register(
-                                    package,
-                                    &path,
-                                    self.settings.vscode.node.clone(),
-                                    self.extension_logs.clone(),
-                                )
-                            });
-                        if let Err(error) = result {
-                            self.report_extension_error(format!("{}: {error:#}", path.display()));
-                        }
-                        continue;
-                    }
-                    let rx = self.extension_host.load(path);
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        if let Ok(result) = rx.recv() {
-                            let _ = tx.send(Message::Extension(result));
-                        }
-                    });
-                }
+        for path in paths {
+            let manifest_path = path.join("extension.json");
+            if !manifest_path.is_file() || !seen.insert(path.canonicalize().unwrap_or(path.clone()))
+            {
+                continue;
             }
+            if let Some(manifest) = std::fs::read(manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .filter(|manifest| manifest["runtime"].as_str() == Some("node"))
+            {
+                let result = serde_json::from_value(manifest)
+                    .map_err(Into::into)
+                    .and_then(|package| {
+                        filesystems.register(
+                            package,
+                            &path,
+                            self.settings.vscode.node.clone(),
+                            self.extension_logs.clone(),
+                        )
+                    });
+                if let Err(error) = result {
+                    self.report_extension_error(format!("{}: {error:#}", path.display()));
+                }
+                continue;
+            }
+            let rx = self
+                .extension_host
+                .get_or_insert_with(|| {
+                    ExtensionHost::new(extension_cache_directory().join("quickjs"))
+                })
+                .load(path);
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(result) = rx.recv() {
+                    let _ = tx.send(Message::Extension(result));
+                }
+            });
         }
         self.filesystems = filesystems;
     }
@@ -1095,7 +1094,7 @@ impl DotDir {
             ))
         })
     }
-    pub fn extension_context(&self) -> serde_json::Value {
+    pub(crate) fn extension_selection(&self) -> (usize, Vec<Entry>) {
         let source = if self.directory(self.active).is_some() {
             self.active
         } else {
@@ -1105,6 +1104,10 @@ impl DotDir {
             .directory(source)
             .map(Directory::selected)
             .unwrap_or_default();
+        (source, selected)
+    }
+    pub fn extension_context(&self) -> serde_json::Value {
+        let (source, selected) = self.extension_selection();
         json!({"path":self.pane_location(source).display(),"oppositePath":self.pane_location(1-source).display(),"selected":selected.iter().map(|e|json!({"name":e.name,"path":e.path.display(),"size":e.size,"directory":e.directory})).collect::<Vec<_>>()})
     }
     pub fn invoke_extension(
@@ -1115,6 +1118,9 @@ impl DotDir {
         event: serde_json::Value,
         _cx: &mut Context<Self>,
     ) {
+        let Some(host) = &self.extension_host else {
+            return;
+        };
         let target = (!event.is_null())
             .then(|| {
                 let pane = &self.panes[self.active];
@@ -1126,7 +1132,7 @@ impl DotDir {
             .flatten();
         self.extension_request += 1;
         let request = self.extension_request;
-        let rx = self.extension_host.invoke(
+        let rx = host.invoke(
             extension.clone(),
             command.clone(),
             self.extension_context(),
@@ -1969,6 +1975,10 @@ pub(crate) enum TabContent {
         command: String,
         node: PanelNode,
     },
+    SelectionInspector {
+        id: u64,
+        snapshot: SelectionSnapshot,
+    },
 }
 impl TabContent {
     pub fn id(&self) -> u64 {
@@ -1976,6 +1986,7 @@ impl TabContent {
             Self::Directory(d) => d.id,
             Self::Document(id) => *id,
             Self::Panel { id, .. }
+            | Self::SelectionInspector { id, .. }
             | Self::Image { id, .. }
             | Self::Media { id, .. }
             | Self::Pending { id, .. } => *id,
@@ -2330,7 +2341,7 @@ pub(crate) struct DotDir {
     pub terminal_visible: bool,
     pub panels_visible: bool,
     pub extensions: Vec<LoadedExtension>,
-    pub extension_host: ExtensionHost,
+    extension_host: Option<ExtensionHost>,
     pub vscode_extensions: Vec<vscode::Extension>,
     vscode_host: vscode::Host,
     vscode_language_command: Option<(u64, u64)>,
@@ -2501,10 +2512,7 @@ impl DotDir {
                 active: 0,
             }
         });
-        let cache = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("dev.dotdir.native");
-        let host = ExtensionHost::new(cache.join("quickjs"));
+        let cache = extension_cache_directory();
         let vscode_tx = tx.clone();
         let vscode_host =
             vscode::Host::new(cache.join("node"), extension_logs.clone(), move |event| {
@@ -2570,7 +2578,7 @@ impl DotDir {
             terminal_visible: false,
             panels_visible: true,
             extensions: vec![],
-            extension_host: host,
+            extension_host: None,
             vscode_extensions: vec![],
             vscode_host,
             vscode_language_command: None,
@@ -3251,6 +3259,13 @@ impl DotDir {
                 (TabContent::Directory(browser), None)
             }
             TabContent::Document(document) => (TabContent::Document(*document), None),
+            TabContent::SelectionInspector { snapshot, .. } => (
+                TabContent::SelectionInspector {
+                    id,
+                    snapshot: snapshot.clone(),
+                },
+                None,
+            ),
             TabContent::Image { path, image, .. } => (
                 TabContent::Image {
                     id,
@@ -3933,6 +3948,8 @@ impl DotDir {
             self.end_shift_selection();
         }
         match id {
+            selection_inspector::INSPECT => self.open_selection_inspector(window, cx),
+            selection_inspector::SUMMARY => self.status = self.selection_snapshot().summary(),
             "left-panel-menu" => self.open_panel_menu(0, window, cx),
             "right-panel-menu" => self.open_panel_menu(1, window, cx),
             "keep-preview" => {
@@ -4553,7 +4570,11 @@ Selected entries will be permanently removed from the archive."
         };
         let readonly = readonly || !path.editable();
         if readonly {
-            let viewer = self
+            let bundled = MediaFilter::bundled();
+            let builtin = bundled
+                .matches(path.name_path())
+                .then(|| (VIEWER_PRIORITY, bundled.clone()));
+            let extensions = self
                 .extensions
                 .iter()
                 .flat_map(|e| &e.contributions)
@@ -4563,7 +4584,10 @@ Selected entries will be permanently removed from the archive."
                         .ok()
                         .filter(|f| f.matches(path.name_path()))
                         .map(|f| (v.priority, f))
-                })
+                });
+            let viewer = builtin
+                .into_iter()
+                .chain(extensions)
                 .max_by_key(|(priority, _)| *priority);
             if let Some((_, filter)) = viewer {
                 if tab.is_none() {
