@@ -84,10 +84,8 @@ impl Render for TabDragPreview {
     }
 }
 
-fn tab_meets_pane_edge(scroll: &ScrollHandle, index: usize) -> bool {
-    scroll.bounds_for_item(index).is_some_and(|tab| {
-        (tab.left() + scroll.offset().x - scroll.bounds().left()).abs() < px(0.01)
-    })
+fn tab_overlaps_pane_corner(tab_left: Pixels, tab_right: Pixels, pane_left: Pixels) -> bool {
+    tab_right > pane_left && tab_left < pane_left + PANE_CORNER_RADIUS
 }
 
 fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>, flush_left: bool) {
@@ -119,31 +117,26 @@ fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>, flush_left: bo
     path.curve_to(point(right, bottom), point(right - radius, bottom));
 }
 
-fn tab_surface(
-    color: Hsla,
-    border: Hsla,
-    selected: Option<(ScrollHandle, usize)>,
-) -> impl IntoElement {
+fn tab_surface(color: Hsla, border: Hsla, selected: Option<ScrollHandle>) -> impl IntoElement {
     let is_selected = selected.is_some();
     let shape = canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            let flush_left = selected
-                .as_ref()
-                .is_some_and(|(scroll, index)| tab_meets_pane_edge(scroll, *index));
+            let pane_left = selected.as_ref().map(|scroll| scroll.bounds().left());
+            let flush_left = pane_left.is_some_and(|left| (bounds.left() - left).abs() < px(0.01));
             let divider_top = bounds.bottom() - TAB_BORDER_WIDTH;
-            let edge_bottom = if is_selected {
-                // Cover the divider beneath the selected tab and center the curved
-                // outline on the divider so the two meet at its ends.
-                let divider_left = if flush_left {
-                    bounds.left() + TAB_BORDER_WIDTH
-                } else {
-                    bounds.left()
-                };
-                window.paint_quad(fill(
-                    Bounds::from_corners(point(divider_left, divider_top), bounds.bottom_right()),
-                    color,
-                ));
+            let edge_bottom = if let Some(pane_left) = pane_left {
+                // Keep the pane's left stroke intact when a tab extends past the clip.
+                let divider_left = bounds.left().max(pane_left + TAB_BORDER_WIDTH);
+                if divider_left < bounds.right() {
+                    window.paint_quad(fill(
+                        Bounds::from_corners(
+                            point(divider_left, divider_top),
+                            bounds.bottom_right(),
+                        ),
+                        color,
+                    ));
+                }
                 divider_top + TAB_BORDER_WIDTH / 2.
             } else {
                 divider_top
@@ -626,7 +619,7 @@ impl DotDir {
                     .child(tab_surface(
                         surface,
                         outline,
-                        selected.then(|| (scroll.clone(), index)),
+                        selected.then(|| scroll.clone()),
                     ))
                     .when(
                         !selected && index + 1 < tab_count && index + 1 != selected_index,
@@ -1017,7 +1010,15 @@ impl DotDir {
                     |_, _, _| (),
                     move |bounds, _, window, _| {
                         let mut corners = Corners::all(PANE_CORNER_RADIUS);
-                        if tab_meets_pane_edge(&scroll, selected_index) {
+                        let left = scroll.bounds().left();
+                        let offset = scroll.offset().x;
+                        if scroll.bounds_for_item(selected_index).is_some_and(|tab| {
+                            tab_overlaps_pane_corner(
+                                tab.left() + offset,
+                                tab.right() + offset,
+                                left,
+                            )
+                        }) {
                             corners.top_left = px(0.);
                         }
                         window.paint_quad(quad(
@@ -2732,5 +2733,20 @@ impl Render for DotDir {
         root = root.children(self.render_hover(window, cx));
         root = root.children(self.render_presentation_keystroke(window));
         root
+    }
+}
+
+#[cfg(test)]
+mod tab_outline_tests {
+    use super::{px, tab_overlaps_pane_corner};
+
+    #[test]
+    fn selected_tab_squares_the_corner_while_it_overlaps_the_left_edge() {
+        let pane_left = px(20.);
+        assert!(tab_overlaps_pane_corner(px(17.), px(95.), pane_left));
+        assert!(tab_overlaps_pane_corner(px(20.), px(98.), pane_left));
+        assert!(tab_overlaps_pane_corner(px(23.), px(101.), pane_left));
+        assert!(!tab_overlaps_pane_corner(px(-60.), px(20.), pane_left));
+        assert!(!tab_overlaps_pane_corner(px(28.), px(106.), pane_left));
     }
 }
