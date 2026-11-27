@@ -366,7 +366,7 @@ impl DotDir {
         let right = if menu.pane == 0 {
             window.viewport_size().width / 2. + px(3.)
         } else {
-            px(1.)
+            px(crate::ui::PANEL_MARGIN + 1.)
         };
         let mut surface = div()
             .id("panel-menu-surface")

@@ -2880,7 +2880,7 @@ impl DotDir {
         }
     }
 
-    fn file_changes<'a>(
+    pub(crate) fn file_changes<'a>(
         &'a self,
         content: &'a TabContent,
         cx: &App,
@@ -3411,7 +3411,7 @@ impl DotDir {
         let width: f32 = window.viewport_size().width.into();
         PanelLayout::new(
             self.settings.presentation(pane),
-            width / 2. - 10.,
+            width / 2. - 10. - crate::ui::PANEL_MARGIN,
             height
                 - 218.
                 - if self.operation.is_some() { 30. } else { 0. }

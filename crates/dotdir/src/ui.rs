@@ -24,6 +24,9 @@ use gpui_kit::{
 use serde_json::json;
 use std::{ffi::OsStr, time::Duration};
 
+pub(crate) const PANEL_MARGIN: f32 = 4.;
+const TAB_BORDER_WIDTH: Pixels = px(1.);
+
 struct TabDrag {
     id: u64,
 }
@@ -68,6 +71,7 @@ impl Render for TabDragPreview {
             .h(px(28.))
             .max_w(px(200.))
             .px(px(8.))
+            .rounded(px(6.))
             .border_1()
             .border_color(p.accent)
             .bg(p.bg)
@@ -76,6 +80,78 @@ impl Render for TabDragPreview {
             .child(self.icon.clone().render(p))
             .child(text(self.label.clone()))
     }
+}
+
+fn trace_tab_edge(path: &mut PathBuilder, bounds: Bounds<Pixels>) {
+    let radius = px(7.).min(bounds.size.height / 2.);
+    let left = bounds.left();
+    let right = bounds.right();
+    let top = bounds.top();
+    let bottom = bounds.bottom();
+
+    // The lower corners turn out into the pane, and the upper corners turn in.
+    path.move_to(point(left, bottom));
+    path.curve_to(
+        point(left + radius, bottom - radius),
+        point(left + radius, bottom),
+    );
+    path.line_to(point(left + radius, top + radius));
+    path.curve_to(point(left + radius * 2., top), point(left + radius, top));
+    path.line_to(point(right - radius * 2., top));
+    path.curve_to(
+        point(right - radius, top + radius),
+        point(right - radius, top),
+    );
+    path.line_to(point(right - radius, bottom - radius));
+    path.curve_to(point(right, bottom), point(right - radius, bottom));
+}
+
+fn tab_surface(color: Hsla, selected: bool, border: Hsla) -> impl IntoElement {
+    let shape = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let divider_top = bounds.bottom() - TAB_BORDER_WIDTH;
+            let edge_bottom = if selected {
+                // Cover the divider beneath the selected tab and center the curved
+                // outline on the divider so the two meet at its ends.
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left(), divider_top),
+                        size(bounds.size.width, TAB_BORDER_WIDTH),
+                    ),
+                    color,
+                ));
+                divider_top + TAB_BORDER_WIDTH / 2.
+            } else {
+                divider_top
+            };
+            let edge_bounds =
+                Bounds::from_corners(bounds.origin, point(bounds.right(), edge_bottom));
+            let mut path = PathBuilder::fill();
+            trace_tab_edge(&mut path, edge_bounds);
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+
+            if selected {
+                let mut edge = PathBuilder::stroke(TAB_BORDER_WIDTH);
+                trace_tab_edge(&mut edge, edge_bounds);
+                if let Ok(edge) = edge.build() {
+                    window.paint_path(edge, border);
+                }
+            }
+        },
+    )
+    .size_full();
+
+    div()
+        .absolute()
+        .inset_0()
+        .when(!selected, |surface| {
+            surface.invisible().group_hover("file-tab", |s| s.visible())
+        })
+        .child(shape)
 }
 
 pub(crate) fn icon(name: IconName, color: Hsla) -> Icon {
@@ -389,10 +465,18 @@ impl DotDir {
     ) -> AnyElement {
         let p = self.palette;
         let active = self.active == pane;
-        let selected = self.panes[pane].active;
-        let tab = self.panes[pane].tabs[selected].id();
+        let selected_index = self.panes[pane].active;
+        let tab_count = self.panes[pane].tabs.len();
+        let tab = self.panes[pane].tabs[selected_index].id();
+        let dark = p.mode.is_dark();
+        let rail = p.bg.blend(black().opacity(if dark { 0.25 } else { 0.08 }));
+        let tab_border = p.bg.blend(if dark {
+            white().opacity(0.14)
+        } else {
+            black().opacity(0.18)
+        });
         let scroll = &mut self.tab_strip_scrolls[pane];
-        scroll.follow(selected, tab, cx.reduce_motion(), window);
+        scroll.follow(selected_index, tab, cx.reduce_motion(), window);
         let mut tabs = div()
             .id(("pane-tabs", pane))
             .role(Role::TabList)
@@ -414,7 +498,16 @@ impl DotDir {
         for (index, tab) in self.panes[pane].tabs.iter().enumerate() {
             let id = tab.id();
             let preview = tab.preview;
-            let selected = self.panes[pane].active == index;
+            let selected = selected_index == index;
+            let dirty = self
+                .file_changes(&tab.content, cx)
+                .is_some_and(|(_, _, dirty)| dirty);
+            let tab_fg = if selected { p.fg } else { p.muted };
+            let surface = if selected {
+                p.bg
+            } else {
+                rail.blend(p.bg.opacity(0.6))
+            };
             let (label, tab_icon) = match &tab.content {
                 TabContent::Directory(browser) => {
                     let path = &browser.current().path;
@@ -424,25 +517,11 @@ impl DotDir {
                 }
                 TabContent::Document(id) => {
                     let doc = &self.documents[id];
-                    let (mut label, icon) =
-                        self.file_tab_label(doc.path.file_name().unwrap_or_default(), false);
-                    if doc.dirty() {
-                        label.insert_str(0, "● ");
-                    }
-                    (label, icon)
+                    self.file_tab_label(doc.path.file_name().unwrap_or_default(), false)
                 }
-                TabContent::Hex { path, view, .. } => {
-                    let (mut label, icon) =
-                        self.file_tab_label(path.file_name().unwrap_or_default(), false);
-                    if view.read(cx).buffer.read(cx).dirty() {
-                        label.insert_str(0, "● ");
-                    }
-                    (label, icon)
-                }
-                TabContent::Image { path, .. } => {
-                    self.file_tab_label(path.file_name().unwrap_or_default(), false)
-                }
-                TabContent::Media { path, .. } => {
+                TabContent::Hex { path, .. }
+                | TabContent::Image { path, .. }
+                | TabContent::Media { path, .. } => {
                     self.file_tab_label(path.file_name().unwrap_or_default(), false)
                 }
                 TabContent::Panel { title, .. } => {
@@ -465,11 +544,14 @@ impl DotDir {
                     .role(Role::Tab)
                     .aria_label(label.clone())
                     .aria_selected(selected)
-                    .aria_description(if tab.preview {
+                    .aria_description(if dirty {
+                        "Unsaved changes"
+                    } else if preview {
                         "Preview tab; double-click to keep"
                     } else {
                         "Permanent tab"
                     })
+                    .group("file-tab")
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -477,21 +559,8 @@ impl DotDir {
                     .flex_shrink_0()
                     .min_w(px(64.))
                     .max_w(px(200.))
-                    .px(px(8.))
-                    .border_r_1()
-                    .border_color(p.border)
-                    .when(selected, |s| {
-                        s.child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(2.))
-                                .bg(if active { p.accent } else { p.muted }),
-                        )
-                    })
-                    .text_color(if selected { p.fg } else { p.muted })
+                    .px(px(11.))
+                    .text_color(tab_fg)
                     .text_size(px(12.))
                     .cursor_pointer()
                     .on_drag(TabDrag { id }, {
@@ -517,23 +586,66 @@ impl DotDir {
                             this.request_close_tab(pane, id, window, cx);
                         }
                     }))
-                    .child(tab_icon.render(p))
-                    .child(
-                        text(label)
-                            .min_w_0()
-                            .when(tab.preview, |text| text.italic()),
+                    .child(tab_surface(surface, selected, tab_border))
+                    .when(
+                        !selected && index + 1 < tab_count && index + 1 != selected_index,
+                        |tab| {
+                            tab.child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top(px(6.))
+                                    .bottom(px(6.))
+                                    .w(px(1.))
+                                    .bg(p.fg.opacity(0.12))
+                                    .group_hover("file-tab", |s| s.invisible()),
+                            )
+                        },
                     )
+                    .child(tab_icon.render(p))
+                    .child(text(label).min_w_0().when(preview, |text| text.italic()))
                     .child(
                         div()
                             .id(("close-tab", id as usize))
+                            .relative()
+                            .role(Role::Button)
+                            .aria_label("Close tab")
+                            .group("file-tab-close")
+                            .ml_auto()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(16.))
+                            .size(px(18.))
                             .flex_shrink_0()
-                            .rounded(px(2.))
-                            .hover(move |s| s.bg(p.selected))
-                            .child(icon(IconName::Close, p.muted))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .when(!dirty, |s| {
+                                s.invisible().group_hover("file-tab", |s| s.visible())
+                            })
+                            .hover(move |s| s.bg(tab_fg.opacity(0.14)))
+                            .when(dirty, |s| {
+                                s.child(
+                                    div()
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .bg(tab_fg)
+                                        .group_hover("file-tab-close", |s| s.invisible()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(dirty, |s| {
+                                        s.invisible().group_hover("file-tab-close", |s| s.visible())
+                                    })
+                                    .child(icon(IconName::Close, tab_fg).size(px(14.))),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.request_close_tab(pane, id, window, cx);
@@ -569,9 +681,10 @@ impl DotDir {
                     })),
             )
         }
-        let end = self.panes[pane].tabs.len();
+        let end = tab_count;
         let tab_bar = div()
             .id(("tab-bar", pane))
+            .relative()
             .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                 let scroll = &mut this.tab_strip_scrolls[pane];
                 if *hovered {
@@ -592,8 +705,21 @@ impl DotDir {
             .flex()
             .h(px(28.))
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(p.border)
+            .items_center()
+            .gap(px(3.))
+            .px(px(4.))
+            .pt(px(3.))
+            .rounded_t(px(7.))
+            .bg(rail)
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(TAB_BORDER_WIDTH)
+                    .bg(tab_border),
+            )
             .child(
                 tabs.child(
                     div()
@@ -620,16 +746,15 @@ impl DotDir {
                     .aria_expanded(
                         matches!(&self.modal, Some(Modal::PanelMenu(menu)) if menu.pane == pane),
                     )
-                    .w(px(28.))
+                    .size(px(24.))
                     .flex_shrink_0()
-                    .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(p.accent)
-                    .text_color(p.accent_fg)
+                    .rounded(px(5.))
+                    .hover(move |s| s.bg(p.selected))
                     .cursor_pointer()
-                    .child(icon(IconName::EllipsisVertical, p.accent_fg))
+                    .child(icon(IconName::EllipsisVertical, p.muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_panel_menu(pane, window, cx);
                     })),
@@ -827,7 +952,12 @@ impl DotDir {
             .min_w_0()
             .h_full()
             .border_1()
-            .border_color(if active { p.accent } else { p.border })
+            .border_color(if active {
+                p.accent.opacity(0.55)
+            } else {
+                p.border
+            })
+            .rounded(px(8.))
             .bg(p.bg)
             .child(tab_bar)
             .child(
@@ -2253,6 +2383,8 @@ impl Render for DotDir {
                 .flex_1()
                 .min_h_0()
                 .gap(px(4.))
+                .px(px(PANEL_MARGIN))
+                .bg(p.command_bg)
                 .child(self.render_pane(0, window, cx))
                 .child(self.render_pane(1, window, cx));
             root = root.child(panes);
