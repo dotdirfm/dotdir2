@@ -3,7 +3,6 @@ from pathlib import Path
 app = Path(defines["app"]).resolve()
 files = [str(app)]
 symlinks = {"Applications": "/Applications"}
-hide_extensions = [app.name]
 
 background = str(Path(defines["background"]).resolve())
 window_rect = ((180, 160), (600, 330))
