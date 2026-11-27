@@ -1,0 +1,2 @@
+// GPUI loads icon group 1 from the Windows executable.
+1 ICON "../../packaging/windows/dotdir.ico"

@@ -1458,6 +1458,7 @@ dependencies = [
  "dotdir-sevenz",
  "dotdir-tar",
  "dotdir-zip",
+ "embed-resource",
  "flate2",
  "globset",
  "gpui-kit",
