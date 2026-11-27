@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DotDir Native
+Comment=Two-pane file manager
+Exec=dotdir
+Icon=dev.dotdir.native
+Terminal=false
+Categories=System;FileTools;FileManager;

@@ -57,6 +57,22 @@ process; ordinary application errors and JavaScript exceptions remain handled.
 Development and test builds retain panic unwinding.
 See the [release size measurements](docs/release-size.md) for the build comparison.
 
+### Test packages
+
+Run **Test packages** from the repository's Actions tab and download the
+artifacts from the run summary. Changes to the workflow, packaging files,
+or build configuration also trigger a run. The workflow uploads test
+artifacts and does not publish a GitHub Release.
+
+| Platform | Download | Install |
+| --- | --- | --- |
+| macOS Apple Silicon | `DotDir-macOS-arm64.dmg` | Open the disk image and drag DotDir Native to Applications. |
+| Windows x64 | `DotDir-Windows-x64-Setup.exe` | Run the per-user installer. |
+| Linux x64 | `DotDir-Linux-x86_64.AppImage` | Make the AppImage executable with `chmod +x` and run it. |
+
+The DMG contains an ad-hoc signed app, and the Windows installer is unsigned.
+The Linux job builds on Ubuntu 24.04.
+
 ## Keyboard
 
 | Key | Action |
