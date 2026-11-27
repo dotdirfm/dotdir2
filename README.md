@@ -73,6 +73,14 @@ artifacts and does not publish a GitHub Release.
 The DMG contains an ad-hoc signed app, and the Windows installer is unsigned.
 The Linux job builds on Ubuntu 24.04.
 
+### GitHub Releases
+
+Push a version tag in the form `vMAJOR.MINOR.PATCH` (for example, `v0.1.0`)
+on the commit you want to release. The **Release desktop packages** workflow
+builds and verifies the three packages above, then publishes them together on
+GitHub Releases with generated release notes. The release uses the same
+package and signing settings as the test builds.
+
 ## Keyboard
 
 | Key | Action |

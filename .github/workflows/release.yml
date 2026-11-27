@@ -1,0 +1,39 @@
+name: Release desktop packages
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    if: ${{ !github.event.deleted }}
+    uses: ./.github/workflows/build-packages.yml
+
+  publish:
+    name: Publish GitHub Release
+    needs: packages
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: DotDir-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release with all three packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+            --title "DotDir $RELEASE_TAG" \
+            release-assets/DotDir-macOS-arm64.dmg \
+            release-assets/DotDir-Windows-x64-Setup.exe \
+            release-assets/DotDir-Linux-x86_64.AppImage
