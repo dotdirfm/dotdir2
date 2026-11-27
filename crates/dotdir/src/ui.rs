@@ -21,7 +21,7 @@ use gpui_kit::{
     *,
 };
 use serde_json::json;
-use std::ffi::OsStr;
+use std::{ffi::OsStr, time::Duration};
 
 struct TabDrag {
     id: u64,
@@ -291,6 +291,95 @@ impl DotDir {
                 }
             }))
     }
+    pub(crate) fn render_breadcrumbs(
+        &self,
+        pane: usize,
+        location: &Location,
+        file: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let p = self.palette;
+        let bar = div()
+            .id(("breadcrumbs", pane))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .h(px(34.))
+            .min_w_0()
+            .flex_shrink_0()
+            .px(px(12.))
+            .border_b_1()
+            .border_color(p.border)
+            .text_size(px(12.))
+            .overflow_hidden();
+        let mut ancestors = div()
+            .id("breadcrumb-ancestors")
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .min_w_0()
+            .overflow_hidden()
+            .overflow_x_scroll();
+        let crumbs =
+            std::iter::successors(Some(location.clone()), Location::parent).collect::<Vec<_>>();
+        let depth = crumbs.len();
+        let mut separator = "";
+        for (index, path) in crumbs.into_iter().rev().enumerate() {
+            let last = index + 1 == depth;
+            let label = path.label();
+            let divider = (!separator.is_empty())
+                .then(|| text(separator).flex_shrink_0().text_color(p.muted));
+            separator = if path
+                .archive_member()
+                .is_some_and(|member| member.as_os_str().is_empty())
+            {
+                "!/"
+            } else if path.local().is_some() {
+                std::path::MAIN_SEPARATOR_STR
+            } else {
+                "/"
+            };
+            if index == 0 && label.ends_with(separator) {
+                separator = "";
+            }
+            let caption = text(label.clone())
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis();
+            let crumb = if file && last {
+                caption.into_any_element()
+            } else {
+                div()
+                    .id(("crumb", index))
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(p.accent))
+                    .child(caption)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate(pane, path.clone(), window, cx)
+                    }))
+                    .into_any_element()
+            };
+            if last {
+                return bar
+                    .when(index > 0, |bar| bar.child(ancestors))
+                    .children(divider)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .when(index > 0, |s| s.max_w(relative(0.5)))
+                            .child(crumb),
+                    );
+            }
+            ancestors = ancestors
+                .children(divider)
+                .child(div().flex_shrink_0().child(crumb));
+        }
+        bar
+    }
+
     fn render_pane(
         &mut self,
         pane: usize,
@@ -302,10 +391,7 @@ impl DotDir {
         let selected = self.panes[pane].active;
         let tab = self.panes[pane].tabs[selected].id();
         let scroll = &mut self.tab_strip_scrolls[pane];
-        if scroll.last_selected != Some((selected, tab)) {
-            scroll.handle.scroll_to_item(selected);
-            scroll.last_selected = Some((selected, tab));
-        }
+        scroll.follow(selected, tab, cx.reduce_motion(), window);
         let mut tabs = div()
             .id(("pane-tabs", pane))
             .role(Role::TabList)
@@ -315,7 +401,15 @@ impl DotDir {
             .h_full()
             .overflow_hidden()
             .overflow_x_scroll()
-            .track_scroll(&scroll.handle);
+            .track_scroll(&scroll.handle)
+            .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, _| {
+                let scroll = &mut this.tab_strip_scrolls[pane];
+                let delta = event.delta.pixel_delta(window.line_height());
+                if scroll.handle.max_offset().x > px(0.) && (delta.x != px(0.) || delta.y != px(0.))
+                {
+                    scroll.manual_scroll();
+                }
+            }));
         for (index, tab) in self.panes[pane].tabs.iter().enumerate() {
             let id = tab.id();
             let preview = tab.preview;
@@ -464,6 +558,24 @@ impl DotDir {
         }
         let end = self.panes[pane].tabs.len();
         let tab_bar = div()
+            .id(("tab-bar", pane))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                let scroll = &mut this.tab_strip_scrolls[pane];
+                if *hovered {
+                    scroll.return_timer = None;
+                } else if scroll.manually_scrolled && scroll.return_timer.is_none() {
+                    scroll.return_timer = Some(cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        let _ = cx.update(|window, cx| {
+                            let _ = this.update(cx, |this, cx| {
+                                this.tab_strip_scrolls[pane].return_to_active();
+                                window.refresh();
+                                cx.notify();
+                            });
+                        });
+                    }));
+                }
+            }))
             .flex()
             .h(px(28.))
             .flex_shrink_0()
@@ -530,7 +642,7 @@ impl DotDir {
                 let id = *id;
                 let (state, readonly) = self.editor_for_pane(pane, id, window, cx);
                 let doc = &self.documents[&id];
-                let path = doc.path.display().to_string();
+                let breadcrumbs = self.render_breadcrumbs(pane, &doc.path, true, cx);
                 let status = doc.error.clone().unwrap_or_else(|| {
                     if doc.saving {
                         "Saving…".into()
@@ -552,18 +664,7 @@ impl DotDir {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .flex_shrink_0()
-                            .px(px(12.))
-                            .py(px(8.))
-                            .border_b_1()
-                            .border_color(p.border)
-                            .text_size(px(12.))
-                            .font_family("Menlo")
-                            .child(text(path)),
-                    )
+                    .child(breadcrumbs)
                     .child(
                         div()
                             .flex_1()
@@ -596,7 +697,14 @@ impl DotDir {
                     )
                     .into_any_element()
             }
-            TabContent::Media { view, .. } => view.clone().into_any_element(),
+            TabContent::Media { path, view, .. } => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_breadcrumbs(pane, path, true, cx))
+                .child(div().flex_1().min_h_0().child(view.clone()))
+                .into_any_element(),
             TabContent::Image { path, image, .. } => div()
                 .flex()
                 .flex_col()
@@ -604,14 +712,7 @@ impl DotDir {
                 .min_h_0()
                 .when(active, |s| s.track_focus(&self.focus))
                 .key_context("PreviewPane")
-                .child(
-                    div()
-                        .h(px(34.))
-                        .px(px(12.))
-                        .py(px(8.))
-                        .text_size(px(12.))
-                        .child(text(path.display().to_string())),
-                )
+                .child(self.render_breadcrumbs(pane, path, true, cx))
                 .child(
                     div().flex_1().min_h_0().overflow_hidden().child(
                         if let Some(image) = image {
@@ -2063,7 +2164,7 @@ impl Render for DotDir {
         let path = if matches!(location, Location::Provider(_)) {
             location.display()
         } else {
-            self.cwd(self.active).display().to_string()
+            crate::archive::display_local_path(&self.cwd(self.active))
         };
         root = root.child(
             div()

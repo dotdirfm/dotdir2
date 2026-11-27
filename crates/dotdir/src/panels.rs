@@ -383,43 +383,7 @@ impl DotDir {
         let browser = self.browser(pane).expect("directory tab").clone();
         let d = browser.current();
         let layout = self.layout_for(pane, window);
-        let mut breadcrumbs = div()
-            .flex()
-            .items_center()
-            .gap(px(5.))
-            .h(px(34.))
-            .flex_shrink_0()
-            .px(px(12.))
-            .border_b_1()
-            .border_color(p.border)
-            .text_size(px(12.))
-            .overflow_hidden();
-        for (index, path) in std::iter::successors(Some(d.path.clone()), |path| path.parent())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .enumerate()
-        {
-            let label = path.label();
-            if index > 1 {
-                breadcrumbs = breadcrumbs.child(text("/").text_color(p.muted));
-            }
-            breadcrumbs = breadcrumbs.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "crumb-{pane}-{}",
-                        path.display()
-                    )))
-                    .role(Role::Button)
-                    .aria_label(label.clone())
-                    .cursor_pointer()
-                    .hover(move |s| s.text_color(p.accent))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.navigate(pane, path.clone(), window, cx)
-                    })),
-            );
-        }
+        let breadcrumbs = self.render_breadcrumbs(pane, &d.path, false, cx);
         let mut toolbar = div()
             .flex()
             .items_center()

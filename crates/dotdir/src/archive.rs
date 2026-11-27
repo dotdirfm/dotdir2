@@ -159,6 +159,20 @@ impl From<&Path> for Location {
     }
 }
 
+pub(crate) fn display_local_path(path: &Path) -> String {
+    let display = path.display().to_string();
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        use std::path::Prefix;
+        match prefix.kind() {
+            Prefix::VerbatimDisk(_) => return display[4..].to_owned(),
+            Prefix::VerbatimUNC(_, _) => return format!(r"\\{}", &display[8..]),
+            _ => {}
+        }
+    }
+    display
+}
+
 impl Location {
     pub fn editable(&self) -> bool {
         match self {
@@ -256,6 +270,13 @@ impl Location {
         self.file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| {
+                if let Self::Local(path) = self {
+                    return if path.has_root() {
+                        display_local_path(path)
+                    } else {
+                        std::path::MAIN_SEPARATOR.to_string()
+                    };
+                }
                 if matches!(self, Self::Provider(_)) {
                     self.display()
                 } else {

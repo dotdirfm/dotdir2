@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod app;
 mod archive;
 mod archive_extensions;
@@ -44,11 +46,22 @@ fn main() {
             gpui_kit::init(cx);
             syntax::register_perl();
             commands::bind(cx, &config.join("keybindings.json"));
-            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            let preferred_size = size(px(1200.), px(800.));
+            let display = cx.primary_display();
+            let bounds = match &display {
+                Some(display) => {
+                    let work_area = display.visible_bounds();
+                    // Leave room for the native window frame around the client area.
+                    let available = work_area.size.map(|axis| axis * 0.9);
+                    Bounds::centered_at(work_area.center(), preferred_size.min(&available))
+                }
+                None => Bounds::centered(None, preferred_size, cx),
+            };
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(700.), px(420.))),
+                    window_min_size: Some(size(px(700.), px(420.)).min(&bounds.size)),
+                    display_id: display.map(|display| display.id()),
                     titlebar: Some(TitlebarOptions {
                         title: Some("DotDir".into()),
                         ..Default::default()

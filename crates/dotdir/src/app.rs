@@ -2039,7 +2039,63 @@ pub(crate) struct Pane {
 #[derive(Default)]
 pub(crate) struct TabStripScroll {
     pub handle: ScrollHandle,
-    pub last_selected: Option<(usize, u64)>,
+    last_selected: Option<(usize, u64)>,
+    pub manually_scrolled: bool,
+    pub return_timer: Option<Task<()>>,
+    return_motion: Option<(Pixels, Instant)>,
+}
+
+impl TabStripScroll {
+    pub fn manual_scroll(&mut self) {
+        self.manually_scrolled = true;
+        self.return_timer = None;
+        self.return_motion = None;
+    }
+
+    pub fn return_to_active(&mut self) {
+        self.manually_scrolled = false;
+        self.return_timer = None;
+        self.return_motion = Some((self.handle.offset().x, Instant::now()));
+    }
+
+    pub fn follow(&mut self, index: usize, id: u64, reduce_motion: bool, window: &mut Window) {
+        if self.last_selected != Some((index, id)) {
+            self.last_selected = Some((index, id));
+            self.manually_scrolled = false;
+            self.return_timer = None;
+            self.return_motion = None;
+        }
+        if self.manually_scrolled {
+            return;
+        }
+        if !reduce_motion
+            && let Some((from, started)) = self.return_motion
+            && let Some(tab) = self.handle.bounds_for_item(index)
+        {
+            let viewport = self.handle.bounds();
+            let mut offset = self.handle.offset();
+            let x = offset.x;
+            let left = viewport.left() - tab.left();
+            let right = viewport.right() - tab.right();
+            let target = if left > right {
+                left
+            } else {
+                x.clamp(left, right)
+            }
+            .clamp(-self.handle.max_offset().x, px(0.));
+            if (target - x).abs() > px(0.5) {
+                let progress = (started.elapsed().as_secs_f32() / 0.22).min(1.);
+                offset.x = from + (target - from) * (1. - (1. - progress).powi(3));
+                self.handle.set_offset(offset);
+                if progress < 1. {
+                    window.request_animation_frame();
+                    return;
+                }
+            }
+        }
+        self.return_motion = None;
+        self.handle.scroll_to_item(index);
+    }
 }
 
 impl Pane {

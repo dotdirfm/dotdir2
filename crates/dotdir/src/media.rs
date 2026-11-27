@@ -525,18 +525,6 @@ impl Render for MediaViewer {
             .track_focus(&self.focus)
             .child(
                 div()
-                    .h(px(34.))
-                    .flex_shrink_0()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .text_size(px(12.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(self.path.display()),
-            )
-            .child(
-                div()
                     .id("media-surface")
                     .group("media-surface")
                     .relative()
