@@ -13,6 +13,7 @@ use crate::{
     hex_view::{ByteViewMode, HexBuffer, HexView},
     hover::HoverHints,
     icon_theme::IconTheme,
+    keystrokes::PresentationKeystrokes,
     lsp::{self, LanguageServers},
     media::{MediaEvent, MediaFilter, MediaViewer, VIEWER_PRIORITY, image_format},
     model::*,
@@ -583,6 +584,7 @@ impl DotDir {
                         !view.readonly && !view.buffer.read(cx).saving
                     })),
             line_wrap: document.and_then(|doc| doc.line_wrap),
+            show_keystrokes: self.keystrokes.enabled,
             language_server: document.is_some_and(|d| d.lsp.is_some()),
             has_tab: self.panels_visible && tab.is_some(),
             multiple_tabs: self.panels_visible && self.panes[self.active].tabs.len() > 1,
@@ -2452,6 +2454,7 @@ pub(crate) struct DotDir {
     vscode_language_command: Option<(u64, u64)>,
     language_servers: LanguageServers,
     pub hover: HoverHints,
+    pub(crate) keystrokes: PresentationKeystrokes,
     pub(crate) quick_actions: QuickActions,
     source_jump: [Option<(u64, lsp_types::Position)>; 2],
     pub extension_errors: Vec<String>,
@@ -2550,6 +2553,7 @@ impl DotDir {
         let search_content =
             cx.new(|cx| InputState::new(window, cx).placeholder("Containing text (optional)"));
         let subscriptions = vec![
+            Self::observe_presentation_keystrokes(window, cx),
             cx.subscribe_in(&command_line, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.execute_shell(window, cx);
@@ -2585,9 +2589,12 @@ impl DotDir {
                     window.refresh();
                 },
             ),
-            cx.observe_window_activation(window, |this, window, _| {
+            cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.end_shift_selection();
+                    if this.keystrokes.clear() {
+                        cx.notify();
+                    }
                 }
             }),
             cx.on_release(|this, _| {
@@ -2674,6 +2681,7 @@ impl DotDir {
             vscode_language_command: None,
             language_servers,
             hover: HoverHints::default(),
+            keystrokes: PresentationKeystrokes::default(),
             quick_actions: QuickActions::default(),
             source_jump: [None, None],
             extension_errors: vec![],
@@ -4479,6 +4487,10 @@ Selected entries will be permanently removed from the archive."
                     editor.update(cx, |state, cx| state.set_soft_wrap(!wrapped, window, cx));
                 }
                 self.dismiss_hover(cx);
+            }
+            "toggle-keystrokes" => {
+                self.keystrokes.enabled = !self.keystrokes.enabled;
+                self.keystrokes.clear();
             }
             "palette" => self.show_modal(Modal::Palette, window, cx),
             "settings" => self.show_modal(Modal::Settings, window, cx),

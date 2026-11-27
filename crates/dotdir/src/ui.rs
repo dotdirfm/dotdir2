@@ -2665,6 +2665,7 @@ impl Render for DotDir {
             root = root.child(self.render_modal(window, cx));
         }
         root = root.children(self.render_hover(window, cx));
+        root = root.children(self.render_presentation_keystroke(window));
         root
     }
 }

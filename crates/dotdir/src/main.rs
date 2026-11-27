@@ -16,6 +16,7 @@ mod hex_file;
 mod hex_view;
 mod hover;
 mod icon_theme;
+mod keystrokes;
 mod lsp;
 mod marketplace;
 mod media;

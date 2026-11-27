@@ -113,6 +113,10 @@ modifier combination's F-key commands in the bottom bar (for example, Alt+F7
 shows Find Files). The labels and clicks follow the active keyboard context
 and custom bindings. Unbound slots are empty; unavailable commands are dimmed.
 
+Use **F1 → Show Keystrokes** to briefly display shortcuts and navigation keys
+above the function-key bar during a presentation. **Hide Keystrokes** turns it
+off. The overlay starts off each time you launch DotDir.
+
 F1 lists commands available for the active pane. The same capability rules are
 checked again when executing a command, including through custom keybindings
 and the function-key bar. Keyboard contexts still control where shortcuts match;

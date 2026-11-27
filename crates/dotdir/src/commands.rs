@@ -28,6 +28,7 @@ pub struct CommandState {
     pub parent: bool,
     pub can_save: bool,
     pub line_wrap: Option<bool>,
+    pub show_keystrokes: bool,
     pub language_server: bool,
     pub has_tab: bool,
     pub multiple_tabs: bool,
@@ -140,6 +141,7 @@ impl Command {
             "trash" if state.archive => "Delete Archive Entries",
             "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
             "toggle-line-wrap" if state.line_wrap == Some(false) => "Enable Line Wrap",
+            "toggle-keystrokes" if state.show_keystrokes => "Hide Keystrokes",
             _ => self.title,
         }
     }
@@ -220,6 +222,13 @@ pub const COMMANDS: &[Command] = &[
         id: "palette",
         title: "Show All Commands",
         key: "f1",
+        context: "DotDir",
+        availability: Availability::Always,
+    },
+    Command {
+        id: "toggle-keystrokes",
+        title: "Show Keystrokes",
+        key: "",
         context: "DotDir",
         availability: Availability::Always,
     },
