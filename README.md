@@ -22,6 +22,24 @@ cargo dist        # optimized release
 cargo dist debug  # faster build for development
 ```
 
+To pull the current branch from its upstream and build in one step, run the
+script for your platform. Both scripts require a fast-forward pull before
+building.
+
+**Windows PowerShell**
+
+```powershell
+.\scripts\pull-and-build.ps1
+.\scripts\pull-and-build.ps1 debug
+```
+
+**macOS or Linux**
+
+```sh
+sh scripts/pull-and-build.sh
+sh scripts/pull-and-build.sh debug
+```
+
 | Platform | Run this artifact |
 | --- | --- |
 | macOS | `dist/macos/DotDir Native.app` |
