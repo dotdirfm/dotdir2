@@ -524,6 +524,10 @@ impl SourceStamp {
         })
     }
 
+    pub(crate) fn same_file(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+
     pub(crate) fn check(&self, path: &Path) -> Result<()> {
         ensure!(
             *self == Self::from_path(path)?,

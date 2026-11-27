@@ -153,11 +153,18 @@ Use **F3** to preview text, hex, images, or supported videos, and **⌘F3** to
 preview in the opposite pane. Use **Left/Right** in the media viewer to browse
 images and videos in the same archive folder.
 
-Browsing and previews use no temporary files. Text, hex, and image previews are
-limited to 16 MiB per entry. Video and nested archive reads use direct seeks for
-plain TAR and stored ZIP or 7z entries. Other entries that need random access
-use up to 64 MiB each in memory. System AVIF decoding is available on macOS.
-Video playback on Windows and Linux requires libmpv.
+Browsing and previews use no temporary files. Text and image previews of
+archive entries are limited to 16 MiB. Hex, video, and nested archive reads use
+direct seeks for plain TAR and stored ZIP or 7z entries. Other entries that
+need random access use up to 64 MiB each in memory. System AVIF decoding is
+available on macOS. Video playback on Windows and Linux requires libmpv.
+
+Press **F3** to view a binary file and **F4** to edit a local binary file.
+**View as Hex** and **Edit as Hex** in the command palette can also open any
+supported file as bytes. Use the offset field to jump to a hexadecimal address.
+Type hex digits to overwrite bytes, then press **F2** to save only the changed
+ranges. Hex previews read data on demand, and local binary files can exceed
+the text editor's 16 MiB limit.
 
 ZIP, 7z, and TAR support browsing, previews, extraction, and creation. ZIP
 also supports editing existing archives.

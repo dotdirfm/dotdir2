@@ -239,12 +239,14 @@ settings/session persistence and local JavaScript commands/panels. The original
 website/demo, account/marketplace integration, full FSS styling language, external
 WASM filesystem-provider loading and specialized PDF and SQLite surfaces are
 separate remaining porting work. Image/video viewing has a native renderer.
-Video and AVIF currently use macOS APIs. ZIP entry previews cover text, images,
+AVIF decoding uses macOS APIs. Video uses AVKit on macOS and libmpv on Windows and Linux. ZIP entry previews cover text, images,
 video, and hex. Language-server integration covers document sync, diagnostics, completion,
 hover, and definition. VS Code workbench features such as task providers,
 debugging, and webviews are separate work.
 
-Native text/hex opening is currently capped at 16 MiB. Search retains the first
-10,000 matching paths. User keybinding changes apply on restart. Platform-specific
+Native text opening is capped at 16 MiB. The hex viewer reads bounded ranges
+from seekable files in the background and renders only the visible rows. The
+hex editor tracks changes by byte offset and saves changed ranges to local
+files. Search retains the first 10,000 matching paths. User keybinding changes apply on restart. Platform-specific
 validation in this checkout is on macOS; Windows/Linux backends are dependency
 supported but have not been runtime-tested here.

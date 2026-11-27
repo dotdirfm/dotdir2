@@ -431,6 +431,14 @@ impl DotDir {
                     }
                     (label, icon)
                 }
+                TabContent::Hex { path, view, .. } => {
+                    let (mut label, icon) =
+                        self.file_tab_label(path.file_name().unwrap_or_default(), false);
+                    if view.read(cx).buffer.read(cx).dirty() {
+                        label.insert_str(0, "● ");
+                    }
+                    (label, icon)
+                }
                 TabContent::Image { path, .. } => {
                     self.file_tab_label(path.file_name().unwrap_or_default(), false)
                 }
@@ -700,6 +708,17 @@ impl DotDir {
                             })
                             .child(status),
                     )
+                    .into_any_element()
+            }
+            TabContent::Hex { path, view, .. } => {
+                view.update(cx, |view, _| view.palette = p);
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_breadcrumbs(pane, path, true, cx))
+                    .child(div().flex_1().min_h_0().child(view.clone()))
                     .into_any_element()
             }
             TabContent::Media { path, view, .. } => div()
@@ -2422,7 +2441,10 @@ impl Render for DotDir {
                         .find(|command| command.id == id)
                         .map(|command| {
                             command
-                                .keybar_label(self.active_document().is_some(), &command_state)
+                                .keybar_label(
+                                    self.active_document().is_some() || self.active_hex().is_some(),
+                                    &command_state,
+                                )
                                 .to_string()
                         })
                         .or_else(|| {

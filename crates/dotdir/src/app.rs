@@ -7,6 +7,8 @@ use crate::{
     commands::{COMMANDS, CommandState, RunCommand},
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
+    hex_file::{self, OpenedFile},
+    hex_view::{HexBuffer, HexView},
     hover::HoverHints,
     icon_theme::IconTheme,
     lsp::{self, LanguageServers},
@@ -67,7 +69,7 @@ pub(crate) enum Message {
         path: Location,
         readonly: bool,
         tab: Option<u64>,
-        result: anyhow::Result<Vec<u8>>,
+        result: anyhow::Result<OpenedFile>,
     },
     Saved {
         id: u64,
@@ -565,7 +567,12 @@ impl DotDir {
             selection: directory
                 .is_some_and(|d| !d.marked.is_empty() || d.focused().is_some_and(|e| !e.parent)),
             parent: directory.is_some_and(|d| d.path.parent().is_some()),
-            can_save: self.panels_visible && document.is_some_and(|d| !d.readonly && !d.saving),
+            can_save: self.panels_visible
+                && (document.is_some_and(|d| !d.readonly && !d.saving)
+                    || self.active_hex().is_some_and(|(_, view)| {
+                        let view = view.read(cx);
+                        !view.readonly && !view.buffer.read(cx).saving
+                    })),
             line_wrap: document.and_then(|doc| doc.line_wrap),
             language_server: document.is_some_and(|d| d.lsp.is_some()),
             has_tab: self.panels_visible && tab.is_some(),
@@ -1479,71 +1486,61 @@ impl DotDir {
                                 self.error(e, cx);
                             }
                         }
-                        Ok(bytes) => {
-                            if readonly
-                                && path.local().is_none()
-                                && let Some(format) = image_format(&path)
-                            {
-                                let id = self.id();
-                                self.install_content(
-                                    pane,
-                                    TabContent::Image {
-                                        id,
-                                        path,
-                                        image: Some(Arc::new(Image::from_bytes(format, bytes))),
-                                    },
-                                    tab,
-                                    window,
-                                    cx,
-                                );
-                                if tab.is_none() {
-                                    self.status.clear();
-                                }
-                                continue;
+                        Ok(OpenedFile::Image(format, bytes)) => {
+                            let id = self.id();
+                            self.install_content(
+                                pane,
+                                TabContent::Image {
+                                    id,
+                                    path,
+                                    image: Some(Arc::new(Image::from_bytes(format, bytes))),
+                                },
+                                tab,
+                                window,
+                                cx,
+                            );
+                            if tab.is_none() {
+                                self.status.clear();
                             }
-                            let (text, readonly, line_wrap) = match String::from_utf8(bytes.clone())
-                            {
-                                Ok(text) => (text, readonly, Some(true)),
-                                Err(_) => {
-                                    let text = bytes
-                                        .chunks(16)
-                                        .enumerate()
-                                        .map(|(i, row)| {
-                                            format!(
-                                                "{:08x}  {:48}  {}",
-                                                i * 16,
-                                                row.iter()
-                                                    .map(|b| format!("{b:02x} "))
-                                                    .collect::<String>(),
-                                                row.iter()
-                                                    .map(|b| if b.is_ascii_graphic() {
-                                                        *b as char
-                                                    } else {
-                                                        '.'
-                                                    })
-                                                    .collect::<String>()
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    (text, true, None)
-                                }
-                            };
+                        }
+                        Ok(OpenedFile::Hex(file)) => {
+                            let buffer = self
+                                .panes
+                                .iter()
+                                .flat_map(|pane| &pane.tabs)
+                                .find_map(|tab| match &tab.content {
+                                    TabContent::Hex {
+                                        path: existing,
+                                        view,
+                                        ..
+                                    } if *existing == path => Some(view.read(cx).buffer.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| cx.new(|_| HexBuffer::new(file)));
+                            let id = tab.unwrap_or_else(|| self.id());
+                            let content = self.hex_content(id, path, buffer, readonly, window, cx);
+                            self.install_content(pane, content, tab, window, cx);
+                            if tab.is_none() {
+                                self.status.clear();
+                            }
+                        }
+                        Ok(OpenedFile::Text(text)) => {
                             // A second pane may have completed the same canonical path first.
                             let id = if let Some(document) =
                                 self.documents.values_mut().find(|d| d.path == path)
                             {
-                                if !readonly && std::str::from_utf8(&document.saved).is_ok() {
+                                if !readonly {
                                     document.readonly = false;
                                 }
                                 document.id
                             } else {
                                 let id = self.id();
                                 let language = language_for(path.name_path());
+                                let bytes = text.as_bytes().to_vec();
                                 let input = cx.new(|cx| {
                                     EditorState::new(window, cx)
                                         .language(language)
-                                        .soft_wrap(line_wrap.unwrap_or(true))
+                                        .soft_wrap(true)
                                         .default_value(text)
                                 });
                                 let subscription =
@@ -1595,7 +1592,7 @@ impl DotDir {
                                         version: Cell::new(1),
                                         dirty_cache: Cell::new(None),
                                         readonly,
-                                        line_wrap,
+                                        line_wrap: Some(true),
                                         saving: false,
                                         error: None,
                                         lsp: None,
@@ -1957,6 +1954,12 @@ pub(crate) enum TabContent {
     },
     Directory(DirectoryBrowser),
     Document(u64),
+    Hex {
+        id: u64,
+        path: Location,
+        view: Entity<HexView>,
+        _subscription: Subscription,
+    },
     Image {
         id: u64,
         path: Location,
@@ -1987,6 +1990,7 @@ impl TabContent {
             Self::Document(id) => *id,
             Self::Panel { id, .. }
             | Self::SelectionInspector { id, .. }
+            | Self::Hex { id, .. }
             | Self::Image { id, .. }
             | Self::Media { id, .. }
             | Self::Pending { id, .. } => *id,
@@ -2121,6 +2125,7 @@ impl Pane {
         let file_tab = matches!(
             closed.content,
             TabContent::Document(_)
+                | TabContent::Hex { .. }
                 | TabContent::Image { .. }
                 | TabContent::Media { .. }
                 | TabContent::Pending { .. }
@@ -2809,12 +2814,11 @@ impl DotDir {
                 .get(id)
                 .and_then(|d| d.path.parent())
                 .unwrap_or_else(|| PathBuf::new().into()),
-            Some(TabContent::Image { path, .. }) => {
-                path.parent().unwrap_or_else(|| PathBuf::new().into())
-            }
-            Some(TabContent::Media { path, .. }) => {
-                path.parent().unwrap_or_else(|| PathBuf::new().into())
-            }
+            Some(
+                TabContent::Image { path, .. }
+                | TabContent::Hex { path, .. }
+                | TabContent::Media { path, .. },
+            ) => path.parent().unwrap_or_else(|| PathBuf::new().into()),
             _ => self.panes[pane]
                 .tabs
                 .iter()
@@ -2849,6 +2853,35 @@ impl DotDir {
             .map(|tab| &tab.content)
         {
             Some(TabContent::Document(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_hex(&self) -> Option<(&Location, &Entity<HexView>)> {
+        match &self.panes[self.active]
+            .tabs
+            .get(self.panes[self.active].active)?
+            .content
+        {
+            TabContent::Hex { path, view, .. } => Some((path, view)),
+            _ => None,
+        }
+    }
+
+    fn file_changes<'a>(
+        &'a self,
+        content: &'a TabContent,
+        cx: &App,
+    ) -> Option<(&'a Location, bool, bool)> {
+        match content {
+            TabContent::Document(id) => self
+                .documents
+                .get(id)
+                .map(|doc| (&doc.path, doc.saving, doc.dirty(cx))),
+            TabContent::Hex { path, view, .. } => {
+                let buffer = view.read(cx).buffer.read(cx);
+                Some((path, buffer.saving, buffer.dirty()))
+            }
             _ => None,
         }
     }
@@ -2971,19 +3004,7 @@ impl DotDir {
     pub fn focus_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.end_shift_selection();
         self.active = pane;
-        if let Some(id) = self.active_document() {
-            if let Some(d) = self.documents.get(&id) {
-                d.input.update(cx, |s, cx| s.focus(window, cx));
-            }
-        } else if let Some(TabContent::Media { view, .. }) = self.panes[pane]
-            .tabs
-            .get(self.panes[pane].active)
-            .map(|tab| &tab.content)
-        {
-            window.focus(&view.read(cx).focus_handle(cx), cx);
-        } else {
-            self.focus.focus(window, cx);
-        }
+        self.focus_active_content(window, cx);
         // A newly mounted pane/editor is not in the dispatch tree until the
         // next frame. Restore focus after that tree replaces a closed dialog.
         let view = cx.weak_entity();
@@ -2992,22 +3013,31 @@ impl DotDir {
                 if this.active != pane || this.modal.is_some() {
                     return;
                 }
-                if let Some(id) = this.active_document() {
-                    if let Some(d) = this.documents.get(&id) {
-                        d.input.update(cx, |s, cx| s.focus(window, cx));
-                    }
-                } else if let Some(TabContent::Media { view, .. }) = this.panes[pane]
-                    .tabs
-                    .get(this.panes[pane].active)
-                    .map(|tab| &tab.content)
-                {
-                    window.focus(&view.read(cx).focus_handle(cx), cx);
-                } else {
-                    this.focus.focus(window, cx);
-                }
+                this.focus_active_content(window, cx);
             });
         });
         cx.notify();
+    }
+
+    fn focus_active_content(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = &self.panes[self.active];
+        match pane.tabs.get(pane.active).map(|tab| &tab.content) {
+            Some(TabContent::Document(id)) => {
+                if let Some(d) = self.documents.get(id) {
+                    d.input.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+            Some(TabContent::Media { view, .. }) => {
+                window.focus(&view.read(cx).focus_handle(cx), cx);
+            }
+            Some(TabContent::Hex { view, .. }) => {
+                let focus = view.read(cx).focus_handle().clone();
+                if !focus.contains_focused(window, cx) {
+                    focus.focus(window, cx);
+                }
+            }
+            _ => self.focus.focus(window, cx),
+        }
     }
 
     pub fn focus_pane_from_click(
@@ -3173,7 +3203,7 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (tab, load) = self.duplicate_tab(source, index);
+        let (tab, load) = self.duplicate_tab(source, index, window, cx);
         let tab_id = tab.id();
         let directories = match &tab.content {
             TabContent::Directory(browser) => {
@@ -3227,11 +3257,9 @@ impl DotDir {
         let tab = &self.panes[pane].tabs[index];
         match tab.content {
             TabContent::Directory(_) => self.navigate(pane, path, window, cx),
-            TabContent::Document(document)
-                if self
-                    .documents
-                    .get(&document)
-                    .is_some_and(|document| document.saving || document.dirty(cx)) =>
+            _ if self
+                .file_changes(&tab.content, cx)
+                .is_some_and(|(_, saving, dirty)| saving || dirty) =>
             {
                 self.open_directory_tab(pane, path, window, cx);
             }
@@ -3247,7 +3275,13 @@ impl DotDir {
         }
     }
 
-    fn duplicate_tab(&mut self, pane: usize, index: usize) -> (Tab, Option<Location>) {
+    fn duplicate_tab(
+        &mut self,
+        pane: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Tab, Option<Location>) {
         let id = self.id();
         let (content, load) = match &self.panes[pane].tabs[index].content {
             TabContent::Directory(browser) => {
@@ -3259,6 +3293,20 @@ impl DotDir {
                 (TabContent::Directory(browser), None)
             }
             TabContent::Document(document) => (TabContent::Document(*document), None),
+            TabContent::Hex { path, view, .. } => {
+                let view = view.read(cx);
+                (
+                    self.hex_content(
+                        id,
+                        path.clone(),
+                        view.buffer.clone(),
+                        view.readonly,
+                        window,
+                        cx,
+                    ),
+                    None,
+                )
+            }
             TabContent::SelectionInspector { snapshot, .. } => (
                 TabContent::SelectionInspector {
                     id,
@@ -4117,7 +4165,7 @@ impl DotDir {
                 cx,
             ),
             "create-archive" => self.prompt_create_archive(window, cx),
-            "rename" if self.active_document().is_none() => {
+            "rename" if self.directory(self.active).is_some() => {
                 if let Some(e) = self
                     .directory(self.active)
                     .and_then(Directory::focused)
@@ -4137,6 +4185,12 @@ impl DotDir {
             "rename" | "save" => {
                 if let Some(id) = self.active_document() {
                     self.save(id, cx);
+                } else if let Some((path, view)) = self.active_hex()
+                    && let Some(path) = path.local().map(Path::to_path_buf)
+                    && !view.read(cx).readonly
+                {
+                    let buffer = view.read(cx).buffer.clone();
+                    buffer.update(cx, |buffer, cx| buffer.save(path, cx));
                 }
             }
             "definition" | "completions" => {
@@ -4150,6 +4204,24 @@ impl DotDir {
                     } else {
                         focus.dispatch_action(&ShowCompletions, window, cx);
                     }
+                }
+            }
+            "view-hex" | "edit-hex" => {
+                if let Some(path) = self
+                    .directory(self.active)
+                    .and_then(Directory::focused)
+                    .filter(|entry| !entry.directory)
+                    .map(|entry| entry.path.clone())
+                {
+                    self.open_file_into(
+                        self.active,
+                        path,
+                        id == "view-hex",
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
                 }
             }
             "view" | "edit" | "quick-view" | "quick-edit" => {
@@ -4312,7 +4384,7 @@ Selected entries will be permanently removed from the archive."
                 }
                 if self.modal.is_some() {
                     self.dismiss(window, cx);
-                } else if self.active_document().is_some() {
+                } else if self.active_document().is_some() || self.active_hex().is_some() {
                     let p = &self.panes[self.active];
                     self.request_close_tab(self.active, p.tabs[p.active].id(), window, cx);
                 } else {
@@ -4487,6 +4559,9 @@ Selected entries will be permanently removed from the archive."
                     Some(TabContent::Media { view, .. }) => {
                         view.read(cx).focus_handle(cx).contains_focused(window, cx)
                     }
+                    Some(TabContent::Hex { view, .. }) => {
+                        view.read(cx).focus_handle().contains_focused(window, cx)
+                    }
                     _ => self.focus.contains_focused(window, cx),
                 };
             if let Some(tab) = self.panes[pane].tabs.iter_mut().find(|tab| tab.id() == id) {
@@ -4499,14 +4574,25 @@ Selected entries will be permanently removed from the archive."
             cx.notify();
             return;
         }
-        let existing = if let TabContent::Document(id) = &content {
+        let existing =
             self.panes[pane]
                 .tabs
                 .iter()
-                .position(|tab| matches!(tab.content, TabContent::Document(doc) if doc == *id))
-        } else {
-            None
-        };
+                .position(|tab| match (&tab.content, &content) {
+                    (TabContent::Document(existing), TabContent::Document(id)) => existing == id,
+                    (
+                        TabContent::Hex {
+                            path: existing_path,
+                            view: existing,
+                            ..
+                        },
+                        TabContent::Hex { path, view, .. },
+                    ) => {
+                        existing_path == path
+                            && existing.read(cx).readonly == view.read(cx).readonly
+                    }
+                    _ => false,
+                });
         if let Some(index) = existing {
             self.panes[pane].tabs[index].make_permanent();
             self.panes[pane].active = index;
@@ -4519,6 +4605,34 @@ Selected entries will be permanently removed from the archive."
             self.panes[pane].insert_after_active(tab);
         }
         self.focus_pane(pane, window, cx);
+    }
+
+    fn hex_content(
+        &self,
+        id: u64,
+        path: Location,
+        buffer: Entity<HexBuffer>,
+        readonly: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabContent {
+        let readonly = readonly || path.local().is_none();
+        let view = cx.new(|cx| HexView::new(buffer.clone(), readonly, self.palette, window, cx));
+        let subscription = cx.observe(&buffer, move |this, buffer, cx| {
+            if !readonly
+                && buffer.read(cx).dirty()
+                && let Some((pane, index)) = this.tab_position(id)
+            {
+                this.panes[pane].tabs[index].make_permanent();
+            }
+            cx.notify();
+        });
+        TabContent::Hex {
+            id,
+            path,
+            view,
+            _subscription: subscription,
+        }
     }
     pub fn open_document(
         &mut self,
@@ -4564,12 +4678,25 @@ Selected entries will be permanently removed from the archive."
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_file_into(pane, path, readonly, tab, false, window, cx);
+    }
+
+    fn open_file_into(
+        &mut self,
+        pane: usize,
+        path: Location,
+        readonly: bool,
+        tab: Option<u64>,
+        force_hex: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let path = match path {
             Location::Local(path) => Location::Local(path.canonicalize().unwrap_or(path)),
             archive => archive,
         };
         let readonly = readonly || !path.editable();
-        if readonly {
+        if readonly && !force_hex {
             let bundled = MediaFilter::bundled();
             let builtin = bundled
                 .matches(path.name_path())
@@ -4699,7 +4826,7 @@ Selected entries will be permanently removed from the archive."
                 return;
             }
         }
-        if readonly && path.local().is_some() && image_format(&path).is_some() {
+        if readonly && !force_hex && path.local().is_some() && image_format(&path).is_some() {
             if tab.is_none() {
                 self.open_request[pane] += 1;
             }
@@ -4717,9 +4844,9 @@ Selected entries will be permanently removed from the archive."
             );
             return;
         }
-        if let Some(doc) = self.documents.values_mut().find(|d| d.path == path) {
+        if !force_hex && let Some(doc) = self.documents.values_mut().find(|d| d.path == path) {
             let id = doc.id;
-            if !readonly && std::str::from_utf8(&doc.saved).is_ok() {
+            if !readonly {
                 doc.readonly = false;
             }
             self.enable_language_server(id, cx);
@@ -4751,7 +4878,7 @@ Selected entries will be permanently removed from the archive."
             self.status = format!("Opening {}…", path.display());
         }
         std::thread::spawn(move || {
-            let result = path.read_preview(&filesystems);
+            let result = hex_file::open(&path, readonly, force_hex, &filesystems);
             let _ = tx.send(Message::Opened {
                 request,
                 pane,
@@ -4925,6 +5052,20 @@ Selected entries will be permanently removed from the archive."
             cx.notify();
         }
     }
+    fn has_other_hex_editor(&self, id: u64, buffer: &Entity<HexBuffer>, cx: &App) -> bool {
+        self.panes.iter().flat_map(|pane| &pane.tabs).any(|tab| {
+            if tab.id() == id {
+                return false;
+            }
+            if let TabContent::Hex { view, .. } = &tab.content {
+                let view = view.read(cx);
+                !view.readonly && view.buffer == *buffer
+            } else {
+                false
+            }
+        })
+    }
+
     pub fn request_close_tab(
         &mut self,
         pane: usize,
@@ -4937,22 +5078,24 @@ Selected entries will be permanently removed from the archive."
             .iter()
             .find(|tab| tab.id() == id)
             .and_then(|tab| {
-                if let TabContent::Document(id) = tab.content {
-                    self.documents.get(&id)
-                } else {
-                    None
+                if let TabContent::Hex { view, .. } = &tab.content {
+                    let view = view.read(cx);
+                    if view.readonly || self.has_other_hex_editor(id, &view.buffer, cx) {
+                        return None;
+                    }
                 }
+                self.file_changes(&tab.content, cx)
             });
-        if let Some(doc) = document {
-            if doc.saving {
+        if let Some((path, saving, dirty)) = document {
+            if saving {
                 self.error("Wait for the save to finish", cx);
                 return;
             }
-            if doc.dirty(cx) {
+            if dirty {
                 self.prompt(
                     PromptKind::CloseTab { pane, id },
                     "Unsaved changes",
-                    format!("Discard changes to {}?", doc.path.display()),
+                    format!("Discard changes to {}?", path.display()),
                     String::new(),
                     window,
                     cx,
@@ -4975,7 +5118,17 @@ Selected entries will be permanently removed from the archive."
                 }
                 self.panel_scrolls.remove(&browser.id);
             }
-            p.remove_tab(i);
+            let closed = p.remove_tab(i);
+            if let TabContent::Hex { view, .. } = closed.content {
+                let view = view.read(cx);
+                if !view.readonly
+                    && view.buffer.read(cx).dirty()
+                    && !self.has_other_hex_editor(id, &view.buffer, cx)
+                {
+                    let buffer = view.buffer.clone();
+                    buffer.update(cx, |buffer, cx| buffer.discard(cx));
+                }
+            }
         }
         self.release_unused_documents();
         if let Some(w) = &self.watcher {
@@ -5000,11 +5153,16 @@ Selected entries will be permanently removed from the archive."
             self.error("Resolve or cancel the file conflict before closing", cx);
             return;
         }
-        if self.documents.values().any(|d| d.saving) {
+        let mut documents = self
+            .panes
+            .iter()
+            .flat_map(|pane| &pane.tabs)
+            .filter_map(|tab| self.file_changes(&tab.content, cx));
+        if documents.clone().any(|(_, saving, _)| saving) {
             self.error("Wait for pending saves before closing", cx);
             return;
         }
-        if self.documents.values().any(|d| d.dirty(cx)) || self.operation.is_some() {
+        if documents.any(|(_, _, dirty)| dirty) || self.operation.is_some() {
             self.prompt(
                 PromptKind::Quit,
                 "Close DotDir",

@@ -53,6 +53,7 @@ pub enum Availability {
     Entry,
     RealEntry,
     File,
+    LocalFile,
     EditableFile,
     Items,
     Copy,
@@ -88,6 +89,7 @@ impl Availability {
             Self::Entry => state.directory && state.entry,
             Self::RealEntry => state.directory && state.real_entry,
             Self::File => state.directory && state.file,
+            Self::LocalFile => state.directory && state.file && local,
             Self::EditableFile => {
                 state.directory && state.file && (local || state.archive_editable)
             }
@@ -251,6 +253,20 @@ pub const COMMANDS: &[Command] = &[
         key: "f4",
         context: "FilePane",
         availability: Availability::EditableFile,
+    },
+    Command {
+        id: "view-hex",
+        title: "View as Hex",
+        key: "",
+        context: "FilePane",
+        availability: Availability::File,
+    },
+    Command {
+        id: "edit-hex",
+        title: "Edit as Hex",
+        key: "",
+        context: "FilePane",
+        availability: Availability::LocalFile,
     },
     Command {
         id: "copy",
