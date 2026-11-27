@@ -7,8 +7,65 @@ use log::debug;
 use notify::{self, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Watches a directory tree or the name of a single file.
+pub struct ChangeWatch {
+    _watcher: RecommendedWatcher,
+}
+
+impl ChangeWatch {
+    pub fn new(
+        source: &Path,
+        recursive: bool,
+        on_change: impl Fn() + Send + 'static,
+    ) -> notify::Result<Self> {
+        use notify::event::{MetadataKind, ModifyKind};
+        use notify::EventKind;
+
+        let path = source.canonicalize()?;
+        let watched_path = if recursive {
+            &path
+        } else {
+            // Watch the name in its parent so atomic file replacement is detected.
+            path.parent()
+                .ok_or_else(|| notify::Error::path_not_found())?
+        }
+        .to_path_buf();
+        let mut watcher = RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                if let Ok(event) = result {
+                    if matches!(
+                        event.kind,
+                        EventKind::Access(_)
+                            | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+                    ) {
+                        return;
+                    }
+                    if !recursive
+                        && !event.need_rescan()
+                        && !event.paths.is_empty()
+                        && !event.paths.contains(&path)
+                    {
+                        return;
+                    }
+                }
+                on_change();
+            },
+            notify::Config::default().with_follow_symlinks(false),
+        )?;
+        watcher.watch(
+            &watched_path,
+            if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            },
+        )?;
+        Ok(Self { _watcher: watcher })
+    }
+}
 
 /// Event kind — matches the canonical strings used throughout the codebase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

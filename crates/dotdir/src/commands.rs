@@ -135,6 +135,7 @@ impl Command {
 
     pub fn title(&self, state: &CommandState) -> &'static str {
         match self.id {
+            "view" if state.directory && state.real_entry && !state.file => "Calculate Folder Size",
             "copy" if state.archive && !state.opposite_archive_writable => "Extract Archive",
             "trash" if state.archive => "Delete Archive Entries",
             "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
@@ -248,7 +249,7 @@ pub const COMMANDS: &[Command] = &[
         title: "View File",
         key: "f3",
         context: "DotDir",
-        availability: Availability::File,
+        availability: Availability::RealEntry,
     },
     Command {
         id: "edit",
@@ -1069,6 +1070,7 @@ mod tests {
         state.selection = true;
         assert!(available("rename", &state));
         assert!(available("copy", &state));
+        assert!(available("view", &state));
         assert!(!available("edit", &state));
         state.file = true;
         for id in ["view", "edit", "quick-view", "quick-edit"] {
@@ -1162,6 +1164,7 @@ mod tests {
                     expected,
                     &CommandState {
                         directory: true,
+                        real_entry: true,
                         file: true,
                         ..Default::default()
                     }

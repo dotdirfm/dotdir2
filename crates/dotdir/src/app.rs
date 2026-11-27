@@ -7,6 +7,7 @@ use crate::{
     commands::{COMMANDS, CommandState, RunCommand},
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
+    folder_sizes::{FolderSizeEvent, FolderSizes},
     hex_file::{self, OpenedFile},
     hex_view::{ByteViewMode, HexBuffer, HexView},
     hover::HoverHints,
@@ -60,6 +61,7 @@ pub(crate) enum Message {
     Lsp(lsp::Notice),
     MountedRoots(Vec<PathBuf>),
     Directory(u64, u64, anyhow::Result<Vec<Entry>>),
+    FolderSize(FolderSizeEvent),
     Watch(u64),
     ArchivePassword(PasswordRequest),
     Opened {
@@ -1445,6 +1447,13 @@ impl DotDir {
                 Message::Watch(id) => {
                     self.pending_watch.entry(id).or_insert_with(Instant::now);
                 }
+                Message::FolderSize(event) => {
+                    if let Err(error) = self.folder_sizes.update(event)
+                        && !error.is::<UnlockCancelled>()
+                    {
+                        self.error(format!("{error:#}"), cx);
+                    }
+                }
                 Message::ArchivePassword(request) => self.password_requests.push_back(request),
                 Message::Opened {
                     request,
@@ -2328,6 +2337,7 @@ pub(crate) struct DotDir {
     pub panes: [Pane; 2],
     pub tab_strip_scrolls: [TabStripScroll; 2],
     pub panel_scrolls: HashMap<u64, ColumnScroll>,
+    pub folder_sizes: FolderSizes,
     pub active: usize,
     pub documents: HashMap<u64, Document>,
     pub settings: Settings,
@@ -2609,6 +2619,7 @@ impl DotDir {
                 filesystems
             },
             password_requests: VecDeque::new(),
+            folder_sizes: FolderSizes::default(),
             extension_logs,
             extension_log_scroll: ScrollHandle::new(),
             market: open_vsx::Market::default(),
@@ -2916,6 +2927,9 @@ impl DotDir {
             let generation = d.generation;
             let path = d.path.clone();
             let sort = d.sort;
+            self.folder_sizes.invalidate_unwatched(|folder| {
+                folder == &path || folder.parent().as_ref() == Some(&path)
+            });
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(Message::Directory(
@@ -2927,10 +2941,13 @@ impl DotDir {
         }
     }
     pub fn refresh_all(&mut self) {
+        self.folder_sizes.invalidate_unwatched(|_| true);
         self.refresh_directories(|_| true);
     }
 
     pub fn refresh_provider_directories(&mut self) {
+        self.folder_sizes
+            .invalidate_unwatched(|path| matches!(path, Location::Provider(_)));
         self.refresh_directories(|path| matches!(path, Location::Provider(_)));
     }
 
@@ -4252,9 +4269,21 @@ impl DotDir {
                 if let Some(e) = self
                     .directory(self.active)
                     .and_then(Directory::focused)
-                    .filter(|e| !e.directory)
                     .cloned()
                 {
+                    if e.directory {
+                        if id == "view" && !e.parent {
+                            let request = self.id();
+                            self.folder_sizes.start(
+                                request,
+                                e.path,
+                                self.filesystems.archive_operation(),
+                                self.tx.clone(),
+                            );
+                        }
+                        cx.notify();
+                        return;
+                    }
                     let pane = if id.starts_with("quick-") {
                         1 - self.active
                     } else {
@@ -4408,6 +4437,14 @@ Selected entries will be permanently removed from the archive."
                 }
                 if self.modal.is_some() {
                     self.dismiss(window, cx);
+                } else if let Some(path) = self
+                    .directory(self.active)
+                    .and_then(Directory::focused)
+                    .map(|entry| entry.path.clone())
+                    && self.folder_sizes.cancel_for(&path)
+                {
+                    cx.notify();
+                    return;
                 } else if self.active_document().is_some() || self.active_hex().is_some() {
                     let p = &self.panes[self.active];
                     self.request_close_tab(self.active, p.tabs[p.active].id(), window, cx);

@@ -10,6 +10,7 @@ mod column_scroll;
 mod commands;
 mod extension_logs;
 mod filesystems;
+mod folder_sizes;
 mod hex_file;
 mod hex_view;
 mod hover;

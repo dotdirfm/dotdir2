@@ -603,7 +603,9 @@ impl DotDir {
                 if e.parent {
                     "Up".into()
                 } else if e.directory {
-                    "<DIR>".into()
+                    self.folder_sizes
+                        .readout(&e.path)
+                        .unwrap_or_else(|| "<DIR>".into())
                 } else {
                     human_size(e.size)
                 }
@@ -643,7 +645,13 @@ impl DotDir {
                     .text_size(px(11.))
                     .text_color(p.muted)
                     .child(text(focused.map(|e| e.name.clone()).unwrap_or_default()).flex_1())
-                    .child(text(status))
+                    .child(
+                        div()
+                            .id(("focused-entry-size", pane))
+                            .role(Role::Label)
+                            .aria_label(status.clone())
+                            .child(text(status)),
+                    )
                     .child(text(focused.map(modified).unwrap_or_default())),
             )
             .child(
