@@ -13,6 +13,7 @@ use gpui_kit::{
     *,
 };
 use lsp_types::{HoverContents, MarkedString, MarkupKind, Position};
+use markdown::mdast::Node;
 use std::{cell::Cell, ops::Range, path::Path, path::PathBuf, rc::Rc, time::Duration};
 use url::Url;
 
@@ -32,6 +33,7 @@ struct Target {
 struct Documentation {
     contents: SharedString,
     markdown: bool,
+    code_only: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -280,6 +282,7 @@ impl DotDir {
             if contents.trim().is_empty() {
                 return;
             }
+            let code_only = markdown && is_code_only_markdown(&contents);
             let _ = this.update(cx, |this, cx| {
                 if this.hover.target.as_ref() == Some(&target)
                     && this.hover_editor_for_target(&target).is_some()
@@ -288,6 +291,7 @@ impl DotDir {
                         hint.documentation = Some(Documentation {
                             contents: contents.into(),
                             markdown,
+                            code_only,
                         });
                         cx.notify();
                     }
@@ -371,8 +375,16 @@ impl DotDir {
             .map(Path::to_path_buf);
         let view = cx.weak_entity();
         let origin = target.clone();
+        let compact = hint.diagnostics.is_empty()
+            && hint.documentation.as_ref().is_some_and(|doc| doc.code_only);
         let documentation = hint.documentation.as_ref().map(|documentation| {
             if documentation.markdown {
+                let code_style = StyleRefinement::default().py_0().text_size(px(11.));
+                let code_style = if compact {
+                    code_style.px_0().border_0().bg(transparent_black())
+                } else {
+                    code_style.px_1()
+                };
                 TextView::markdown("lsp-hover-markdown", documentation.contents.clone())
                     .style(
                         TextViewStyle::default()
@@ -382,9 +394,7 @@ impl DotDir {
                                 4 => rem_size * 0.9,
                                 _ => rem_size * 0.8,
                             })
-                            .code_block(
-                                StyleRefinement::default().px_1().py_0().text_size(px(11.)),
-                            ),
+                            .code_block(code_style),
                     )
                     .code_block_actions(|_, _, _| div().size_0())
                     .selectable(true)
@@ -465,7 +475,14 @@ impl DotDir {
             .flex()
             .flex_col()
             .gap_2()
-            .p_2()
+            .when(compact, |popup| {
+                popup
+                    .border_1()
+                    .border_color(self.palette.border)
+                    .px(px(5.))
+                    .py(px(2.))
+            })
+            .when(!compact, |popup| popup.p_2())
             .text_xs()
             .max_w((viewport.width - margin * 2).min(px(500.)))
             .max_h((viewport.height - margin * 2).min(px(320.)))
@@ -561,6 +578,13 @@ fn hover_text(contents: HoverContents) -> (bool, String) {
     }
 }
 
+fn is_code_only_markdown(contents: &str) -> bool {
+    matches!(
+        markdown::to_mdast(contents, &markdown::ParseOptions::gfm()),
+        Ok(Node::Root(root)) if matches!(root.children.as_slice(), [Node::Code(_)])
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum HoverLink {
     Source(PathBuf, Option<Position>),
@@ -593,10 +617,25 @@ fn source_position(fragment: &str) -> Option<Position> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticSet, DiagnosticSeverity, HoverLink, hover_diagnostics, hover_link};
+    use super::{
+        DiagnosticSet, DiagnosticSeverity, HoverLink, hover_diagnostics, hover_link,
+        is_code_only_markdown,
+    };
     use gpui_kit::{base::input::Diagnostic, component::input::Rope};
     use lsp_types::Position;
     use url::Url;
+
+    #[test]
+    fn compact_hover_requires_a_standalone_code_block() {
+        let snippet = "```typescript\n(parameter) parentInstance: EffieInstance\n```";
+        assert!(is_code_only_markdown(&format!("\n{snippet}\n\n")));
+        assert!(is_code_only_markdown("~~~rust\nfn example() {}\n~~~"));
+        assert!(!is_code_only_markdown(&format!(
+            "{snippet}\n\nDocumentation"
+        )));
+        assert!(!is_code_only_markdown(&format!("{snippet}\n\n{snippet}")));
+        assert!(!is_code_only_markdown("See `parentInstance` for details."));
+    }
 
     #[test]
     fn hover_shows_only_overlapping_diagnostics_in_severity_order() {
