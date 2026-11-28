@@ -2608,6 +2608,7 @@ pub(crate) struct DotDir {
     pub panes: [Pane; 2],
     pub tab_strip_scrolls: [TabStripScroll; 2],
     pub panel_scrolls: HashMap<u64, ColumnScroll>,
+    listing_redraw_at: Option<Instant>,
     pub(crate) panel_split_unsaved: bool,
     pub(crate) workspace: Workspace,
     window_id: u64,
@@ -2823,6 +2824,7 @@ impl DotDir {
             panes,
             tab_strip_scrolls: Default::default(),
             panel_scrolls: HashMap::new(),
+            listing_redraw_at: None,
             panel_split_unsaved: false,
             window_id: session.id,
             workspace,
@@ -3878,6 +3880,33 @@ impl DotDir {
             }
         }
     }
+    pub(crate) fn redraw_listing_at(
+        &mut self,
+        deadline: Instant,
+        window: &Window,
+        cx: &Context<Self>,
+    ) {
+        if self
+            .listing_redraw_at
+            .is_some_and(|scheduled| scheduled <= deadline)
+        {
+            return;
+        }
+        self.listing_redraw_at = Some(deadline);
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.listing_redraw_at == Some(deadline) {
+                    this.listing_redraw_at = None;
+                    cx.notify();
+                    window.refresh();
+                }
+            });
+        })
+        .detach();
+    }
     pub fn reveal_column(&mut self, pane: usize, preview: bool) {
         if self.settings.presentation(pane) != Presentation::Columns {
             return;
@@ -3945,25 +3974,26 @@ impl DotDir {
     }
     pub fn select_panel_entry(
         &mut self,
-        pane: usize,
-        column: usize,
+        location: (usize, usize),
+        expected_listing: (u64, u64),
         index: usize,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active = pane;
+        let (pane, column) = location;
         let Some(browser) = self.browser_mut(pane) else {
             return;
         };
-        if column >= browser.columns.len() {
+        let Some(directory) = browser.columns.get_mut(column) else {
+            return;
+        };
+        if (directory.id, directory.generation) != expected_listing
+            || index >= directory.entries.len()
+        {
             return;
         }
         browser.active = column;
-        let directory = browser.current_mut();
-        if index >= directory.entries.len() {
-            return;
-        }
         let previous = directory.cursor;
         directory.cursor = index;
         let marking = event.modifiers.platform || event.modifiers.control || event.modifiers.shift;

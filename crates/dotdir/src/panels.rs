@@ -71,10 +71,11 @@ impl DotDir {
         index: usize,
         directory: &Directory,
         layout: PanelLayout,
-        active: bool,
+        state: (bool, bool),
         cx: &Context<Self>,
     ) -> AnyElement {
         let (pane, column) = location;
+        let (active, interactive) = state;
         let p = self.palette;
         let entry = &directory.entries[index];
         let cursor = directory.cursor == index;
@@ -96,7 +97,9 @@ impl DotDir {
                 entry.mode & 0o7777
             ))
             .aria_selected(marked || cursor)
-            .when(cursor && active, |s| s.aria_active_descendant())
+            .when(cursor && active && interactive, |s| {
+                s.aria_active_descendant()
+            })
             .relative()
             .flex()
             .flex_shrink_0()
@@ -139,7 +142,9 @@ impl DotDir {
                         .when(icons, |s| s.rounded(px(5.))),
                 )
             })
-            .when(!cursor && !marked, |s| s.hover(move |s| s.bg(p.selected)));
+            .when(interactive && !cursor && !marked, |s| {
+                s.hover(move |s| s.bg(p.selected))
+            });
         let name = format!("{}{}", entry.name, if entry.symlink { " ↗" } else { "" });
         if icons {
             item = item
@@ -216,19 +221,29 @@ impl DotDir {
                 );
             }
         }
-        item.on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                this.select_panel_entry(pane, column, index, event, window, cx);
-            }),
-        )
+        let expected_listing = (directory.id, directory.generation);
+        item.when(interactive, |item| {
+            item.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.select_panel_entry(
+                        (pane, column),
+                        expected_listing,
+                        index,
+                        event,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+        })
         .into_any_element()
     }
     fn panel_entries(
         &mut self,
         location: (usize, usize),
-        mut directory: Directory,
+        directory: Directory,
         layout: PanelLayout,
         active: bool,
         window: &Window,
@@ -236,15 +251,26 @@ impl DotDir {
     ) -> AnyElement {
         let (pane, column) = location;
         let p = self.palette;
+        let now = std::time::Instant::now();
+        let (mut directory, retained_at) = directory.into_display(now);
+        let interactive = retained_at.is_none();
+        if let Some(retained_at) = retained_at {
+            self.redraw_listing_at(retained_at + PREVIOUS_LISTING_DURATION, window, cx);
+        }
         layout.ensure_visible(&mut directory);
-        let scroll_position = if let Some(actual) = self.directory_by_id(directory.id) {
+        let scroll_position = if let Some(retained_at) = retained_at {
+            if layout.presentation == Presentation::Icons {
+                directory
+                    .icon_scroll_position(layout, cx.reduce_motion(), retained_at)
+                    .0
+            } else {
+                0.
+            }
+        } else if let Some(actual) = self.directory_by_id(directory.id) {
             actual.top = directory.top;
             if layout.presentation == Presentation::Icons {
-                let (position, animating) = actual.icon_scroll_position(
-                    layout,
-                    cx.reduce_motion(),
-                    std::time::Instant::now(),
-                );
+                let (position, animating) =
+                    actual.icon_scroll_position(layout, cx.reduce_motion(), now);
                 if animating {
                     window.request_animation_frame();
                 }
@@ -276,7 +302,7 @@ impl DotDir {
                             index,
                             &directory,
                             layout,
-                            active,
+                            (active, interactive),
                             cx,
                         ));
                     } else {
@@ -313,7 +339,7 @@ impl DotDir {
                             index,
                             &directory,
                             layout,
-                            active,
+                            (active, interactive),
                             cx,
                         ));
                     }
@@ -332,43 +358,47 @@ impl DotDir {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    if let Some(browser) = this.browser_mut(pane) {
-                        browser.active = column;
-                    }
-                    this.focus_pane(pane, window, cx);
-                }),
-            )
-            .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
-                let delta = event.delta.pixel_delta(px(layout.cell_height));
-                let (x, y): (f32, f32) = (delta.x.into(), delta.y.into());
-                if event.modifiers.shift || x.abs() > y.abs() || y == 0. {
-                    return;
-                }
-                if layout.presentation == Presentation::Columns
-                    && let Some(browser) = this.browser(pane)
-                {
-                    let browser_id = browser.id;
-                    this.panel_scrolls
-                        .entry(browser_id)
-                        .or_default()
-                        .hold_position();
-                }
-                let changed = this
-                    .directory_by_id(id)
-                    .is_some_and(|directory| layout.scroll_pixels(directory, -y));
-                cx.stop_propagation();
-                if changed {
-                    if let Some(browser) = this.browser_mut(pane) {
-                        browser.active = column;
-                    }
-                    this.update_column_preview(pane);
-                    cx.notify();
-                    window.refresh();
-                }
-            }))
+            .when(interactive, |list| {
+                list.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if let Some(browser) = this.browser_mut(pane) {
+                            browser.active = column;
+                        }
+                        this.focus_pane(pane, window, cx);
+                    }),
+                )
+                .on_scroll(cx.listener(
+                    move |this, event: &ScrollEvent, window, cx| {
+                        let delta = event.delta.pixel_delta(px(layout.cell_height));
+                        let (x, y): (f32, f32) = (delta.x.into(), delta.y.into());
+                        if event.modifiers.shift || x.abs() > y.abs() || y == 0. {
+                            return;
+                        }
+                        if layout.presentation == Presentation::Columns
+                            && let Some(browser) = this.browser(pane)
+                        {
+                            let browser_id = browser.id;
+                            this.panel_scrolls
+                                .entry(browser_id)
+                                .or_default()
+                                .hold_position();
+                        }
+                        let changed = this
+                            .directory_by_id(id)
+                            .is_some_and(|directory| layout.scroll_pixels(directory, -y));
+                        cx.stop_propagation();
+                        if changed {
+                            if let Some(browser) = this.browser_mut(pane) {
+                                browser.active = column;
+                            }
+                            this.update_column_preview(pane);
+                            cx.notify();
+                            window.refresh();
+                        }
+                    },
+                ))
+            })
             .child(content)
             .into_any_element()
     }

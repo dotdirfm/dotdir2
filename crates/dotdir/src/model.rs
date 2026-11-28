@@ -390,11 +390,24 @@ impl IconScroll {
     }
 }
 
+pub(crate) const PREVIOUS_LISTING_DURATION: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone)]
+struct PreviousListing {
+    entries: Arc<Vec<Entry>>,
+    cursor: usize,
+    top: usize,
+    icon_scroll: Option<IconScroll>,
+    marked: HashSet<Location>,
+    retained_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub id: u64,
     pub path: Location,
     pub entries: Arc<Vec<Entry>>,
+    previous_listing: Option<PreviousListing>,
     show_parent: bool,
     pub cursor: usize,
     pub top: usize,
@@ -415,6 +428,7 @@ impl Directory {
             id,
             path,
             entries: Arc::new(vec![]),
+            previous_listing: None,
             show_parent: true,
             cursor: 0,
             top: 0,
@@ -453,6 +467,7 @@ impl Directory {
             return;
         }
         self.loading = false;
+        self.previous_listing = None;
         match result {
             Ok(mut entries) => {
                 if !self.show_parent {
@@ -478,6 +493,7 @@ impl Directory {
         if self.path == path {
             return;
         }
+        self.previous_listing = self.retain_listing(&path, Instant::now());
         let old = self.path.clone();
         self.restore_name = if old.parent().as_ref() == Some(&path) {
             old.file_name().map(|n| n.to_string_lossy().into_owned())
@@ -493,6 +509,45 @@ impl Directory {
         self.icon_scroll = None;
         self.marked.clear();
         self.entries = Arc::new(vec![]);
+        self.error = None;
+    }
+
+    fn retain_listing(&self, next: &Location, now: Instant) -> Option<PreviousListing> {
+        if self.path.host_path().is_none() || next.host_path().is_none() {
+            return None;
+        }
+        if self.entries.is_empty() {
+            return self
+                .previous_listing
+                .as_ref()
+                .filter(|previous| now < previous.retained_at + PREVIOUS_LISTING_DURATION)
+                .cloned();
+        }
+        Some(PreviousListing {
+            entries: self.entries.clone(),
+            cursor: self.cursor,
+            top: self.top,
+            icon_scroll: self.icon_scroll,
+            marked: self.marked.clone(),
+            retained_at: now,
+        })
+    }
+
+    /// Called on the rendering copy. The live entries remain empty until the read completes.
+    pub(crate) fn into_display(mut self, now: Instant) -> (Self, Option<Instant>) {
+        let Some(previous) = self
+            .previous_listing
+            .take()
+            .filter(|previous| now < previous.retained_at + PREVIOUS_LISTING_DURATION)
+        else {
+            return (self, None);
+        };
+        self.entries = previous.entries;
+        self.cursor = previous.cursor;
+        self.top = previous.top;
+        self.icon_scroll = previous.icon_scroll;
+        self.marked = previous.marked;
+        (self, Some(previous.retained_at))
     }
     pub fn move_cursor(&mut self, delta: isize) {
         self.wheel_remainder = 0.;
@@ -602,7 +657,9 @@ impl DirectoryBrowser {
         let mut current = self.columns.remove(self.active);
         if !current.show_parent {
             current.show_parent = true;
-            if let Some(parent) = parent_entry(&current.path) {
+            if (!current.loading || !current.entries.is_empty())
+                && let Some(parent) = parent_entry(&current.path)
+            {
                 // Preserve the focused file and viewport when a child becomes
                 // the first column (including when leaving Columns mode).
                 if !current.entries.is_empty() {
@@ -626,9 +683,15 @@ impl DirectoryBrowser {
         if self.columns.get(self.active + 1).map(|d| &d.path) == path.as_ref() {
             return None;
         }
+        let previous = path.as_ref().and_then(|path| {
+            self.columns
+                .get(self.active + 1)?
+                .retain_listing(path, Instant::now())
+        });
         self.columns.truncate(self.active + 1);
         path.map(|path| {
             let mut child = Directory::new(child_id, path);
+            child.previous_listing = previous;
             child.show_parent = false;
             child.sort = self.current().sort;
             self.columns.push(child);
@@ -807,6 +870,63 @@ mod tests {
                 .collect(),
         );
         directory
+    }
+
+    #[test]
+    fn navigating_keeps_a_read_only_snapshot_until_the_new_listing_or_deadline() {
+        let mut directory = numbered_directory(5);
+        directory.cursor = 3;
+        directory.top = 2;
+        directory.toggle_mark();
+        let old_entries = directory.entries.clone();
+        directory.navigate(Path::new("/next").into());
+        directory.generation = 2;
+
+        assert!(directory.focused().is_none());
+        assert!(directory.selected().is_empty());
+        let retained_at = directory.previous_listing.as_ref().unwrap().retained_at;
+        let (display, retained) = directory.clone().into_display(retained_at);
+        assert_eq!(retained, Some(retained_at));
+        assert!(Arc::ptr_eq(&display.entries, &old_entries));
+        assert_eq!(
+            (display.cursor, display.top, display.marked.len()),
+            (3, 2, 1)
+        );
+
+        directory.apply(1, Ok(vec![]));
+        assert_eq!(
+            directory.clone().into_display(retained_at).1,
+            Some(retained_at)
+        );
+        assert_eq!(
+            directory
+                .retain_listing(
+                    &Path::new("/another").into(),
+                    retained_at + Duration::from_millis(50),
+                )
+                .map(|previous| previous.retained_at),
+            Some(retained_at)
+        );
+        let (expired, retained) = directory
+            .clone()
+            .into_display(retained_at + PREVIOUS_LISTING_DURATION);
+        assert!(retained.is_none() && expired.entries.is_empty());
+
+        let current_entries = numbered_directory(2).entries;
+        directory.apply(2, Ok(current_entries.as_ref().clone()));
+        let (display, retained) = directory.into_display(retained_at);
+        assert!(retained.is_none());
+        assert_eq!(display.entries.len(), 2);
+    }
+
+    #[test]
+    fn remote_navigation_drops_the_previous_listing_immediately() {
+        let mut directory = numbered_directory(5);
+        directory.navigate(Path::new("/pending").into());
+        let remote = Location::Provider(crate::filesystems::ProviderPath::root("s3"));
+        directory.navigate(remote);
+        let (display, retained) = directory.into_display(Instant::now());
+        assert!(retained.is_none() && display.entries.is_empty());
     }
 
     #[test]
@@ -1122,6 +1242,15 @@ mod tests {
         assert_eq!(browser.preview(4), Some(4));
         assert_eq!(browser.columns.len(), 2);
         assert_eq!(browser.columns[1].path, b.into());
+        assert!(browser.columns[1].entries.is_empty());
+        let retained_at = browser.columns[1]
+            .previous_listing
+            .as_ref()
+            .unwrap()
+            .retained_at;
+        let (display, retained) = browser.columns[1].clone().into_display(retained_at);
+        assert_eq!(retained, Some(retained_at));
+        assert_eq!(display.entries[0].name, "nested");
         assert!(!browser.columns.iter().any(|d| matches!(d.id, 2 | 3)));
     }
     #[test]
