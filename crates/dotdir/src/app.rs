@@ -7,7 +7,7 @@ use crate::{
     commands::{COMMANDS, CommandState, RunCommand},
     diagnostics::{DiagnosticDecorations, DiagnosticStyles},
     extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
-    filesystems::{Filesystems, LOG_SCHEME, ProviderPath},
+    filesystems::{Filesystems, LOG_SCHEME, ProviderPath, RemoteDocument},
     folder_sizes::{FolderSizeEvent, FolderSizes},
     hex_file::{self, OpenedFile},
     hex_view::{ByteViewMode, HexBuffer, HexView},
@@ -51,6 +51,22 @@ use std::{
 };
 
 const VSCODE_RUNNING: &str = "Running VS Code extension…";
+const OPERATION_CANCELLED: &str = "Operation cancelled. Completed changes are retained.";
+
+fn operation_was_cancelled(error: &anyhow::Error, cancelled: bool) -> bool {
+    use dotdir_core::error::FsError;
+    use std::io::ErrorKind::Interrupted;
+
+    error.is::<UnlockCancelled>()
+        || cancelled
+            && (matches!(error.downcast_ref::<FsError>(), Some(FsError::Io(err)) if err.kind() == Interrupted)
+                || matches!(
+                    error.root_cause().to_string().as_str(),
+                    "Archive operation cancelled"
+                        | "Remote operation cancelled"
+                        | "File read cancelled"
+                ))
+}
 
 fn extension_cache_directory() -> PathBuf {
     dirs::cache_dir()
@@ -64,7 +80,7 @@ pub(crate) enum Message {
     ColorTheme(u64, anyhow::Result<Box<ImportedTheme>>),
     Lsp(lsp::Notice),
     MountedRoots(Vec<PathBuf>),
-    Directory(u64, u64, anyhow::Result<Vec<Entry>>),
+    Directory(u64, u64, bool, anyhow::Result<Vec<Entry>>),
     FolderSize(FolderSizeEvent),
     Watch(u64),
     ArchivePassword(PasswordRequest),
@@ -81,9 +97,10 @@ pub(crate) enum Message {
         id: u64,
         version: u64,
         text: String,
-        result: anyhow::Result<()>,
+        result: anyhow::Result<Option<RemoteDocument>>,
     },
-    ArchiveFileCreated {
+    HexSaved(anyhow::Result<()>),
+    FileCreated {
         pane: usize,
         directory: Location,
         path: Location,
@@ -99,7 +116,6 @@ pub(crate) enum Message {
         title: String,
         result: anyhow::Result<ExtensionReply>,
     },
-    Simple(anyhow::Result<()>),
 }
 
 pub(crate) fn read_password(input: &InputState) -> Password {
@@ -156,6 +172,10 @@ fn parse_copy_destinations(value: &str) -> anyhow::Result<Vec<String>> {
 
 impl DotDir {
     pub fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.error_messages.is_empty() {
+            self.dismiss(window, cx);
+            return;
+        }
         if matches!(self.modal, Some(Modal::RemoteConnections { .. })) {
             self.save_remote_connection(window, cx);
             return;
@@ -267,7 +287,7 @@ impl DotDir {
                         folder,
                         self.filesystems.clone(),
                         move |path| {
-                            let _ = tx.send(Message::ArchiveFileCreated {
+                            let _ = tx.send(Message::FileCreated {
                                 pane,
                                 directory: owner,
                                 path,
@@ -275,47 +295,50 @@ impl DotDir {
                         },
                     ));
                 }
-                PromptKind::Mkdir(_) => {
+                PromptKind::Mkdir(directory) => {
                     if !valid_name(value.trim()) {
                         anyhow::bail!("Enter one valid directory name");
                     }
-                    let path = self.cwd(self.active).join(value.trim());
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(Message::Simple(
-                            std::fs::create_dir(path).map_err(Into::into),
-                        ));
-                    });
+                    let path = directory.local().context("Expected a local directory")?;
+                    self.operation =
+                        Some(Operation::create_folder(self.id(), path.join(value.trim())));
                 }
                 PromptKind::Rename(source) => {
                     if !valid_name(&value) {
                         anyhow::bail!("Enter one valid file name");
                     }
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        let result = dotdir_core::move_op::rename_item(&source, &value)
-                            .map(|_| ())
-                            .map_err(Into::into);
-                        let _ = tx.send(Message::Simple(result));
-                    });
+                    self.operation = Some(Operation::rename(self.id(), source, value.clone()));
                 }
-                PromptKind::NewFile(_) => {
+                PromptKind::NewFile(directory) => {
                     if value.trim().is_empty() {
                         anyhow::bail!("Enter a file path");
                     }
-                    let path = self.resolve_path(&value);
-                    if !path.exists() {
-                        std::fs::OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .open(&path)?;
-                    }
-                    self.open_document(self.active, path, false, window, cx);
+                    let path = match &directory {
+                        Location::Provider(path) => {
+                            Location::Provider(path.checked_child(value.trim())?)
+                        }
+                        _ => self.resolve_path(&value).into(),
+                    };
+                    let tx = self.tx.clone();
+                    let pane = self.active;
+                    let opened = move |path| {
+                        let _ = tx.send(Message::FileCreated {
+                            pane,
+                            directory,
+                            path,
+                        });
+                    };
+                    self.operation = Some(Operation::create_file(
+                        self.id(),
+                        path,
+                        self.filesystems.clone(),
+                        opened,
+                    ));
                 }
                 PromptKind::Transfer {
                     kind,
                     sources,
-                    archive_destination,
+                    virtual_destination,
                 } => {
                     anyhow::ensure!(
                         self.operation.is_none(),
@@ -326,11 +349,22 @@ impl DotDir {
                     }
                     let local_copy = matches!(kind, OperationKind::Copy)
                         && sources.iter().all(|source| source.local().is_some());
-                    let archive_destination =
-                        archive_destination.filter(|path| value.trim() == path.display());
+                    let mut virtual_destination =
+                        virtual_destination.filter(|path| value.trim() == path.display());
+                    if !self.copy_multiple && virtual_destination.is_none() {
+                        virtual_destination =
+                            ProviderPath::parse(value.trim())?.map(Location::Provider);
+                    }
+                    if let Some(Location::Provider(path)) = &virtual_destination {
+                        anyhow::ensure!(sources.iter().all(|source| source.local().is_some() || matches!(source, Location::Provider(path) if self.filesystems.can_change_remote(path))), "Choose local files or entries inside a remote connection");
+                        anyhow::ensure!(
+                            self.filesystems.can_upload_to(path),
+                            "Choose a remote connection or folder"
+                        );
+                    }
                     let mut options = self.copy_options.clone();
                     let id = self.id();
-                    self.operation = if local_copy && archive_destination.is_none() {
+                    self.operation = if local_copy && virtual_destination.is_none() {
                         let values = if self.copy_multiple {
                             parse_copy_destinations(&value)?
                         } else {
@@ -363,7 +397,7 @@ impl DotDir {
                             .collect();
                         Some(Operation::copy(id, sources, destinations, options))
                     } else {
-                        let destination = if let Some(path) = archive_destination {
+                        let destination = if let Some(path) = virtual_destination {
                             path
                         } else {
                             let path = self.resolve_path(value.trim());
@@ -373,7 +407,7 @@ impl DotDir {
                         if !self.transfer_supports_policy(
                             kind,
                             &sources,
-                            destination.archive_member().is_some(),
+                            Some(&destination),
                             options.conflict_policy,
                         ) {
                             options.conflict_policy = ConflictPolicy::Ask;
@@ -394,6 +428,17 @@ impl DotDir {
                         "Wait for the current operation to finish"
                     );
                     self.operation = Some(Operation::delete_entries(
+                        self.id(),
+                        sources,
+                        self.filesystems.clone(),
+                    ));
+                }
+                PromptKind::DeleteRemote(sources) => {
+                    anyhow::ensure!(
+                        self.operation.is_none(),
+                        "Wait for the current operation to finish"
+                    );
+                    self.operation = Some(Operation::delete_remote(
                         self.id(),
                         sources,
                         self.filesystems.clone(),
@@ -431,8 +476,8 @@ impl DotDir {
                 title,
                 description,
             });
-            self.modal_error = Some(e.to_string());
-            self.dialog_input.update(cx, |s, cx| s.focus(window, cx));
+            self.report_error("Error", &e, cx);
+            self.focus_modal(window, cx);
         } else if !self.shutting_down && self.modal.is_none() {
             self.focus_pane(self.active, window, cx);
         }
@@ -572,7 +617,10 @@ impl DotDir {
             archive_creation: ARCHIVE_FORMATS.creators().next().is_some(),
             provider: matches!(location, Location::Provider(_)),
             remote_download: matches!(&location, Location::Provider(path)
-                if path.name().is_some() && self.filesystems.is_remote(path)),
+                if self.filesystems.can_upload_to(path)),
+            remote_editable: entry.is_some_and(|entry| self.can_edit_remote_document(&entry.path)),
+            remote_create_file: matches!(&location, Location::Provider(path)
+                if self.filesystems.can_create_remote_file(path)),
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
             file: entry.is_some_and(|entry| !entry.directory && !entry.parent),
@@ -597,7 +645,7 @@ impl DotDir {
             has_tab: self.panels_visible && tab.is_some(),
             multiple_tabs: self.panels_visible && self.panes[self.active].tabs.len() > 1,
             preview: self.preview_target().is_some(),
-            operation_idle: self.operation.is_none(),
+            operation_idle: self.operation.is_none() && self.saving_file.is_none(),
             media: match tab {
                 Some(TabContent::Media { view, .. }) if self.panels_visible => {
                     Some(view.read(cx).command_state())
@@ -938,7 +986,7 @@ impl DotDir {
                                     cx,
                                 ),
                                 Ok(Some(action))
-                                    if this.modal.is_none()
+                                    if !this.has_dialog()
                                         && this.active == pane
                                         && this.active_document() == Some(origin)
                                         && this.documents[&origin].version == version =>
@@ -1013,8 +1061,10 @@ impl DotDir {
         self.extension_logs
             .source(extension, "VS Code commands")
             .error(&format!("{command}: {error:#}"));
-        self.status = format!("VS Code extension: {error}");
-        cx.notify();
+        self.queue_error(
+            ErrorMessage::new("VS Code Extension", error.to_string()),
+            cx,
+        );
     }
 
     fn handle_vscode(&mut self, event: vscode::Event, window: &mut Window, cx: &mut Context<Self>) {
@@ -1295,6 +1345,10 @@ impl DotDir {
     }
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        if self.panel_split_unsaved && !cx.has_active_drag() {
+            self.panel_split_unsaved = false;
+            self.persist();
+        }
         if let Some(pending) = self.vscode_host.expire() {
             self.report_vscode_error(
                 &pending.extension,
@@ -1350,7 +1404,7 @@ impl DotDir {
                         request,
                         reply,
                     } => {
-                        if self.modal.is_none()
+                        if !self.has_dialog()
                             && self
                                 .vscode_language_command
                                 .is_some_and(|(_, owner)| owner == session)
@@ -1425,17 +1479,23 @@ impl DotDir {
                             .and_then(|doc| doc.lsp.as_ref())
                             .is_some_and(|buffer| buffer.session() == session)
                         {
-                            self.status = format!("Code action: {error}");
+                            self.error(format!("Code action: {error}"), cx);
                         }
                     }
                 },
-                Message::Directory(id, generation, result) => {
+                Message::Directory(id, generation, interactive, result) => {
+                    let active = self.directory(self.active).is_some_and(|d| d.id == id);
                     let Some(directory) = self
                         .directory_by_id(id)
                         .filter(|d| d.generation == generation)
                     else {
                         continue;
                     };
+                    let error = result
+                        .as_ref()
+                        .err()
+                        .filter(|error| interactive && active && !error.is::<UnlockCancelled>())
+                        .map(|error| ErrorMessage::from_error("Could Not List Directory", error));
                     directory.apply(generation, result);
                     let local = directory.path.local().map(PathBuf::from);
                     if let Some(w) = &self.watcher {
@@ -1454,6 +1514,9 @@ impl DotDir {
                         }
                     }
                     self.unwatch_removed_columns(old_ids);
+                    if let Some((message, details)) = error {
+                        self.log_error(message, &details, cx);
+                    }
                 }
                 Message::Watch(id) => {
                     self.pending_watch.entry(id).or_insert_with(Instant::now);
@@ -1509,7 +1572,7 @@ impl DotDir {
                             } else if e.is::<UnlockCancelled>() {
                                 self.status = e.to_string();
                             } else {
-                                self.error(e, cx);
+                                self.report_error("Could Not Open File", &e, cx);
                             }
                         }
                         Ok(OpenedFile::Image(format, bytes)) => {
@@ -1551,13 +1614,14 @@ impl DotDir {
                                 self.status.clear();
                             }
                         }
-                        Ok(OpenedFile::Text(text)) => {
+                        Ok(OpenedFile::Text { text, remote_edit }) => {
                             // A second pane may have completed the same canonical path first.
                             let id = if let Some(document) =
                                 self.documents.values_mut().find(|d| d.path == path)
                             {
-                                if !readonly {
-                                    document.readonly = false;
+                                if !readonly && let Err(error) = document.enable_editing() {
+                                    self.error(error, cx);
+                                    continue;
                                 }
                                 document.id
                             } else {
@@ -1615,12 +1679,12 @@ impl DotDir {
                                         inactive_view: None,
                                         diagnostics: DiagnosticDecorations::default(),
                                         saved: bytes,
+                                        remote_edit,
                                         version: 1,
                                         saved_version: 1,
                                         readonly,
                                         line_wrap: Some(true),
                                         saving: false,
-                                        error: None,
                                         lsp: None,
                                         lsp_status: None,
                                         _subscription: subscription,
@@ -1648,15 +1712,15 @@ impl DotDir {
                     if let Some(d) = self.documents.get_mut(&id) {
                         d.saving = false;
                         match result {
-                            Ok(()) => {
+                            Ok(remote_edit) => {
                                 if let Some(buffer) = &d.lsp {
                                     buffer.save();
                                 }
                                 d.saved = text.into_bytes();
                                 d.saved_version = version;
+                                d.remote_edit = remote_edit;
                                 // An edit and its Undo can both finish while a save is pending.
                                 d.reconcile_saved_text(cx);
-                                d.error = None;
                                 self.status = format!("Saved {}", d.path.display());
                                 if d.path.archive_member().is_some()
                                     && let Some(host) = d.path.host_path().map(Path::to_path_buf)
@@ -1665,14 +1729,29 @@ impl DotDir {
                                         path.host_path() == Some(host.as_path())
                                             || path.local() == host.parent()
                                     });
+                                } else if d.remote_edit.is_some()
+                                    && let Some(parent) = d.path.parent()
+                                {
+                                    self.refresh_directories(|directory| directory == &parent);
                                 }
                             }
-                            Err(e) => {
-                                d.error = Some(e.to_string());
-                                self.status = e.to_string();
+                            Err(error) if error.is::<UnlockCancelled>() => {
+                                self.status = "Save cancelled. Your edits are still open.".into();
                             }
+                            Err(error) => self.report_error("Could Not Save File", &error, cx),
                         }
                     }
+                    self.saving_file = None;
+                    self.focus_pane(self.active, window, cx);
+                }
+                Message::HexSaved(result) => {
+                    if let Some(path) = self.saving_file.take() {
+                        match result {
+                            Ok(()) => self.status = format!("Saved {path}"),
+                            Err(error) => self.report_error("Could Not Save File", &error, cx),
+                        }
+                    }
+                    self.focus_pane(self.active, window, cx);
                 }
                 Message::Search(id, event) => {
                     if let Some(s) = self.search.as_mut().filter(|s| s.id == id) {
@@ -1689,8 +1768,15 @@ impl DotDir {
                                 s.done = true;
                             }
                             FileSearchEvent::Error { message, .. } => {
-                                s.error = Some(message);
+                                s.error = Some(message.clone());
                                 s.done = true;
+                                if matches!(self.modal, Some(Modal::Search)) {
+                                    self.log_error(
+                                        ErrorMessage::new("File Search Failed", message.clone()),
+                                        &message,
+                                        cx,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1778,7 +1864,7 @@ impl DotDir {
                         }
                     }
                 }
-                Message::ArchiveFileCreated {
+                Message::FileCreated {
                     pane,
                     directory,
                     path,
@@ -1786,12 +1872,6 @@ impl DotDir {
                     if self.pane_location(pane) == directory {
                         self.open_document_into(pane, path, false, None, window, cx);
                     }
-                }
-                Message::Simple(result) => {
-                    if let Err(e) = result {
-                        self.error(e, cx);
-                    }
-                    self.refresh_all();
                 }
             }
         }
@@ -1808,36 +1888,31 @@ impl DotDir {
         }
         let mut settled = None;
         let mut focus_conflict = false;
-        if let Some(op) = &mut self.operation
-            && !matches!(self.modal, Some(Modal::ArchivePassword { .. }))
+        if self.modal.is_none()
+            && self.error_messages.is_empty()
+            && let Some(op) = &mut self.operation
         {
             for _ in 0..100 {
-                let Ok(event) = op.events.try_recv() else {
-                    break;
+                let event = match op.events.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => OperationEvent::Settled(Err(
+                        anyhow::anyhow!("The operation stopped unexpectedly"),
+                    )),
                 };
                 changed = true;
                 match event {
-                    OperationEvent::Progress(CopyEvent::Progress(p)) => {
-                        op.fraction = if p.bytes_total > 0 {
-                            p.bytes_copied as f32 / p.bytes_total as f32
-                        } else {
-                            0.
-                        };
-                        op.progress = format!(
-                            "{} / {} files · {} / {} · {}",
-                            p.files_done,
-                            p.files_total,
-                            human_size(p.bytes_copied),
-                            human_size(p.bytes_total),
-                            p.current_file
-                        );
-                    }
+                    OperationEvent::Progress(CopyEvent::Progress(p)) => op.update_progress(p),
                     OperationEvent::Progress(CopyEvent::Error { message }) => op.progress = message,
                     OperationEvent::Conflict {
                         source,
                         destination,
                         reply,
                     } => {
+                        if op.token.is_cancelled() {
+                            let _ = reply.send(ConflictResolution::Cancel);
+                            continue;
+                        }
                         self.palette_cursor = 0;
                         self.modal = Some(Modal::Conflict {
                             source,
@@ -1845,8 +1920,12 @@ impl DotDir {
                             reply,
                         });
                         focus_conflict = true;
+                        break;
                     }
-                    OperationEvent::Settled(result) => settled = Some(result),
+                    OperationEvent::Settled(result) => {
+                        settled = Some(result);
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -1854,53 +1933,51 @@ impl DotDir {
         if focus_conflict {
             self.focus_modal(window, cx);
         }
-        if let Some(result) = settled {
-            let cancelled = self
-                .operation
-                .as_ref()
-                .is_some_and(|o| o.token.is_cancelled());
-            self.operation = None;
-            if matches!(self.modal, Some(Modal::Conflict { .. })) {
-                self.modal = None;
-                self.focus_pane(self.active, window, cx);
-            }
-            self.status = match result {
-                Ok(()) => {
-                    if cancelled {
-                        "Operation cancelled; completed changes are retained".into()
-                    } else {
-                        "Operation completed".into()
-                    }
+        if let Some(result) = settled
+            && let Some(operation) = self.operation.take()
+        {
+            let cancelled = operation.token.is_cancelled();
+            match result {
+                Ok(()) if cancelled => self.status = OPERATION_CANCELLED.into(),
+                Ok(()) => self.status = "Operation completed".into(),
+                Err(error) if operation_was_cancelled(&error, cancelled) => {
+                    self.status = OPERATION_CANCELLED.into();
                 }
-                Err(e) => e,
-            };
+                Err(error) => {
+                    self.report_error(format!("{} Failed", operation.kind.title()), &error, cx)
+                }
+            }
             self.refresh_all();
-            if self.quit_pending {
+            if self.quit_pending && self.error_messages.is_empty() {
                 self.persist();
                 self.shutting_down = true;
                 window.remove_window();
                 cx.quit();
                 return;
             }
+            self.quit_pending = false;
+            self.focus_pane(self.active, window, cx);
         }
         self.filesystems.archive_passwords.expire();
         if matches!(self.modal.as_ref(), Some(Modal::ArchivePassword { request, .. }) if request.cancel.is_cancelled())
         {
-            self.dismiss(window, cx);
+            self.close_modal(window, cx);
             changed = true;
         }
-        if self.modal.is_none() && !self.quit_pending {
+        if self.modal.is_none() && self.error_messages.is_empty() && !self.quit_pending {
             while let Some(request) = self.password_requests.pop_front() {
                 if request.cancel.is_cancelled() {
                     continue;
                 }
                 let input = cx.new(|cx| InputState::new(window, cx).masked(true));
                 self.modal = Some(Modal::ArchivePassword { request, input });
-                self.modal_error = None;
                 self.focus_modal(window, cx);
                 changed = true;
                 break;
             }
+        }
+        if self.overlay_visible() && !self.overlay_focus.contains_focused(window, cx) {
+            self.focus_modal(window, cx);
         }
         self.sync_previews(window, cx);
         if self
@@ -1937,12 +2014,12 @@ pub(crate) struct Document {
     inactive_view: Option<InactiveEditor>,
     pub(crate) diagnostics: DiagnosticDecorations,
     pub saved: Vec<u8>,
+    remote_edit: Option<RemoteDocument>,
     version: u64,
     saved_version: u64,
     pub readonly: bool,
     line_wrap: Option<bool>,
     pub saving: bool,
-    pub error: Option<String>,
     pub lsp: Option<Rc<lsp::Buffer>>,
     pub lsp_status: Option<String>,
     pub _subscription: Subscription,
@@ -1957,6 +2034,15 @@ impl Drop for Document {
 }
 
 impl Document {
+    fn enable_editing(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.path.editable() || self.remote_edit.is_some(),
+            "The S3 server did not provide a usable ETag for editing."
+        );
+        self.readonly = false;
+        Ok(())
+    }
+
     pub(crate) fn inactive_editor(&self) -> Option<&Entity<EditorState>> {
         self.inactive_view.as_ref().map(|view| &view.input)
     }
@@ -2304,10 +2390,11 @@ pub(crate) enum PromptKind {
     Transfer {
         kind: OperationKind,
         sources: Vec<Location>,
-        archive_destination: Option<Location>,
+        virtual_destination: Option<Location>,
     },
     Trash(Vec<PathBuf>),
     DeleteArchive(Vec<Location>),
+    DeleteRemote(Vec<Location>),
     CloseTab {
         pane: usize,
         id: u64,
@@ -2439,13 +2526,40 @@ pub(crate) struct SearchState {
     pub error: Option<String>,
     pub cursor: usize,
 }
+#[derive(PartialEq, Eq)]
+pub(crate) struct ErrorMessage {
+    pub title: String,
+    pub message: String,
+}
+
+impl ErrorMessage {
+    fn new(title: impl Into<String>, message: String) -> Self {
+        Self {
+            title: title.into(),
+            message,
+        }
+    }
+
+    fn from_error(title: impl Into<String>, error: &anyhow::Error) -> (Self, String) {
+        let details = format!("{error:#}");
+        let message = if details.len() <= 400 && !details.contains('\n') {
+            details.clone()
+        } else {
+            error.to_string()
+        };
+        (Self::new(title, message), details)
+    }
+}
+
 pub(crate) struct DotDir {
     pub focus: FocusHandle,
     pub terminal_focus: FocusHandle,
     pub modal_focus: FocusHandle,
+    pub overlay_focus: FocusHandle,
     pub panes: [Pane; 2],
     pub tab_strip_scrolls: [TabStripScroll; 2],
     pub panel_scrolls: HashMap<u64, ColumnScroll>,
+    pub(crate) panel_split_unsaved: bool,
     pub folder_sizes: FolderSizes,
     pub active: usize,
     pub documents: HashMap<u64, Document>,
@@ -2461,11 +2575,12 @@ pub(crate) struct DotDir {
     pub jump_input: Entity<InputState>,
     pub search_content: Entity<InputState>,
     pub modal: Option<Modal>,
-    pub modal_error: Option<String>,
+    pub error_messages: VecDeque<ErrorMessage>,
     pub palette_cursor: usize,
     pub mounted_roots: Vec<PathBuf>,
     pub panel_menu_scroll: ScrollHandle,
     pub operation: Option<Operation>,
+    pub saving_file: Option<String>,
     pub copy_options: CopyOptions,
     pub copy_multiple: bool,
     pub copy_use_filter: bool,
@@ -2595,7 +2710,6 @@ impl DotDir {
                     InputEvent::PressEnter { .. } => {}
                     InputEvent::Change => {
                         this.palette_cursor = 0;
-                        this.modal_error = None;
                         if matches!(this.modal, Some(Modal::OpenVsx)) {
                             this.schedule_market_search(cx);
                         }
@@ -2673,9 +2787,11 @@ impl DotDir {
             focus,
             terminal_focus: cx.focus_handle(),
             modal_focus: cx.focus_handle(),
+            overlay_focus: cx.focus_handle(),
             panes,
             tab_strip_scrolls: Default::default(),
             panel_scrolls: HashMap::new(),
+            panel_split_unsaved: false,
             active: settings.active_pane,
             documents: HashMap::new(),
             palette,
@@ -2688,11 +2804,12 @@ impl DotDir {
             jump_input,
             search_content,
             modal: None,
-            modal_error: None,
+            error_messages: VecDeque::new(),
             palette_cursor: 0,
             mounted_roots: vec![],
             panel_menu_scroll: ScrollHandle::new(),
             operation: None,
+            saving_file: None,
             copy_options: CopyOptions::default(),
             copy_multiple: false,
             copy_use_filter: false,
@@ -3053,6 +3170,7 @@ impl DotDir {
                 let _ = tx.send(Message::Directory(
                     id,
                     generation,
+                    interactive,
                     read_location(&path, &filesystems, hidden, sort),
                 ));
             });
@@ -3157,13 +3275,18 @@ impl DotDir {
     pub fn focus_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.end_shift_selection();
         self.active = pane;
+        if self.has_dialog() {
+            self.focus_modal(window, cx);
+            cx.notify();
+            return;
+        }
         self.focus_active_content(window, cx);
         // A newly mounted pane/editor is not in the dispatch tree until the
         // next frame. Restore focus after that tree replaces a closed dialog.
         let view = cx.weak_entity();
         window.on_next_frame(move |window, cx| {
             let _ = view.update(cx, |this, cx| {
-                if this.active != pane || this.modal.is_some() {
+                if this.active != pane || this.has_dialog() {
                     return;
                 }
                 this.focus_active_content(window, cx);
@@ -3206,7 +3329,7 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.button != MouseButton::Left || self.active == pane || self.modal.is_some() {
+        if event.button != MouseButton::Left || self.active == pane || self.has_dialog() {
             return;
         }
         let mirror = self.active_document().and_then(|id| {
@@ -3238,10 +3361,18 @@ impl DotDir {
         }
     }
     fn focus_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_visible() {
+            self.overlay_focus.focus(window, cx);
+            return;
+        }
         self.modal_focus.focus(window, cx);
         let view = cx.weak_entity();
         window.on_next_frame(move |window, cx| {
             let _ = view.update(cx, |this, cx| {
+                if this.overlay_visible() {
+                    this.overlay_focus.focus(window, cx);
+                    return;
+                }
                 if matches!(&this.modal, Some(Modal::PanelMenu(menu)) if menu.is_jump()) {
                     this.jump_input.update(cx, |s, cx| s.focus(window, cx));
                     return;
@@ -3259,12 +3390,17 @@ impl DotDir {
                 }
                 let input = match &this.modal {
                     Some(
-                        Modal::Palette | Modal::Search | Modal::OpenVsx | Modal::CreateArchive(_),
+                        Modal::Palette
+                        | Modal::Search
+                        | Modal::OpenVsx
+                        | Modal::CreateArchive(_)
+                        | Modal::QuickPick { .. },
                     ) => true,
                     Some(Modal::Prompt { kind, .. }) => !matches!(
                         kind,
                         PromptKind::Trash(_)
                             | PromptKind::DeleteArchive(_)
+                            | PromptKind::DeleteRemote(_)
                             | PromptKind::CloseTab { .. }
                             | PromptKind::Quit
                     ),
@@ -3315,7 +3451,7 @@ impl DotDir {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal.is_some() {
+        if self.has_dialog() {
             return;
         }
         let Some((source, index)) = self.tab_position(id) else {
@@ -3563,12 +3699,17 @@ impl DotDir {
         let view = doc.inactive_view.as_ref().unwrap();
         (view.input.clone(), true)
     }
+    pub(crate) fn pane_widths(&self, window: &Window) -> [f32; 2] {
+        panel_widths(
+            window.viewport_size().width.into(),
+            self.settings.panel_split,
+        )
+    }
     pub fn layout_for(&self, pane: usize, window: &Window) -> PanelLayout {
         let height: f32 = window.viewport_size().height.into();
-        let width: f32 = window.viewport_size().width.into();
         PanelLayout::new(
             self.settings.presentation(pane),
-            width / 2. - 10. - crate::ui::PANEL_MARGIN,
+            self.pane_widths(window)[pane] - 8.,
             height
                 - 218.
                 - if self.operation.is_some() { 30. } else { 0. }
@@ -3671,7 +3812,7 @@ impl DotDir {
             self.update_column_preview(pane);
             self.reveal_column(pane, true);
         }
-        if self.modal.is_none() {
+        if !self.has_dialog() {
             self.focus_pane(pane, window, cx);
         }
         self.persist();
@@ -3748,10 +3889,10 @@ impl DotDir {
             &kind,
             PromptKind::Trash(_)
                 | PromptKind::DeleteArchive(_)
+                | PromptKind::DeleteRemote(_)
                 | PromptKind::CloseTab { .. }
                 | PromptKind::Quit
         );
-        self.modal_error = None;
         self.modal = Some(Modal::Prompt {
             kind,
             title: title.into(),
@@ -3774,16 +3915,22 @@ impl DotDir {
         &self,
         kind: OperationKind,
         sources: &[Location],
-        archive_target: bool,
+        destination: Option<&Location>,
         policy: ConflictPolicy,
     ) -> bool {
         match policy {
             ConflictPolicy::Append => {
-                !matches!(kind, OperationKind::Move | OperationKind::Download)
+                !matches!(
+                    kind,
+                    OperationKind::Move | OperationKind::Download | OperationKind::Upload
+                ) && sources
+                    .iter()
+                    .all(|source| !matches!(source, Location::Provider(_)))
+                    && !matches!(destination, Some(Location::Provider(_)))
             }
             ConflictPolicy::Resume => {
                 matches!(kind, OperationKind::Copy)
-                    && !archive_target
+                    && destination.is_none_or(|path| path.local().is_some())
                     && sources.iter().all(|source| source.local().is_some())
             }
             _ => true,
@@ -3859,7 +4006,7 @@ impl DotDir {
                         });
                     }
                     Ok(_) => {}
-                    Err(error) => this.modal_error = Some(error.to_string()),
+                    Err(error) => this.error(error, cx),
                 }
                 cx.notify();
             });
@@ -3926,7 +4073,6 @@ impl DotDir {
         dialog.options = ArchiveDialog::fields(format, window, cx);
         let new_suffix = dialog.output_suffix();
         self.update_archive_suffix(old_suffix, new_suffix, window, cx);
-        self.modal_error = None;
         cx.notify();
     }
 
@@ -3947,7 +4093,6 @@ impl DotDir {
         *option = ArchiveOption::Choice(value);
         let new_suffix = dialog.output_suffix();
         self.update_archive_suffix(old_suffix, new_suffix, window, cx);
-        self.modal_error = None;
         cx.notify();
     }
 
@@ -4040,7 +4185,7 @@ impl DotDir {
                     self.filesystems.clone(),
                 ));
             }
-            Err(error) => self.modal_error = Some(error.to_string()),
+            Err(error) => self.report_error("Create Archive", &error, cx),
         }
         cx.notify();
     }
@@ -4060,7 +4205,6 @@ impl DotDir {
                 | Modal::CreateArchive(_)
         );
         self.modal = Some(modal);
-        self.modal_error = None;
         self.palette_cursor = 0;
         self.dialog_input.update(cx, |s, cx| {
             s.set_placeholder(placeholder, window, cx);
@@ -4098,11 +4242,29 @@ impl DotDir {
     fn dismiss_quick_pick(&mut self, session: u64, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(&self.modal, Some(Modal::QuickPick { action: QuickPickAction::Extension { session: owner, .. }, .. }) if *owner == session)
         {
-            self.dismiss(window, cx);
+            self.close_modal(window, cx);
         }
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.error_messages.pop_front().is_some() {
+            self.focus_pane(self.active, window, cx);
+            return;
+        }
+        if self.modal.is_none()
+            && let Some(operation) = &self.operation
+        {
+            operation.token.cancel();
+            cx.notify();
+            window.refresh();
+            return;
+        }
+        if self.modal.is_none() && self.saving_file.is_some() {
+            return;
+        }
+        self.close_modal(window, cx);
+    }
+    pub(crate) fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(
             self.modal,
             Some(Modal::RemoteConnections { busy: true, .. })
@@ -4127,15 +4289,41 @@ impl DotDir {
         if let Some(search) = &self.search {
             search.token.cancel();
         }
-        self.modal_error = None;
         self.focus_pane(self.active, window, cx);
     }
     pub fn error(&mut self, e: impl ToString, cx: &mut Context<Self>) {
-        self.status = e.to_string();
+        let message = e.to_string();
+        self.log_error(ErrorMessage::new("Error", message.clone()), &message, cx);
+    }
+    pub(crate) fn report_error(
+        &mut self,
+        title: impl Into<String>,
+        error: &anyhow::Error,
+        cx: &mut Context<Self>,
+    ) {
+        let (message, details) = ErrorMessage::from_error(title, error);
+        self.log_error(message, &details, cx);
+    }
+    fn log_error(&mut self, message: ErrorMessage, details: &str, cx: &mut Context<Self>) {
         self.extension_logs
             .source("dotdir", "DotDir")
-            .error(&self.status);
+            .error(details);
+        self.queue_error(message, cx);
+    }
+    fn queue_error(&mut self, error: ErrorMessage, cx: &mut Context<Self>) {
+        self.status.clear();
+        if !self.error_messages.contains(&error) {
+            self.dismiss_hover(cx);
+            self.error_messages.push_back(error);
+        }
         cx.notify();
+    }
+    pub(crate) fn overlay_visible(&self) -> bool {
+        !self.error_messages.is_empty()
+            || self.modal.is_none() && (self.operation.is_some() || self.saving_file.is_some())
+    }
+    pub(crate) fn has_dialog(&self) -> bool {
+        self.modal.is_some() || self.overlay_visible()
     }
     pub(crate) fn end_shift_selection(&mut self) {
         self.shift_selection = None;
@@ -4144,16 +4332,16 @@ impl DotDir {
     pub fn run(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let switches_panel_menu = matches!(self.modal, Some(Modal::PanelMenu(_)))
             && matches!(id, "left-panel-menu" | "right-panel-menu");
-        if self.modal.is_some()
-            && !switches_panel_menu
-            && !matches!(id, "escape" | "quit" | "palette")
+        if self.has_dialog()
+            && !matches!(id, "escape" | "quit")
+            && (self.overlay_visible() || !switches_panel_menu && id != "palette")
         {
             return;
         }
         if !self.command_available(id, cx) {
             return;
         }
-        if self.modal.is_none()
+        if !self.has_dialog()
             && let Some(TabContent::Media { view, .. }) = self.panes[self.active]
                 .tabs
                 .get(self.panes[self.active].active)
@@ -4363,13 +4551,27 @@ impl DotDir {
             }
             "rename" | "save" => {
                 if let Some(id) = self.active_document() {
-                    self.save(id, cx);
+                    self.save(id, window, cx);
                 } else if let Some((path, view)) = self.active_hex()
-                    && let Some(path) = path.local().map(Path::to_path_buf)
+                    && let Some(local) = path.local().map(Path::to_path_buf)
                     && !view.read(cx).readonly
                 {
                     let buffer = view.read(cx).buffer.clone();
-                    buffer.update(cx, |buffer, cx| buffer.save(path, cx));
+                    let tx = self.tx.clone();
+                    let started = buffer.update(cx, |buffer, cx| {
+                        buffer.save(
+                            local,
+                            move |result| {
+                                let _ = tx.send(Message::HexSaved(result));
+                            },
+                            cx,
+                        )
+                    });
+                    if started {
+                        self.saving_file = Some(path.display());
+                        self.focus_modal(window, cx);
+                        cx.notify();
+                    }
                 }
             }
             "definition" | "completions" => {
@@ -4515,6 +4717,14 @@ impl DotDir {
 Selected entries will be permanently removed from the archive."
                             ),
                         )
+                    } else if from_remote {
+                        (
+                            PromptKind::DeleteRemote(sources),
+                            "Delete Remote Entries",
+                            format!(
+                                "{description}\nSelected entries and their contents will be deleted from the server."
+                            ),
+                        )
                     } else {
                         (
                             PromptKind::Trash(
@@ -4533,7 +4743,17 @@ Selected entries will be permanently removed from the archive."
                         .opposite_archive_destination()
                         .cloned()
                         .filter(|_| !from_remote);
-                    let destination = archive_destination
+                    let opposite = self.pane_location(1 - self.active);
+                    let upload_destination = match &opposite {
+                        Location::Provider(path)
+                            if !from_archive && self.filesystems.can_upload_to(path) =>
+                        {
+                            Some(opposite.clone())
+                        }
+                        _ => None,
+                    };
+                    let virtual_destination = archive_destination.clone().or(upload_destination);
+                    let destination = virtual_destination
                         .as_ref()
                         .map(Location::display)
                         .or_else(|| {
@@ -4544,7 +4764,9 @@ Selected entries will be permanently removed from the archive."
                         .unwrap_or_default();
                     let kind = match id {
                         "move" => OperationKind::Move,
-                        "copy" if from_remote => OperationKind::Download,
+                        "copy" if from_remote && virtual_destination.is_none() => {
+                            OperationKind::Download
+                        }
                         _ if from_archive && archive_destination.is_none() => {
                             OperationKind::Extract
                         }
@@ -4554,7 +4776,7 @@ Selected entries will be permanently removed from the archive."
                         PromptKind::Transfer {
                             kind,
                             sources,
-                            archive_destination,
+                            virtual_destination,
                         },
                         kind.title(),
                         description,
@@ -4614,10 +4836,10 @@ Selected entries will be permanently removed from the archive."
             }
             "command-line" => self.command_line.update(cx, |s, cx| s.focus(window, cx)),
             "escape" => {
-                if self.modal.is_none() && self.dismiss_hover(cx) {
+                if !self.has_dialog() && self.dismiss_hover(cx) {
                     return;
                 }
-                if self.modal.is_some() {
+                if self.has_dialog() {
                     self.dismiss(window, cx);
                 } else if let Some(path) = self
                     .directory(self.active)
@@ -4661,7 +4883,7 @@ Selected entries will be permanently removed from the archive."
     ) {
         // Media actions now bubble to this shared dispatcher. Resolve the pane
         // owning focus, including a native video view, before validating it.
-        if self.modal.is_none() && self.panels_visible {
+        if !self.has_dialog() && self.panels_visible {
             for (pane, panel) in self.panes.iter().enumerate() {
                 if let Some(TabContent::Media { view, .. }) =
                     panel.tabs.get(panel.active).map(|tab| &tab.content)
@@ -4784,7 +5006,7 @@ Selected entries will be permanently removed from the archive."
     ) {
         if let Some(id) = target {
             let refocus = self.active == pane
-                && self.modal.is_none()
+                && !self.has_dialog()
                 && self.panes[pane]
                     .tabs
                     .get(self.panes[pane].active)
@@ -4914,7 +5136,8 @@ Selected entries will be permanently removed from the archive."
                 let _ = open::that(path);
             });
         } else {
-            let readonly = entry.path.archive_member().is_some();
+            let readonly = entry.path.archive_member().is_some()
+                || matches!(entry.path, Location::Provider(_));
             self.open_document_into(pane, entry.path, readonly, None, window, cx);
         }
     }
@@ -4928,6 +5151,10 @@ Selected entries will be permanently removed from the archive."
         cx: &mut Context<Self>,
     ) {
         self.open_file_into(pane, path, readonly, tab, None, window, cx);
+    }
+
+    fn can_edit_remote_document(&self, path: &Location) -> bool {
+        matches!(path, Location::Provider(path) if self.filesystems.can_edit_remote(path))
     }
 
     fn open_file_into(
@@ -4944,7 +5171,7 @@ Selected entries will be permanently removed from the archive."
             Location::Local(path) => Location::Local(path.canonicalize().unwrap_or(path)),
             archive => archive,
         };
-        let readonly = readonly || !path.editable();
+        let readonly = readonly || (!path.editable() && !self.can_edit_remote_document(&path));
         if let Some(mode) = byte_mode
             && tab.is_none()
             && let Some((index, view)) =
@@ -5076,7 +5303,7 @@ Selected entries will be permanently removed from the archive."
                             }
                             if this.active == pane
                                 && this.panes[pane].active == index
-                                && this.modal.is_none()
+                                && !this.has_dialog()
                             {
                                 this.focus_pane(pane, window, cx);
                             }
@@ -5125,8 +5352,9 @@ Selected entries will be permanently removed from the archive."
             && let Some(doc) = self.documents.values_mut().find(|d| d.path == path)
         {
             let id = doc.id;
-            if !readonly {
-                doc.readonly = false;
+            if !readonly && let Err(error) = doc.enable_editing() {
+                self.error(error, cx);
+                return;
             }
             self.enable_language_server(id, cx);
             if tab.is_none() {
@@ -5192,7 +5420,7 @@ Selected entries will be permanently removed from the archive."
                         &self.settings.vscode,
                     )
                 })
-        } else {
+        } else if path.archive_member().is_some() {
             self.language_servers
                 .archive_text(&path, Some(text.clone()));
             archive_typescript::extension(&path, &self.vscode_extensions, &self.settings.vscode)
@@ -5214,6 +5442,8 @@ Selected entries will be permanently removed from the archive."
                         }
                     }
                 })
+        } else {
+            None
         };
         let Some(buffer) = buffer else {
             return;
@@ -5377,29 +5607,44 @@ Selected entries will be permanently removed from the archive."
         });
     }
 
-    pub fn save(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub fn save(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.documents.get_mut(&id) {
             if d.readonly || d.saving {
                 return;
             }
-            if !d.path.editable() {
+            if !d.path.editable() && (d.remote_edit.is_none() || !d.dirty()) {
                 return;
             }
             d.saving = true;
-            d.error = None;
             let version = d.version;
-            let (path, expected, text) = (
-                d.path.clone(),
-                d.saved.clone(),
-                d.input.read(cx).value().to_string(),
-            );
+            let path = d.path.clone();
+            self.saving_file = Some(path.display());
+            let remote_edit = d.remote_edit.clone();
+            let expected = if remote_edit.is_none() {
+                d.saved.clone()
+            } else {
+                Vec::new()
+            };
+            let text = d.input.read(cx).value().to_string();
             let filesystems = self.filesystems.clone();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result = if let Some(local) = path.local() {
-                    save_document(local, &expected, &text)
-                } else {
-                    path.save_archive_member(&expected, &text, &filesystems)
+                let result = match &path {
+                    Location::Local(local) => save_document(local, &expected, &text).map(|()| None),
+                    Location::Archive { .. } => path
+                        .save_archive_member(&expected, &text, &filesystems)
+                        .map(|()| None),
+                    Location::Provider(provider) => remote_edit
+                        .context("Missing the original S3 ETag")
+                        .and_then(|document| {
+                            filesystems.save_remote_document(
+                                provider,
+                                document,
+                                text.as_bytes().to_vec(),
+                                &CancelToken::new(),
+                            )
+                        })
+                        .map(Some),
                 };
                 let _ = tx.send(Message::Saved {
                     id,
@@ -5408,6 +5653,7 @@ Selected entries will be permanently removed from the archive."
                     result,
                 });
             });
+            self.focus_modal(window, cx);
             cx.notify();
         }
     }
@@ -5508,8 +5754,17 @@ Selected entries will be permanently removed from the archive."
         }
     }
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modal, Some(Modal::Conflict { .. })) {
-            self.error("Resolve or cancel the file conflict before closing", cx);
+        if !self.error_messages.is_empty() {
+            return;
+        }
+        if matches!(
+            self.modal,
+            Some(Modal::Conflict { .. } | Modal::ArchivePassword { .. })
+        ) {
+            self.error(
+                "Respond to or cancel the pending file prompt before closing DotDir.",
+                cx,
+            );
             return;
         }
         let mut documents = self

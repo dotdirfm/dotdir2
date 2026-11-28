@@ -91,7 +91,6 @@ pub struct HexBuffer {
     edits: Arc<BTreeMap<u64, ByteEdit>>,
     revision: u64,
     pub saving: bool,
-    error: Option<String>,
 }
 
 impl HexBuffer {
@@ -102,7 +101,6 @@ impl HexBuffer {
             edits: Arc::default(),
             revision: 0,
             saving: false,
-            error: None,
         }
     }
 
@@ -112,7 +110,6 @@ impl HexBuffer {
 
     pub fn discard(&mut self, cx: &mut Context<Self>) {
         self.edits = Arc::default();
-        self.error = None;
         cx.notify();
     }
 
@@ -132,33 +129,36 @@ impl HexBuffer {
         cx.notify();
     }
 
-    pub fn save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub fn save(
+        &mut self,
+        path: PathBuf,
+        completed: impl FnOnce(anyhow::Result<()>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(stamp) = self.stamp.clone().filter(|_| self.dirty() && !self.saving) else {
-            return;
+            return false;
         };
         self.saving = true;
-        self.error = None;
         let edits = self.edits.clone();
         let job = cx
             .background_executor()
             .spawn(async move { hex_file::save(&path, &stamp, &edits) });
         cx.spawn(async move |this, cx| {
-            let result = job.await;
+            let result = job.await.map(Arc::new);
             let _ = this.update(cx, |this, cx| {
                 this.saving = false;
-                match result {
-                    Ok(stamp) => {
-                        this.stamp = Some(Arc::new(stamp));
-                        this.edits = Arc::default();
-                        this.revision += 1;
-                    }
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                if let Ok(stamp) = &result {
+                    this.stamp = Some(stamp.clone());
+                    this.edits = Arc::default();
+                    this.revision += 1;
                 }
                 cx.notify();
             });
+            completed(result.map(|_| ()));
         })
         .detach();
         cx.notify();
+        true
     }
 }
 
@@ -757,7 +757,7 @@ impl Render for HexView {
                 revision == buffer.revision && offset == first / PAGE_BYTES * PAGE_BYTES
             })
             .map(|(_, _, text)| text.as_str());
-        let error = self.offset_error.or(buffer.error.as_deref()).or(page_error);
+        let error = self.offset_error.or(page_error);
         let status = if self.len == 0 {
             "Empty file".into()
         } else if buffer.saving {

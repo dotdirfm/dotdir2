@@ -362,12 +362,30 @@ FTPS uses explicit TLS. An SMB connection opens a named share, and an S3
 connection opens a named bucket. S3 prefixes appear as folders, so each
 object and folder in a listing needs a distinct name.
 
-Use **Enter** to browse, **F3** to preview, and **F5 Download** to copy
-selected files or folders to a local directory. Downloads stream in the
-background and support cancellation. Remote connections are read-only in
-this version. The default build bundles all four providers. Custom builds
-can select `ftp-extension`, `webdav-extension`, `smb-extension`, and
-`s3-extension` individually.
+Use **Enter** to browse and **F3** to preview. **F5** copies and **F6**
+moves files or folders between the panes. The destination can be a local
+folder or a remote connection. You can also enter a remote URI in the
+destination field. **F8** asks for confirmation before deleting remote
+entries and their contents.
+
+DotDir uses native operations for same-connection S3 copies, WebDAV
+copies and moves, and FTP/FTPS and SMB renames. SMB copies use the
+server's copy operation when available. Other remote-to-remote transfers
+stream through DotDir without storing local copies. A streamed move
+removes each source file after the destination write completes. Empty
+WebDAV source folders can remain after a streamed move or a folder merge.
+
+For S3 text files up to 16 MiB, use **F4** to edit and **Save** to write
+back. Saving requires `s3:PutObject` and uses the ETag from the opened
+or last saved object. If the object has changed, your edits stay open
+and unsaved.
+
+S3 saves preserve content headers and custom metadata. Object attributes
+such as tags, ACLs, and storage class may reset on replacement.
+
+The default build bundles all four providers. Custom builds can select
+`ftp-extension`, `webdav-extension`, `smb-extension`, and `s3-extension`
+individually.
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the

@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-ftp = ["dep:opendal", "opendal/services-ftp"]
-webdav = ["dep:opendal", "opendal/services-webdav", "dep:opendal-http-transport-reqwest", "dep:rustls"]
+ftp = ["dep:opendal", "opendal/services-ftp", "dep:suppaftp", "dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
+webdav = ["dep:opendal", "opendal/services-webdav", "dep:opendal-http-transport-reqwest", "dep:rustls", "dep:reqwest"]
 s3 = ["dep:opendal", "opendal/services-s3", "dep:opendal-http-transport-reqwest", "dep:rustls"]
 smb = ["dep:smb"]
 
@@ -16,12 +16,16 @@ serde.workspace = true
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "io-util", "sync"] }
 futures = "0.3"
 opendal = { version = "0.59.5", default-features = false, features = ["executors-tokio"], optional = true }
 opendal-http-transport-reqwest = { version = "0.59.5", default-features = false, features = ["rustls-no-provider"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 smb = { version = "0.12.1", default-features = false, features = ["async", "sign", "encrypt"], optional = true }
+suppaftp = { version = "10.0.2", default-features = false, features = ["tokio-rustls-ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider"], optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

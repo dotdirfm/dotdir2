@@ -91,7 +91,7 @@ impl HoverHints {
 
 impl DotDir {
     fn hover_editor(&self, pane: usize) -> Option<(u64, u64, u64, i32, &Entity<EditorState>)> {
-        if !self.panels_visible || self.modal.is_some() {
+        if !self.panels_visible || self.has_dialog() {
             return None;
         }
         let tab = self.panes[pane].tabs.get(self.panes[pane].active)?;

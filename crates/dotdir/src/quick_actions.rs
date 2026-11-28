@@ -56,7 +56,7 @@ impl DotDir {
         let candidate = self
             .active_document()
             .and_then(|id| self.documents.get(&id))
-            .filter(|doc| self.panels_visible && self.modal.is_none() && !doc.readonly)
+            .filter(|doc| self.panels_visible && !self.has_dialog() && !doc.readonly)
             .and_then(|doc| {
                 let editor = doc.input.read(cx);
                 let buffer = doc.lsp.as_ref()?;

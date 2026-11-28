@@ -1,18 +1,21 @@
 use crate::{
+    archive::PREVIEW_LIMIT,
     archive_passwords::{ArchiveAccess, ArchiveKey, ArchivePasswords, PasswordScope},
     extension_logs::ExtensionLogs,
     vscode,
 };
 use anyhow::{Context, Result, bail, ensure};
 use dotdir_core::copy::CancelToken;
-use dotdir_remote::{Connection, Profile, Protocol, RemoteFile};
+use dotdir_remote::{
+    Connection, EditTarget, NativeTransfer, ObjectVersion, Profile, Protocol, RemoteFile, Upload,
+};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, mpsc},
@@ -123,6 +126,11 @@ impl ProviderPath {
         child
     }
 
+    pub fn checked_child(&self, name: &str) -> Result<Self> {
+        ensure!(valid_component(name), "Invalid remote filename: {name:?}");
+        Ok(self.child(name.to_owned()))
+    }
+
     pub fn resolve(&self, relative: &str) -> Result<Self> {
         let mut path = self.clone();
         for part in relative.trim_end_matches('/').split('/') {
@@ -165,6 +173,12 @@ pub struct ProviderEntry {
     pub size: u64,
     #[serde(default)]
     pub modified_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct RemoteDocument {
+    profile: Profile,
+    target: Arc<dyn EditTarget>,
 }
 
 trait Provider: Send + Sync {
@@ -327,8 +341,234 @@ impl Filesystems {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_test_remote_credentials(
+        &self,
+        profiles: &[Profile],
+        secret: &str,
+    ) -> Result<()> {
+        let cancel = CancelToken::new();
+        for profile in profiles {
+            let provider = &self.remote[profile.protocol.scheme()];
+            *provider.mounts[&profile.name]
+                .connection
+                .lock()
+                .expect("test connection lock") =
+                Some(profile.connect_with_secret(secret, &cancel)?);
+        }
+        Ok(())
+    }
+
     pub fn is_remote(&self, path: &ProviderPath) -> bool {
         self.remote.contains_key(&path.scheme)
+    }
+
+    pub fn can_edit_remote(&self, path: &ProviderPath) -> bool {
+        self.can_create_remote_file(path) && path.parts.len() > 1
+    }
+
+    pub fn can_create_remote_file(&self, directory: &ProviderPath) -> bool {
+        directory.scheme == Protocol::S3.scheme() && self.can_upload_to(directory)
+    }
+
+    pub fn can_upload_to(&self, path: &ProviderPath) -> bool {
+        self.remote
+            .get(&path.scheme)
+            .and_then(|provider| provider.mount(path).ok())
+            .is_some()
+    }
+
+    pub fn can_change_remote(&self, path: &ProviderPath) -> bool {
+        self.can_upload_to(path) && path.parts.len() > 1
+    }
+
+    fn upload_target<'a>(
+        &'a self,
+        path: &'a ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<(Connection, &'a [String])> {
+        ensure!(
+            self.can_change_remote(path),
+            "Choose an entry inside a remote connection"
+        );
+        let provider = &self.remote[&path.scheme];
+        let (mount, parts) = provider.mount(path)?;
+        Ok((provider.connection(mount, cancel)?, parts))
+    }
+
+    pub fn upload_version(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<Option<ObjectVersion>> {
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        connection.upload_version(parts, cancel)
+    }
+
+    pub fn open_remote_snapshot(
+        &self,
+        path: &ProviderPath,
+        version: &ObjectVersion,
+        cancel: &CancelToken,
+    ) -> Result<RemoteFile> {
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        connection.open_snapshot(parts, version, cancel)
+    }
+
+    pub fn upload(
+        &self,
+        path: &ProviderPath,
+        upload: Upload<'_>,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        connection.upload(parts, upload, cancel)
+    }
+
+    pub fn open_or_create_remote_file(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        ensure!(
+            self.can_edit_remote(path),
+            "Choose a file inside an S3 connection"
+        );
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        if let Some(existing) = connection.upload_version(parts, cancel)? {
+            ensure!(!existing.directory, "A folder already uses this name");
+            return Ok(());
+        }
+        connection.upload(
+            parts,
+            Upload {
+                reader: &mut Cursor::new([]),
+                size: 0,
+                previous: None,
+                progress: &mut |_| {},
+            },
+            cancel,
+        )
+    }
+
+    pub fn create_remote_dir(&self, path: &ProviderPath, cancel: &CancelToken) -> Result<()> {
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        connection.create_dir(parts, cancel)
+    }
+
+    pub fn remove_remote(
+        &self,
+        path: &ProviderPath,
+        version: &ObjectVersion,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let (connection, parts) = self.upload_target(path, cancel)?;
+        connection.remove(parts, version, cancel)
+    }
+
+    pub fn native_transfer(
+        &self,
+        from: &ProviderPath,
+        to: &ProviderPath,
+        operation: NativeTransfer<'_>,
+        cancel: &CancelToken,
+    ) -> Result<bool> {
+        if !self.same_remote_connection(from, to) {
+            return Ok(false);
+        }
+        let (connection, parts) = self.upload_target(from, cancel)?;
+        ensure!(
+            self.can_change_remote(to),
+            "Choose an entry inside a remote connection"
+        );
+        connection.transfer(parts, &to.parts[1..], operation, cancel)
+    }
+
+    pub fn same_remote_connection(&self, from: &ProviderPath, to: &ProviderPath) -> bool {
+        from.scheme == to.scheme && from.parts.first() == to.parts.first() && self.is_remote(from)
+    }
+
+    pub fn remote_within(&self, child: &ProviderPath, ancestor: &ProviderPath) -> bool {
+        if child.scheme != ancestor.scheme {
+            return false;
+        }
+        let Some(provider) = self.remote.get(&child.scheme) else {
+            return false;
+        };
+        let (Ok((child_mount, child_parts)), Ok((parent_mount, parent_parts))) =
+            (provider.mount(child), provider.mount(ancestor))
+        else {
+            return false;
+        };
+        let a = &child_mount.profile;
+        let b = &parent_mount.profile;
+        if a.endpoint.trim_end_matches('/') != b.endpoint.trim_end_matches('/')
+            || !a.share.eq_ignore_ascii_case(&b.share)
+        {
+            return false;
+        }
+        let rooted = |root: &str, parts: &[String]| {
+            root.split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .chain(parts.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        let child = rooted(&a.root, child_parts);
+        let parent = rooted(&b.root, parent_parts);
+        child.len() >= parent.len()
+            && child.iter().zip(&parent).all(|(a, b)| {
+                a == b || child_mount.profile.protocol == Protocol::Smb && a.eq_ignore_ascii_case(b)
+            })
+    }
+
+    pub fn is_webdav(&self, path: &ProviderPath) -> bool {
+        path.scheme == Protocol::WebDav.scheme() && self.is_remote(path)
+    }
+
+    pub fn open_remote_document(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<(RemoteFile, Option<RemoteDocument>)> {
+        let provider = self
+            .remote
+            .get(&path.scheme)
+            .context("Expected a remote connection")?;
+        let (mount, parts) = provider.mount(path)?;
+        let (file, target) = provider
+            .connection(mount, cancel)?
+            .open_document(parts, cancel)?;
+        Ok((
+            file,
+            target.map(|target| RemoteDocument {
+                profile: mount.profile.clone(),
+                target,
+            }),
+        ))
+    }
+
+    pub fn save_remote_document(
+        &self,
+        path: &ProviderPath,
+        mut document: RemoteDocument,
+        bytes: Vec<u8>,
+        cancel: &CancelToken,
+    ) -> Result<RemoteDocument> {
+        ensure!(
+            bytes.len() as u64 <= PREVIEW_LIMIT,
+            "The S3 object exceeds the 16 MiB text editor limit. Your edits are still open."
+        );
+        let current = self
+            .remote
+            .get(&path.scheme)
+            .and_then(|provider| provider.mount(path).ok());
+        ensure!(
+            current.is_some_and(|(mount, _)| mount.profile == document.profile),
+            "The remote connection changed. Your edits are still open."
+        );
+        document.target = document.target.save(bytes, cancel)?;
+        Ok(document)
     }
 
     pub fn open_remote(&self, path: &ProviderPath, cancel: &CancelToken) -> Result<RemoteFile> {

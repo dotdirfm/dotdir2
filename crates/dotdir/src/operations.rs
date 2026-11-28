@@ -2,7 +2,7 @@ use crate::{
     archive::Location,
     archive_ops::{self, TransferContext},
     filesystems::Filesystems,
-    remote_download,
+    remote_transfer,
 };
 use anyhow::{Context, bail};
 use dotdir_archive_api::{ArchiveFormat, CreationOptions};
@@ -20,10 +20,15 @@ use std::{
 pub enum OperationKind {
     Copy,
     Download,
+    Upload,
     Move,
     Trash,
     Extract,
     DeleteEntries,
+    DeleteRemote,
+    Rename,
+    CreateFolder,
+    CreateFile,
     CreateEntry,
     CreateArchive,
 }
@@ -32,10 +37,15 @@ impl OperationKind {
         match self {
             Self::Copy => "Copy",
             Self::Download => "Download",
+            Self::Upload => "Upload",
             Self::Move => "Move",
             Self::Trash => "Move to Trash",
             Self::Extract => "Extract Archive",
             Self::DeleteEntries => "Delete Archive Entries",
+            Self::DeleteRemote => "Delete Remote Entries",
+            Self::Rename => "Rename",
+            Self::CreateFolder => "Create Folder",
+            Self::CreateFile => "Create File",
             Self::CreateEntry => "Create Archive Entry",
             Self::CreateArchive => "Create Archive",
         }
@@ -48,7 +58,7 @@ pub enum OperationEvent {
         destination: PathBuf,
         reply: mpsc::Sender<ConflictResolution>,
     },
-    Settled(Result<(), String>),
+    Settled(anyhow::Result<()>),
 }
 pub struct Operation {
     pub id: u64,
@@ -56,9 +66,83 @@ pub struct Operation {
     pub token: CancelToken,
     pub events: mpsc::Receiver<OperationEvent>,
     pub progress: String,
-    pub fraction: f32,
+    pub fraction: Option<f32>,
 }
 impl Operation {
+    pub fn rename(id: u64, source: PathBuf, name: String) -> Self {
+        Self::spawn(id, OperationKind::Rename, move |cancel, _, _| {
+            if !cancel.is_cancelled() {
+                move_op::rename_item(&source, &name)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_folder(id: u64, path: PathBuf) -> Self {
+        Self::spawn(id, OperationKind::CreateFolder, move |cancel, _, _| {
+            if !cancel.is_cancelled() {
+                std::fs::create_dir(&path)
+                    .with_context(|| format!("Creating {}", path.display()))?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_file(
+        id: u64,
+        path: Location,
+        filesystems: Filesystems,
+        opened: impl FnOnce(Location) + Send + 'static,
+    ) -> Self {
+        Self::spawn(id, OperationKind::CreateFile, move |cancel, _, _| {
+            if !cancel.is_cancelled() {
+                match &path {
+                    Location::Local(local) => match std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(local)
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("Creating {}", local.display()));
+                        }
+                    },
+                    Location::Provider(remote) => {
+                        filesystems.open_or_create_remote_file(remote, cancel)?
+                    }
+                    Location::Archive { .. } => bail!("Use archive entry creation for this path"),
+                }
+                if !cancel.is_cancelled() {
+                    opened(path);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn update_progress(&mut self, p: copy::CopyProgress) {
+        self.fraction = progress_fraction(&p);
+        let mut parts = Vec::new();
+        if p.files_total > 0 {
+            parts.push(format!("{} / {} files", p.files_done, p.files_total));
+        }
+        if p.bytes_total > 0 {
+            parts.push(format!(
+                "{} / {}",
+                crate::model::human_size(p.bytes_copied),
+                crate::model::human_size(p.bytes_total)
+            ));
+        }
+        if !p.current_file.is_empty() {
+            parts.push(p.current_file);
+        }
+        if !parts.is_empty() {
+            self.progress = parts.join(" · ");
+        }
+    }
+
     pub fn copy(
         id: u64,
         sources: Vec<PathBuf>,
@@ -110,8 +194,8 @@ impl Operation {
                         }
                         trash::delete(path)?;
                         emit(CopyEvent::Progress(copy::CopyProgress {
-                            bytes_copied: i as u64 + 1,
-                            bytes_total: sources.len() as u64,
+                            bytes_copied: 0,
+                            bytes_total: 0,
                             files_done: i as u32 + 1,
                             files_total: sources.len() as u32,
                             current_file: path.to_string_lossy().into_owned(),
@@ -132,14 +216,22 @@ impl Operation {
         options: CopyOptions,
         filesystems: Filesystems,
     ) -> Self {
-        if matches!(kind, OperationKind::Download) {
-            return Self::spawn(id, kind, move |cancel, emit, conflict| {
-                let destination = destination
-                    .local()
-                    .context("Choose a local directory for downloads")?;
-                remote_download::download(
+        let remote_source = sources
+            .iter()
+            .any(|source| matches!(source, Location::Provider(_)));
+        if remote_source || matches!(destination, Location::Provider(_)) {
+            let moving = matches!(kind, OperationKind::Move);
+            let label = match (&destination, moving, remote_source) {
+                (_, true, _) => OperationKind::Move,
+                (Location::Local(_), false, true) => OperationKind::Download,
+                (Location::Provider(_), false, false) => OperationKind::Upload,
+                _ => OperationKind::Copy,
+            };
+            return Self::spawn(id, label, move |cancel, emit, conflict| {
+                remote_transfer::transfer(
                     sources,
-                    destination,
+                    &destination,
+                    moving,
                     options.conflict_policy,
                     &TransferContext {
                         filesystems: &filesystems,
@@ -206,6 +298,24 @@ impl Operation {
                 Location::Provider(_) => bail!("Destination filesystem is read-only"),
             }
         })
+    }
+
+    pub fn delete_remote(id: u64, sources: Vec<Location>, filesystems: Filesystems) -> Self {
+        Self::spawn(
+            id,
+            OperationKind::DeleteRemote,
+            move |cancel, emit, conflict| {
+                remote_transfer::delete(
+                    sources,
+                    &TransferContext {
+                        filesystems: &filesystems,
+                        cancel,
+                        emit,
+                        conflict,
+                    },
+                )
+            },
+        )
     }
 
     pub fn delete_entries(id: u64, sources: Vec<Location>, filesystems: Filesystems) -> Self {
@@ -313,17 +423,26 @@ impl Operation {
                 }
             };
             let result = work(&cancel, &emit, &conflict);
-            let _ = tx.send(OperationEvent::Settled(result.map_err(|e| e.to_string())));
+            let _ = tx.send(OperationEvent::Settled(result));
         });
         Self {
             id,
             kind,
             token,
             events,
-            progress: "Preparing…".into(),
-            fraction: 0.,
+            progress: "Working…".into(),
+            fraction: None,
         }
     }
+}
+
+fn progress_fraction(p: &copy::CopyProgress) -> Option<f32> {
+    let (done, total) = if p.bytes_total > 0 {
+        (p.bytes_copied, p.bytes_total)
+    } else {
+        (u64::from(p.files_done), u64::from(p.files_total))
+    };
+    (total > 0).then(|| (done as f32 / total as f32).clamp(0., 1.))
 }
 impl Drop for Operation {
     fn drop(&mut self) {
@@ -347,6 +466,26 @@ pub fn save_document(path: &std::path::Path, expected: &[u8], text: &str) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_uses_item_counts_when_byte_totals_are_unavailable() {
+        let mut progress = copy::CopyProgress {
+            bytes_copied: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            current_file: String::new(),
+        };
+        assert_eq!(progress_fraction(&progress), None);
+        progress.files_done = 1;
+        progress.files_total = 2;
+        assert_eq!(progress_fraction(&progress), Some(0.5));
+        progress.bytes_copied = 256;
+        progress.bytes_total = 1024;
+        assert_eq!(progress_fraction(&progress), Some(0.25));
+        progress.bytes_copied = 2048;
+        assert_eq!(progress_fraction(&progress), Some(1.));
+    }
+
     #[test]
     fn save_rejects_external_changes() {
         let t = tempfile::tempdir().unwrap();

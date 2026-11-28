@@ -197,7 +197,7 @@ impl DiagnosticDecorations {
                             // Pane activation may swap a mirrored editor for the editable view.
                             window.defer(cx, move |window, cx| {
                                 let _ = app.update(cx, |this, cx| {
-                                    if this.modal.is_some()
+                                    if this.has_dialog()
                                         || !matches!(this.panes[pane].tabs[this.panes[pane].active].content,
                                             TabContent::Document(id) if id == document)
                                     {

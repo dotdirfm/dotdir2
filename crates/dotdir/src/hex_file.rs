@@ -1,6 +1,6 @@
 use crate::{
     archive::{Location, PREVIEW_LIMIT, SourceStamp, VirtualFile},
-    filesystems::Filesystems,
+    filesystems::{Filesystems, RemoteDocument},
     media::image_format,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -17,7 +17,10 @@ use std::{
 pub const PAGE_BYTES: u64 = 64 * 1024;
 
 pub enum OpenedFile {
-    Text(String),
+    Text {
+        text: String,
+        remote_edit: Option<RemoteDocument>,
+    },
     Hex(HexFile),
     Image(ImageFormat, Vec<u8>),
 }
@@ -78,6 +81,7 @@ pub fn open(
     {
         return Ok(OpenedFile::Image(format, path.read_preview(filesystems)?));
     }
+    let mut remote_edit = None;
     let file = if let Some(path) = path.local() {
         let file = File::open(path)?;
         let metadata = file.metadata()?;
@@ -88,6 +92,16 @@ pub fn open(
                 file: Arc::new(Mutex::new(file)),
                 len: metadata.len(),
             },
+        }
+    } else if let Location::Provider(path) = path
+        && !force_bytes
+        && filesystems.can_edit_remote(path)
+    {
+        let (file, edit) = filesystems.open_remote_document(path, &CancelToken::new())?;
+        remote_edit = edit;
+        HexFile {
+            stamp: None,
+            source: ByteSource::Virtual(VirtualFile::streaming(file.reader, file.size)),
         }
     } else {
         HexFile {
@@ -125,7 +139,12 @@ pub fn open(
                 return Ok(OpenedFile::Hex(file));
             }
         }
-        anyhow::bail!("File exceeds the 16 MiB text editor limit. Use Edit as Hex to edit bytes.");
+        if path.local().is_some() {
+            anyhow::bail!(
+                "File exceeds the 16 MiB text editor limit. Use Edit as Hex to edit bytes."
+            );
+        }
+        anyhow::bail!("File exceeds the 16 MiB text editor limit. Use F3 to preview it.");
     }
     let bytes = if len <= PAGE_BYTES {
         sample
@@ -135,7 +154,14 @@ pub fn open(
     if is_binary(&bytes, true) {
         Ok(OpenedFile::Hex(file))
     } else {
-        Ok(OpenedFile::Text(String::from_utf8(bytes)?))
+        ensure!(
+            readonly || !matches!(path, Location::Provider(_)) || remote_edit.is_some(),
+            "The S3 server did not provide a usable ETag for editing. Use F3 to preview the object."
+        );
+        Ok(OpenedFile::Text {
+            text: String::from_utf8(bytes)?,
+            remote_edit,
+        })
     }
 }
 
@@ -254,6 +280,125 @@ pub fn save(
 mod tests {
     use super::*;
     use std::io::SeekFrom;
+
+    #[cfg(feature = "s3-extension")]
+    #[test]
+    #[ignore = "requires the local S3 fixture in DOTDIR_TEST_S3_ENDPOINT"]
+    fn saves_s3_text_and_rejects_a_stale_editor() {
+        use crate::{
+            extension_logs::ExtensionLogs,
+            filesystems::ProviderPath,
+            operations::{Operation, OperationEvent},
+        };
+
+        let endpoint = std::env::var("DOTDIR_TEST_S3_ENDPOINT").unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        let profile = dotdir_remote::Profile {
+            protocol: dotdir_remote::Protocol::S3,
+            name: "fixture".into(),
+            endpoint,
+            root: String::new(),
+            user: String::new(),
+            share: "dotdir-edit-fixture".into(),
+            region: "us-east-1".into(),
+            aws_profile: "dotdir-test".into(),
+            credential_id: None,
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let settings = scratch.path().join("settings.json");
+        let mut filesystems = Filesystems::new(ExtensionLogs::default());
+        filesystems.set_remote_profiles(std::slice::from_ref(&profile), &settings);
+        let name =
+            std::env::var("DOTDIR_TEST_S3_EDIT_NAME").unwrap_or_else(|_| "example.txt".into());
+        let address = ProviderPath::root("s3")
+            .child("fixture".into())
+            .checked_child(&name)
+            .unwrap();
+        let path = Location::Provider(address.clone());
+        let open_text = |readonly| match open(&path, readonly, false, &filesystems).unwrap() {
+            OpenedFile::Text {
+                text,
+                remote_edit: Some(edit),
+            } => (text, edit),
+            _ => panic!("Expected S3 text with an ETag"),
+        };
+        let (preview, stale) = open_text(true);
+        let (original, edit) = open_text(false);
+        assert_eq!(original, "original\n");
+        assert_eq!(preview, original);
+        let cancel = CancelToken::new();
+        let (mut pending_read, _) = filesystems.open_remote_document(&address, &cancel).unwrap();
+        let save = |edit, text: &str| {
+            filesystems.save_remote_document(&address, edit, text.as_bytes().to_vec(), &cancel)
+        };
+        let first = save(edit, "").unwrap();
+        assert!(pending_read.reader.read_to_end(&mut Vec::new()).is_err());
+        assert!(open_text(true).0.is_empty());
+        let second = save(first, "second save\n").unwrap();
+        let conflict = save(stale, "stale buffer\n").err().unwrap();
+        assert!(conflict.to_string().contains("The S3 object changed"));
+        assert!(conflict.to_string().contains("Your edits are still open"));
+        assert_eq!(open_text(true).0, "second save\n");
+
+        let root = address.parent().unwrap();
+        assert!(filesystems.can_create_remote_file(&root));
+        assert!(!filesystems.can_create_remote_file(&ProviderPath::root("s3")));
+        let created = root.child(format!(
+            "new-{}.txt",
+            scratch.path().file_name().unwrap().to_string_lossy()
+        ));
+        let created_path = Location::Provider(created.clone());
+        let create = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let operation =
+                Operation::create_file(1, created_path.clone(), filesystems.clone(), move |path| {
+                    tx.send(path).unwrap();
+                });
+            match operation
+                .events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+            {
+                OperationEvent::Settled(result) => result.unwrap(),
+                _ => panic!("Expected file creation to settle"),
+            }
+            assert_eq!(rx.try_recv().unwrap(), created_path);
+        };
+        create();
+        let OpenedFile::Text {
+            text,
+            remote_edit: Some(edit),
+        } = open(&created_path, false, false, &filesystems).unwrap()
+        else {
+            panic!("Expected the new file to open with an ETag");
+        };
+        assert!(text.is_empty());
+        let text = b"saved after Shift+F4\n";
+        filesystems
+            .save_remote_document(&created, edit, text.to_vec(), &cancel)
+            .unwrap();
+        create();
+        assert_eq!(
+            filesystems
+                .read_file(&created, text.len(), &cancel)
+                .unwrap(),
+            text
+        );
+
+        // A saved location can be redirected while an editor for it is open.
+        let mut changed = profile;
+        changed.root = "different-prefix".into();
+        filesystems.set_remote_profiles(&[changed], &settings);
+        let conflict = filesystems
+            .save_remote_document(&address, second, b"wrong target".to_vec(), &cancel)
+            .err()
+            .unwrap();
+        assert!(
+            conflict
+                .to_string()
+                .contains("The remote connection changed")
+        );
+    }
 
     #[test]
     fn reads_and_saves_small_ranges_above_four_gib() {

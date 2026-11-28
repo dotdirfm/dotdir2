@@ -17,6 +17,8 @@ use gpui_kit::{
         checkbox::Checkbox,
         input::{Editor, Input, Redo, Undo},
         menu::{DropdownMenu, PopupMenuItem},
+        progress::Progress,
+        resizable::resize_handle,
     },
     prelude::FluentBuilder,
     *,
@@ -24,13 +26,20 @@ use gpui_kit::{
 use serde_json::json;
 use std::{ffi::OsStr, time::Duration};
 
-pub(crate) const PANEL_MARGIN: f32 = 4.;
 const TAB_BORDER_WIDTH: Pixels = px(1.);
 const TAB_BAR_HEIGHT: Pixels = px(28.);
 const PANE_CORNER_RADIUS: Pixels = px(8.);
 
 struct TabDrag {
     id: u64,
+}
+
+struct PanelResize;
+
+impl Render for PanelResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 struct TabDragPreview {
@@ -484,6 +493,7 @@ impl DotDir {
     fn render_pane(
         &mut self,
         pane: usize,
+        width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -809,21 +819,19 @@ impl DotDir {
                 state.update(cx, |editor, _| editor.set_scrollbar_renderer(scrollbar));
                 let code_action_gutter = doc.path.local().is_some() && doc.lsp.is_some();
                 let breadcrumbs = self.render_breadcrumbs(pane, &doc.path, true, cx);
-                let status = doc.error.clone().unwrap_or_else(|| {
-                    if doc.saving {
-                        "Saving…".into()
-                    } else if doc.readonly {
-                        "Read only".into()
-                    } else if doc.dirty() {
-                        "Modified · F2 / ⌘S to save".into()
-                    } else {
-                        "Saved".into()
-                    }
-                });
+                let status = if doc.saving {
+                    "Saving…"
+                } else if doc.readonly {
+                    "Read only"
+                } else if doc.dirty() {
+                    "Modified · F2 / ⌘S to save"
+                } else {
+                    "Saved"
+                };
                 let status = if let Some(language) = &doc.lsp_status {
                     format!("{status} · {language}")
                 } else {
-                    status
+                    status.to_owned()
                 };
                 div()
                     .flex()
@@ -869,16 +877,14 @@ impl DotDir {
                         div()
                             .h(px(26.))
                             .flex_shrink_0()
+                            .min_w_0()
+                            .truncate()
                             .px(px(12.))
                             .py(px(4.))
                             .border_t_1()
                             .border_color(p.border)
                             .text_size(px(12.))
-                            .text_color(if doc.error.is_some() {
-                                p.error
-                            } else {
-                                p.muted
-                            })
+                            .text_color(p.muted)
                             .child(status),
                     )
                     .into_any_element()
@@ -990,7 +996,8 @@ impl DotDir {
             .relative()
             .flex()
             .flex_col()
-            .flex_1()
+            .flex_none()
+            .w(px(width))
             .min_w_0()
             .h_full()
             .child(
@@ -1057,6 +1064,48 @@ impl DotDir {
                     .child(content),
             )
             .into_any_element()
+    }
+
+    fn render_panel_splitter(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_none()
+            .justify_center()
+            .w(px(PANEL_SPLITTER_WIDTH))
+            .h_full()
+            .child(
+                div().relative().w(px(1.)).h_full().child(
+                    resize_handle("panel-splitter", Axis::Horizontal)
+                        .role(Role::Splitter)
+                        .aria_label("Resize file panels")
+                        .on_drag(PanelResize, |_, _, _, cx| cx.new(|_| PanelResize))
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<PanelResize>, window, cx| {
+                                if this.has_dialog()
+                                    || event.event.pressed_button != Some(MouseButton::Left)
+                                {
+                                    return;
+                                }
+                                let width = window.viewport_size().width.into();
+                                if let Some(split) =
+                                    panel_split_at(width, event.event.position.x.into())
+                                    && split != this.settings.panel_split
+                                {
+                                    this.settings.panel_split = split;
+                                    this.panel_split_unsaved = true;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                            if event.click_count() == 2 && !this.has_dialog() {
+                                this.settings.panel_split = 0.5;
+                                this.persist();
+                                cx.notify();
+                            }
+                        })),
+                ),
+            )
     }
 
     fn render_extension_node(
@@ -1273,15 +1322,24 @@ impl DotDir {
         &self,
         kind: OperationKind,
         sources: &[Location],
-        archive_destination: Option<&Location>,
+        virtual_destination: Option<&Location>,
         cx: &Context<Self>,
     ) -> Div {
         let p = self.palette;
         let value = self.dialog_input.read(cx).value();
-        let archive_target = !self.copy_multiple
-            && archive_destination.is_some_and(|path| path.display() == value.trim());
+        let provider = (!self.copy_multiple)
+            .then(|| {
+                crate::filesystems::ProviderPath::parse(value.trim())
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .map(Location::Provider);
+        let virtual_target = virtual_destination
+            .filter(|path| !self.copy_multiple && path.display() == value.trim())
+            .or(provider.as_ref());
         let local_copy = matches!(kind, OperationKind::Copy)
-            && !archive_target
+            && virtual_target.is_none()
             && sources.iter().all(|source| source.local().is_some());
         let options = &self.copy_options;
         let choices = [
@@ -1294,7 +1352,7 @@ impl DotDir {
             ("Only newer files", ConflictPolicy::OnlyNewer),
         ]
         .into_iter()
-        .filter(|(_, policy)| self.transfer_supports_policy(kind, sources, archive_target, *policy))
+        .filter(|(_, policy)| self.transfer_supports_policy(kind, sources, virtual_target, *policy))
         .collect();
         let mut form = div().flex().flex_col().gap(px(10.))
             .child(div().flex().flex_col().gap(px(4.))
@@ -1432,7 +1490,6 @@ impl DotDir {
                                 .checked(self.copy_use_filter)
                                 .on_change(cx.listener(|this, checked: &bool, _, cx| {
                                     this.copy_use_filter = *checked;
-                                    this.modal_error = None;
                                     cx.notify();
                                 })),
                         ),
@@ -1769,19 +1826,20 @@ impl DotDir {
                 if let PromptKind::Transfer {
                     kind,
                     sources,
-                    archive_destination,
+                    virtual_destination,
                 } = kind
                 {
                     content = content.child(self.render_transfer_options(
                         *kind,
                         sources,
-                        archive_destination.as_ref(),
+                        virtual_destination.as_ref(),
                         cx,
                     ));
                 } else if !matches!(
                     kind,
                     PromptKind::Trash(_)
                         | PromptKind::DeleteArchive(_)
+                        | PromptKind::DeleteRemote(_)
                         | PromptKind::CloseTab { .. }
                         | PromptKind::Quit
                 ) {
@@ -1789,7 +1847,7 @@ impl DotDir {
                 }
                 let confirm = match kind {
                     PromptKind::Trash(_) => "Move to Trash",
-                    PromptKind::DeleteArchive(_) => "Delete Entries",
+                    PromptKind::DeleteArchive(_) | PromptKind::DeleteRemote(_) => "Delete Entries",
                     PromptKind::CloseTab { .. } => "Discard Changes",
                     PromptKind::Quit => "Close Without Saving",
                     PromptKind::Transfer { kind, .. } => kind.title(),
@@ -2288,23 +2346,128 @@ impl DotDir {
                 content = content.child(buttons);
             }
         }
-        if let Some(error) = &self.modal_error {
-            content = content.child(div().text_color(p.error).child(error.clone()));
-        }
-        let height: f32 = window.viewport_size().height.into();
-        div()
-            .id("modal-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .justify_center()
+        dialog_backdrop(content)
             .items_start()
-            .pt(px((height * 0.12).min(80.)))
-            .bg(gpui_kit::rgba(0x00000070))
-            .child(content)
+            .pt(px(
+                (f32::from(window.viewport_size().height) * 0.12).min(80.)
+            ))
             .into_any_element()
     }
+
+    fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let p = self.palette;
+        let bar = |id: ElementId, title: &'static str, fraction: Option<f32>| {
+            Progress::new(id)
+                .color(p.accent)
+                .loading(fraction.is_none())
+                .value(fraction.unwrap_or_default() * 100.)
+                .accessibility_label(title)
+        };
+        let (title, role, body, button) = if let Some(error) = self.error_messages.front() {
+            (
+                error.title.as_str(),
+                Role::AlertDialog,
+                div().child(error.message.clone()),
+                Some(
+                    self.primary_button("dismiss-error", "OK", Self::dismiss, cx)
+                        .into_any_element(),
+                ),
+            )
+        } else if let Some(operation) = &self.operation {
+            let title = operation.kind.title();
+            let fraction = operation.fraction;
+            let cancelled = operation.token.is_cancelled();
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(bar(
+                    ("file-operation-progress", operation.id as usize).into(),
+                    title,
+                    fraction,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .text_color(p.muted)
+                        .child(text(operation.progress.clone()).flex_1().min_w_0())
+                        .when_some(fraction, |line, fraction| {
+                            line.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .child(format!("{:.0}%", fraction * 100.)),
+                            )
+                        }),
+                );
+            let button = if cancelled {
+                div()
+                    .text_color(p.muted)
+                    .child("Cancelling…")
+                    .into_any_element()
+            } else {
+                self.button("cancel-operation", "Cancel", Self::dismiss, cx)
+                    .into_any_element()
+            };
+            (title, Role::Dialog, body, Some(button))
+        } else if let Some(path) = &self.saving_file {
+            (
+                "Saving File",
+                Role::Dialog,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(bar("save-progress".into(), "Saving File", None))
+                    .child(div().text_color(p.muted).child(path.clone())),
+                None,
+            )
+        } else {
+            return div().into_any_element();
+        };
+        let content = div()
+            .id("blocking-dialog")
+            .track_focus(&self.overlay_focus)
+            .key_context("Modal")
+            .role(role)
+            .aria_label(title.to_owned())
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .w(px(480.))
+            .max_w(relative(0.9))
+            .max_h(relative(0.86))
+            .overflow_y_scroll()
+            .p(px(20.))
+            .rounded(px(7.))
+            .bg(p.bg)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title.to_owned()),
+            )
+            .child(body)
+            .when_some(button, |content, button| {
+                content.child(div().flex().justify_end().child(button))
+            });
+        dialog_backdrop(content).items_center().into_any_element()
+    }
+}
+
+fn dialog_backdrop(content: impl IntoElement) -> Stateful<Div> {
+    div()
+        .id("modal-backdrop")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .justify_center()
+        .bg(gpui_kit::rgba(0x00000070))
+        .child(content)
 }
 
 impl Render for DotDir {
@@ -2342,6 +2505,17 @@ impl Render for DotDir {
                 }),
             )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.overlay_visible() {
+                    let key = event.keystroke.key.as_str();
+                    if !event.is_held
+                        && (key == "escape" || key == "enter" && !this.error_messages.is_empty())
+                    {
+                        this.dismiss(window, cx);
+                    }
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 if this.handle_panel_menu_key(event, window, cx) {
                     cx.stop_propagation();
                     window.prevent_default();
@@ -2467,57 +2641,20 @@ impl Render for DotDir {
                 }
             }));
         if self.panels_visible {
+            let [left, right] = self.pane_widths(window);
             let panes = div()
                 .flex()
                 .flex_1()
                 .min_h_0()
-                .gap(px(4.))
                 .px(px(PANEL_MARGIN))
                 .bg(p.command_bg)
-                .child(self.render_pane(0, window, cx))
-                .child(self.render_pane(1, window, cx));
+                .child(self.render_pane(0, left, window, cx))
+                .child(self.render_panel_splitter(cx))
+                .child(self.render_pane(1, right, window, cx));
             root = root.child(panes);
         }
         if self.terminal_visible {
             root = root.child(self.render_terminal(window, cx));
-        }
-        if let Some(op) = &self.operation {
-            root = root.child(
-                div()
-                    .id(("operation-progress", op.id as usize))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .h(px(30.))
-                    .flex_shrink_0()
-                    .bg(p.input)
-                    .child(
-                        text(format!(
-                            "{} · {:.0}% · {}",
-                            op.kind.title(),
-                            op.fraction * 100.,
-                            op.progress
-                        ))
-                        .flex_1()
-                        .text_size(px(12.)),
-                    )
-                    .child(self.button(
-                        "cancel-operation",
-                        if op.token.is_cancelled() {
-                            "Cancelling…"
-                        } else {
-                            "Cancel"
-                        },
-                        |this, _, cx| {
-                            if let Some(op) = &this.operation {
-                                op.token.cancel();
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    )),
-            );
         }
         let location = self.pane_location(self.active);
         let path = if matches!(location, Location::Provider(_)) {
@@ -2614,6 +2751,7 @@ impl Render for DotDir {
             .child(
                 text(self.status.clone())
                     .flex_1()
+                    .min_w_0()
                     .text_size(px(11.))
                     .text_color(p.muted),
             )
@@ -2686,7 +2824,7 @@ impl Render for DotDir {
                         })
                 })
                 .unwrap_or_default();
-            let enabled = self.modal.is_none()
+            let enabled = !self.has_dialog()
                 && id
                     .as_deref()
                     .is_some_and(|id| self.command_available(id, cx));
@@ -2738,10 +2876,13 @@ impl Render for DotDir {
             );
         }
         root = root.child(keybar);
-        if self.modal.is_some() {
+        if self.overlay_visible() {
+            root = root.child(self.render_overlay(cx));
+        } else if self.modal.is_some() {
             root = root.child(self.render_modal(window, cx));
+        } else {
+            root = root.children(self.render_hover(window, cx));
         }
-        root = root.children(self.render_hover(window, cx));
         root = root.children(self.render_presentation_keystroke(window));
         root
     }

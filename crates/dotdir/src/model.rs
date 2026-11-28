@@ -9,6 +9,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) const PANEL_MARGIN: f32 = 4.;
+pub(crate) const PANEL_SPLITTER_WIDTH: f32 = 9.;
+const MIN_PANEL_WIDTH: f32 = 260.;
+
+fn panel_space(viewport_width: f32) -> f32 {
+    (viewport_width - 2. * PANEL_MARGIN - PANEL_SPLITTER_WIDTH).max(0.)
+}
+
+pub(crate) fn panel_widths(viewport_width: f32, split: f32) -> [f32; 2] {
+    let width = panel_space(viewport_width);
+    let min = MIN_PANEL_WIDTH.min(width / 2.);
+    let left = (width * split).clamp(min, width - min);
+    [left, width - left]
+}
+
+pub(crate) fn panel_split_at(viewport_width: f32, pointer_x: f32) -> Option<f32> {
+    let width = panel_space(viewport_width);
+    if width <= 2. * MIN_PANEL_WIDTH {
+        return None;
+    }
+    let left = pointer_x - PANEL_MARGIN - PANEL_SPLITTER_WIDTH / 2.;
+    let min = MIN_PANEL_WIDTH / width;
+    Some((left / width).clamp(min, 1. - min))
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
@@ -628,6 +653,7 @@ pub struct Settings {
     pub left_active: usize,
     pub right_active: usize,
     pub active_pane: usize,
+    pub panel_split: f32,
     pub terminal_height: f32,
     pub archive_password_cache_minutes: u64,
     #[serde(
@@ -656,6 +682,7 @@ impl Default for Settings {
             left_active: 0,
             right_active: 0,
             active_pane: 0,
+            panel_split: 0.5,
             terminal_height: 240.,
             archive_password_cache_minutes: crate::archive_passwords::DEFAULT_MINUTES,
             path_aliases: BTreeMap::new(),
@@ -680,6 +707,7 @@ impl Settings {
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .unwrap_or_default();
         s.font_size = s.font_size.clamp(10., 24.);
+        s.panel_split = s.panel_split.clamp(0., 1.);
         s.terminal_height = s.terminal_height.clamp(100., 700.);
         s.active_pane = s.active_pane.min(1);
         // Migrate the previous global brief/list toggle without losing its preference.
@@ -726,6 +754,37 @@ pub fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_split_tracks_the_pointer_and_preserves_minimum_widths() {
+        let viewport = 1200.;
+        let pointer = 740.;
+        let split = panel_split_at(viewport, pointer).unwrap();
+        let [left, right] = panel_widths(viewport, split);
+        assert!((left + PANEL_MARGIN + PANEL_SPLITTER_WIDTH / 2. - pointer).abs() < 0.01);
+        assert_eq!(left + right, panel_space(viewport));
+        assert_eq!(panel_widths(viewport, 0.)[0], MIN_PANEL_WIDTH);
+        assert_eq!(panel_widths(viewport, 1.)[1], MIN_PANEL_WIDTH);
+        assert_eq!(
+            panel_split_at(viewport, -100.),
+            Some(MIN_PANEL_WIDTH / panel_space(viewport))
+        );
+        assert_eq!(panel_widths(400., split), [panel_space(400.) / 2.; 2]);
+        assert!(panel_split_at(400., pointer).is_none());
+    }
+
+    #[test]
+    fn older_settings_default_to_an_even_split_and_new_settings_restore_the_split() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"ayu"}"#).unwrap();
+        let mut settings = Settings::load(&path);
+        assert_eq!(settings.panel_split, 0.5);
+        settings.panel_split = 0.625;
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).panel_split, 0.625);
+    }
+
     fn numbered_directory(count: usize) -> Directory {
         let mut directory = Directory::new(1, Path::new("/fixture").into());
         directory.entries = Arc::new(

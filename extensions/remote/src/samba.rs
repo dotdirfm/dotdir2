@@ -1,10 +1,15 @@
-use crate::{Entry, Profile, RUNTIME, RemoteFile, component, run};
-use anyhow::{Context, Result};
+use crate::Backend as _;
+use crate::{
+    Entry, NativeTransfer, ObjectVersion, Profile, RUNTIME, RemoteFile, Upload, component, run,
+};
+use anyhow::{Context, Result, ensure};
 use dotdir_core::copy::CancelToken;
 use futures::{StreamExt, pin_mut};
 use smb::{
-    Client, ClientConfig, ConnectionConfig, Directory, File, FileAccessMask, FileCreateArgs,
-    FileDirectoryInformation, GetLen, ReadAt, Resource, UncPath,
+    Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, Directory, File,
+    FileAccessMask, FileAttributes, FileCreateArgs, FileDirectoryInformation,
+    FileDispositionInformation, FileRenameInformation, GetLen, ReadAt, Resource, ResourceHandle,
+    UncPath, WriteAt,
 };
 use std::{
     io::{self, Read, Seek, SeekFrom},
@@ -51,6 +56,83 @@ impl Backend {
             .collect::<Vec<_>>()
             .join("\\");
         self.share.clone().with_path(&relative.replace('/', "\\"))
+    }
+
+    fn stage(&self, path: &str, readable: bool, cancel: &CancelToken) -> Result<File> {
+        let staging = crate::staging_path(path);
+        run(cancel, async {
+            let args = FileCreateArgs {
+                disposition: CreateDisposition::Create,
+                attributes: FileAttributes::new(),
+                options: CreateOptions::new().with_non_directory_file(true),
+                desired_access: FileAccessMask::new()
+                    .with_generic_read(readable)
+                    .with_file_read_data(readable)
+                    .with_generic_write(true)
+                    .with_file_write_data(true)
+                    .with_delete(true),
+            };
+            let resource = self
+                .session
+                .client()
+                .create_file(&self.path(&staging), &args)
+                .await?;
+            let Resource::File(file) = resource else {
+                anyhow::bail!("Expected an SMB staging file");
+            };
+            Ok(file)
+        })
+    }
+
+    fn finish_stage(
+        &self,
+        file: File,
+        path: &str,
+        previous: Option<&ObjectVersion>,
+        cancel: &CancelToken,
+        staged: Result<bool>,
+    ) -> Result<bool> {
+        let published = staged.and_then(|ready| {
+            if !ready {
+                return Ok(false);
+            }
+            ensure!(
+                self.upload_version(path, cancel)?.as_ref() == previous,
+                "SMB destination changed before publishing"
+            );
+            run(cancel, async {
+                file.flush().await?;
+                self.rename(&file, path, previous.is_some()).await?;
+                Ok(true)
+            })
+        });
+        let close = run(&CancelToken::new(), async move {
+            if !matches!(published.as_ref(), Ok(true)) {
+                let _ = file.set_info(FileDispositionInformation::default()).await;
+            }
+            file.close().await?;
+            published
+        });
+        close
+    }
+
+    async fn rename(&self, file: &ResourceHandle, to: &str, replace: bool) -> Result<()> {
+        let path = self.path(to);
+        file.set_info(FileRenameInformation {
+            replace_if_exists: replace.into(),
+            root_directory: 0,
+            file_name: path.path().context("Expected SMB destination")?.into(),
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+fn handle(resource: &Resource) -> Result<&ResourceHandle> {
+    match resource {
+        Resource::File(file) => Ok(file),
+        Resource::Directory(directory) => Ok(directory),
+        Resource::Pipe(_) => anyhow::bail!("Expected an SMB file or directory"),
     }
 }
 
@@ -143,6 +225,153 @@ impl crate::Backend for Backend {
                 }),
             })
         })
+    }
+
+    fn upload_version(&self, path: &str, cancel: &CancelToken) -> Result<Option<ObjectVersion>> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        Ok(self
+            .entries(parent, cancel)?
+            .into_iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            .map(|entry| ObjectVersion {
+                etag: String::new(),
+                size: entry.size,
+                modified_ms: entry.modified_ms,
+                directory: entry.directory,
+            }))
+    }
+
+    fn create_dir(&self, path: &str, cancel: &CancelToken) -> Result<()> {
+        run(cancel, async {
+            let args = FileCreateArgs {
+                disposition: CreateDisposition::OpenIf,
+                attributes: FileAttributes::new().with_directory(true),
+                options: CreateOptions::new().with_directory_file(true),
+                desired_access: FileAccessMask::new().with_generic_read(true),
+            };
+            let resource = self
+                .session
+                .client()
+                .create_file(&self.path(path), &args)
+                .await?;
+            handle(&resource)?.close().await?;
+            Ok(())
+        })
+    }
+
+    fn remove(&self, path: &str, expected: &ObjectVersion, cancel: &CancelToken) -> Result<()> {
+        ensure!(
+            self.upload_version(path, cancel)?
+                .as_ref()
+                .is_some_and(|actual| actual == expected || expected.directory && actual.directory),
+            "SMB source changed before removal"
+        );
+        run(cancel, async {
+            let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
+            let resource = self
+                .session
+                .client()
+                .create_file(&self.path(path), &args)
+                .await?;
+            let handle = handle(&resource)?;
+            handle
+                .set_info(FileDispositionInformation::default())
+                .await?;
+            handle.close().await?;
+            Ok(())
+        })
+    }
+
+    fn transfer(
+        &self,
+        from: &str,
+        to: &str,
+        op: NativeTransfer<'_>,
+        cancel: &CancelToken,
+    ) -> Result<bool> {
+        if op.source.directory {
+            return Ok(false);
+        }
+        if !op.moving {
+            // The client sends one CopyChunk request, so larger files use the streaming path.
+            if op.source.size > 16 * 1024 * 1024 {
+                return Ok(false);
+            }
+            ensure!(
+                self.upload_version(from, cancel)?.as_ref() == Some(op.source),
+                "SMB source changed before copying"
+            );
+            let file = self.stage(to, true, cancel)?;
+            let copied = run(cancel, async {
+                let args = FileCreateArgs::make_open_existing(
+                    FileAccessMask::new()
+                        .with_generic_read(true)
+                        .with_file_read_data(true),
+                );
+                let resource = self
+                    .session
+                    .client()
+                    .create_file(&self.path(from), &args)
+                    .await?;
+                let Resource::File(source) = resource else {
+                    anyhow::bail!("Expected an SMB source file");
+                };
+                let result = file.srv_copy(&source).await;
+                source.close().await?;
+                match result {
+                    Ok(()) => Ok(true),
+                    Err(smb::Error::UnexpectedMessageStatus(status))
+                        if matches!(
+                            status,
+                            smb::Status::U32_NOT_SUPPORTED
+                                | smb::Status::U32_INVALID_PARAMETER
+                                | smb::Status::U32_INVALID_DEVICE_REQUEST0
+                                | smb::Status::U32_ACCESS_DENIED
+                        ) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            });
+            return self.finish_stage(file, to, op.previous, cancel, copied);
+        }
+        ensure!(
+            self.upload_version(from, cancel)?.as_ref() == Some(op.source),
+            "SMB source changed before moving"
+        );
+        ensure!(
+            self.upload_version(to, cancel)?.as_ref() == op.previous,
+            "SMB destination changed before moving"
+        );
+        run(cancel, async {
+            let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
+            let resource = self
+                .session
+                .client()
+                .create_file(&self.path(from), &args)
+                .await?;
+            let handle = handle(&resource)?;
+            self.rename(handle, to, op.previous.is_some()).await?;
+            handle.close().await?;
+            Ok(true)
+        })
+    }
+
+    fn upload(&self, path: &str, mut upload: Upload<'_>, cancel: &CancelToken) -> Result<()> {
+        let file = self.stage(path, false, cancel)?;
+        let mut offset = 0;
+        let result = crate::pump(&mut upload, cancel, |mut bytes| {
+            while !bytes.is_empty() {
+                let count = run(cancel, async { Ok(file.write_at(bytes, offset).await?) })?;
+                ensure!(count > 0, "SMB upload made no progress");
+                offset += count as u64;
+                bytes = &bytes[count..];
+            }
+            Ok(())
+        });
+        self.finish_stage(file, path, upload.previous, cancel, result.map(|()| true))
+            .map(|_| ())
     }
 }
 

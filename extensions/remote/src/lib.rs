@@ -12,8 +12,12 @@ use zeroize::Zeroizing;
 
 #[cfg(any(feature = "ftp", feature = "webdav", feature = "s3"))]
 mod dal;
+#[cfg(feature = "ftp")]
+mod ftp;
 #[cfg(feature = "smb")]
 mod samba;
+#[cfg(feature = "webdav")]
+mod webdav;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -207,9 +211,9 @@ impl Profile {
         let _ = (secret, cancel);
         match self.protocol {
             #[cfg(feature = "ftp")]
-            Protocol::Ftp => Ok(Connection(Arc::new(dal::Backend::ftp(self, secret)?))),
+            Protocol::Ftp => Ok(Connection(Arc::new(ftp::Backend::new(self, secret)?))),
             #[cfg(feature = "webdav")]
-            Protocol::WebDav => Ok(Connection(Arc::new(dal::Backend::webdav(self, secret)?))),
+            Protocol::WebDav => Ok(Connection(Arc::new(webdav::Backend::new(self, secret)?))),
             #[cfg(feature = "s3")]
             Protocol::S3 => Ok(Connection(Arc::new(dal::Backend::s3(self, secret)?))),
             #[cfg(feature = "smb")]
@@ -238,9 +242,60 @@ pub struct RemoteFile {
     pub reader: Box<dyn ReadSeek>,
 }
 
+pub trait EditTarget: Send + Sync {
+    fn save(&self, bytes: Vec<u8>, cancel: &CancelToken) -> Result<Arc<dyn EditTarget>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectVersion {
+    pub etag: String,
+    pub modified_ms: u64,
+    pub size: u64,
+    pub directory: bool,
+}
+
+pub struct NativeTransfer<'a> {
+    pub source: &'a ObjectVersion,
+    pub previous: Option<&'a ObjectVersion>,
+    pub moving: bool,
+}
+
+pub struct Upload<'a> {
+    pub reader: &'a mut dyn ReadSeek,
+    pub size: u64,
+    pub previous: Option<&'a ObjectVersion>,
+    pub progress: &'a mut dyn FnMut(u64),
+}
+
 trait Backend: Send + Sync {
     fn entries(&self, path: &str, cancel: &CancelToken) -> Result<Vec<Entry>>;
     fn open(&self, path: &str, cancel: &CancelToken) -> Result<RemoteFile>;
+    fn open_snapshot(
+        &self,
+        path: &str,
+        _: &ObjectVersion,
+        cancel: &CancelToken,
+    ) -> Result<RemoteFile> {
+        self.open(path, cancel)
+    }
+    fn open_document(
+        &self,
+        path: &str,
+        cancel: &CancelToken,
+    ) -> Result<(RemoteFile, Option<Arc<dyn EditTarget>>)> {
+        Ok((self.open(path, cancel)?, None))
+    }
+    fn upload_version(&self, _: &str, _: &CancelToken) -> Result<Option<ObjectVersion>> {
+        bail!("This filesystem does not support uploads")
+    }
+    fn upload(&self, _: &str, _: Upload<'_>, _: &CancelToken) -> Result<()> {
+        bail!("This filesystem does not support uploads")
+    }
+    fn create_dir(&self, path: &str, cancel: &CancelToken) -> Result<()>;
+    fn remove(&self, path: &str, expected: &ObjectVersion, cancel: &CancelToken) -> Result<()>;
+    fn transfer(&self, _: &str, _: &str, _: NativeTransfer<'_>, _: &CancelToken) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Clone)]
@@ -262,6 +317,97 @@ impl Connection {
         );
         self.0.open(&path.join("/"), cancel)
     }
+
+    pub fn open_snapshot(
+        &self,
+        path: &[String],
+        version: &ObjectVersion,
+        cancel: &CancelToken,
+    ) -> Result<RemoteFile> {
+        self.0.open_snapshot(&file_key(path)?, version, cancel)
+    }
+
+    pub fn open_document(
+        &self,
+        path: &[String],
+        cancel: &CancelToken,
+    ) -> Result<(RemoteFile, Option<Arc<dyn EditTarget>>)> {
+        ensure!(
+            !path.is_empty() && path.iter().all(|part| component(part)),
+            "Invalid remote file"
+        );
+        self.0.open_document(&path.join("/"), cancel)
+    }
+
+    pub fn upload_version(
+        &self,
+        path: &[String],
+        cancel: &CancelToken,
+    ) -> Result<Option<ObjectVersion>> {
+        self.0.upload_version(&file_key(path)?, cancel)
+    }
+
+    pub fn upload(&self, path: &[String], upload: Upload<'_>, cancel: &CancelToken) -> Result<()> {
+        self.0.upload(&file_key(path)?, upload, cancel)
+    }
+
+    pub fn create_dir(&self, path: &[String], cancel: &CancelToken) -> Result<()> {
+        self.0.create_dir(&file_key(path)?, cancel)
+    }
+
+    pub fn remove(
+        &self,
+        path: &[String],
+        expected: &ObjectVersion,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        self.0.remove(&file_key(path)?, expected, cancel)
+    }
+
+    pub fn transfer(
+        &self,
+        from: &[String],
+        to: &[String],
+        operation: NativeTransfer<'_>,
+        cancel: &CancelToken,
+    ) -> Result<bool> {
+        self.0
+            .transfer(&file_key(from)?, &file_key(to)?, operation, cancel)
+    }
+}
+
+fn file_key(path: &[String]) -> Result<String> {
+    ensure!(
+        !path.is_empty() && path.iter().all(|part| component(part)),
+        "Invalid remote file"
+    );
+    Ok(path.join("/"))
+}
+
+#[cfg(any(feature = "ftp", feature = "smb", feature = "webdav"))]
+fn staging_path(path: &str) -> String {
+    let name = format!(".dotdir-upload-{}", uuid::Uuid::new_v4());
+    path.rsplit_once('/')
+        .map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
+}
+
+#[cfg(any(feature = "ftp", feature = "smb", feature = "webdav"))]
+fn pump(
+    upload: &mut Upload<'_>,
+    cancel: &CancelToken,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut bytes = vec![0; 256 * 1024];
+    let mut offset = 0;
+    while offset < upload.size {
+        ensure!(!cancel.is_cancelled(), "Remote operation cancelled");
+        let count = (upload.size - offset).min(bytes.len() as u64) as usize;
+        upload.reader.read_exact(&mut bytes[..count])?;
+        write(&bytes[..count])?;
+        offset += count as u64;
+        (upload.progress)(offset);
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "ftp", feature = "webdav", feature = "s3", feature = "smb"))]

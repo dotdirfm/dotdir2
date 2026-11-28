@@ -31,7 +31,7 @@ mod panel_menu;
 mod panels;
 mod quick_actions;
 mod remote_connections;
-mod remote_download;
+mod remote_transfer;
 mod selection_inspector;
 mod syntax;
 mod terminal;

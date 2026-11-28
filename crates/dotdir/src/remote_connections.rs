@@ -164,7 +164,7 @@ impl DotDir {
     }
 
     fn connect_remote(&mut self, profile: &Profile, window: &mut Window, cx: &mut Context<Self>) {
-        self.dismiss(window, cx);
+        self.close_modal(window, cx);
         self.open_panel_location(self.active, location(profile), false, window, cx);
     }
 
@@ -197,14 +197,12 @@ impl DotDir {
         }) {
             Ok(profile) => profile,
             Err(error) => {
-                self.modal_error = Some(error.to_string());
-                cx.notify();
+                self.report_error("Remote Connection", &error, cx);
                 return;
             }
         };
 
         *busy = true;
-        self.modal_error = None;
         let namespace = credential_namespace(&self.settings_path);
         cx.spawn_in(window, async move |this, cx| {
             let (profile, result) = cx
@@ -249,8 +247,7 @@ impl DotDir {
                         if saved_credential {
                             this.remove_remote_credential(profile, cx);
                         }
-                        this.modal_error = Some(format!("{error:#}"));
-                        cx.notify();
+                        this.report_error("Could Not Save Connection", &error, cx);
                     }
                 }
             });
@@ -276,8 +273,7 @@ impl DotDir {
             .remote_connections
             .retain(|saved| saved.protocol != profile.protocol || saved.name != profile.name);
         if let Err(error) = settings.save(&self.settings_path) {
-            self.modal_error = Some(format!("{error:#}"));
-            cx.notify();
+            self.report_error("Could Not Remove Connection", &error, cx);
             return;
         }
         self.settings = settings;
@@ -296,8 +292,7 @@ impl DotDir {
                     .await;
                 if let Err(error) = result {
                     let _ = this.update(cx, |this, cx| {
-                        this.status = format!("{error:#}");
-                        cx.notify();
+                        this.report_error("Could Not Remove Saved Credential", &error, cx);
                     });
                 }
             })
@@ -381,7 +376,6 @@ impl DotDir {
                             }) = &mut this.modal
                             {
                                 form.protocol = option;
-                                this.modal_error = None;
                                 cx.notify();
                             }
                         },

@@ -20,6 +20,8 @@ pub struct CommandState {
     pub archive_creation: bool,
     pub provider: bool,
     pub remote_download: bool,
+    pub remote_editable: bool,
+    pub remote_create_file: bool,
     pub entry: bool,
     pub real_entry: bool,
     pub file: bool,
@@ -90,7 +92,9 @@ impl Availability {
                 state.directory && (local || state.archive_writable && state.operation_idle)
             }
             Self::NewFile => {
-                local || state.directory && state.archive_writable && state.operation_idle
+                state.operation_idle
+                    && (local
+                        || state.directory && (state.archive_writable || state.remote_create_file))
             }
             Self::LocalLocation => local,
             Self::Entry => state.directory && state.entry,
@@ -99,7 +103,9 @@ impl Availability {
             Self::ViewBytes => Self::File.matches(state) || state.byte_viewer,
             Self::LocalFile => state.directory && state.file && local,
             Self::EditableFile => {
-                state.directory && state.file && (local || state.archive_editable)
+                state.directory
+                    && state.file
+                    && (local || state.archive_editable || state.remote_editable)
             }
             Self::Items => state.directory && state.items,
             Self::Copy => {
@@ -117,7 +123,10 @@ impl Availability {
             Self::CopyPath => {
                 state.panels_visible && (state.directory && state.selection || state.file_tab)
             }
-            Self::MutateSelection => Self::Copy.matches(state) && (local || state.archive_writable),
+            Self::MutateSelection => {
+                Self::Copy.matches(state)
+                    && (local || state.archive_writable || state.remote_download)
+            }
             Self::CreateArchive => {
                 Self::Copy.matches(state) && state.archive_creation && !state.provider
             }
@@ -156,7 +165,8 @@ impl Command {
         match self.id {
             "view" if state.directory && state.real_entry && !state.file => "Calculate Folder Size",
             "copy" if state.archive && !state.opposite_archive_writable => "Extract Archive",
-            "copy" if state.remote_download => "Download to Local Folder",
+            "copy" if state.remote_download => "Copy Remote Entries",
+            "trash" if state.remote_download => "Delete Remote Entries",
             "trash" if state.archive => "Delete Archive Entries",
             "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
             "toggle-line-wrap" if state.line_wrap == Some(false) => "Enable Line Wrap",
@@ -185,7 +195,7 @@ impl Command {
             "view" => "View",
             "edit" => "Edit",
             "copy" if state.archive && !state.opposite_archive_writable => "Extract",
-            "copy" if state.remote_download => "Download",
+            "trash" if state.remote_download => "Delete",
             "copy" => "Copy",
             "move" => "Move",
             "mkdir" => "Mkdir",
@@ -929,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_panel_can_download_without_mutating_the_remote_filesystem() {
+    fn remote_panel_supports_copy_move_and_confirmed_delete() {
         let mut state = CommandState {
             panels_visible: true,
             directory: true,
@@ -942,16 +952,22 @@ mod tests {
             ..Default::default()
         };
         assert!(available("copy", &state));
-        for command in [
-            "move",
-            "trash",
-            "rename",
-            "mkdir",
-            "new-file",
-            "create-archive",
-        ] {
+        state.file = true;
+        assert!(!available("edit", &state));
+        state.remote_editable = true;
+        assert!(available("edit", &state));
+        assert!(available("quick-edit", &state));
+        assert!(!available("edit-hex", &state));
+        assert!(available("move", &state));
+        assert!(available("trash", &state));
+        for command in ["rename", "mkdir", "new-file", "create-archive"] {
             assert!(!available(command, &state), "{command}");
         }
+        state.remote_create_file = true;
+        assert!(available("new-file", &state));
+        state.operation_idle = false;
+        assert!(!available("new-file", &state));
+        state.operation_idle = true;
         state.remote_download = false;
         assert!(!available("copy", &state));
     }

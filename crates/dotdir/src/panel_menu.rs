@@ -1,7 +1,7 @@
 use crate::{
     app::{DotDir, Message, Modal},
     archive::Location,
-    model::Entry,
+    model::{Entry, PANEL_MARGIN, PANEL_SPLITTER_WIDTH},
     ui::{icon, text},
 };
 use gpui_kit::{
@@ -363,18 +363,21 @@ impl DotDir {
         cx: &Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
-        let right = if menu.pane == 0 {
-            window.viewport_size().width / 2. + px(3.)
-        } else {
-            px(crate::ui::PANEL_MARGIN + 1.)
-        };
+        let widths = self.pane_widths(window);
+        let right = PANEL_MARGIN
+            + 1.
+            + if menu.pane == 0 {
+                widths[1] + PANEL_SPLITTER_WIDTH
+            } else {
+                0.
+            };
         let mut surface = div()
             .id("panel-menu-surface")
             .absolute()
             .top(px(29.))
-            .right(right)
+            .right(px(right))
             .w(px(if menu.is_jump() { 336. } else { 270. }))
-            .max_w(relative(0.49))
+            .max_w(px(widths[menu.pane] - 2.))
             .track_focus(&self.modal_focus)
             .key_context("Modal")
             .tab_group()
