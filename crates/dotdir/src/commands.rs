@@ -201,7 +201,7 @@ impl Command {
             "mkdir" => "Mkdir",
             "trash" if state.archive => "Delete",
             "trash" => "Trash",
-            "quit" => "Quit",
+            "quit" => "Close Window",
             "extensions" => "Plugins",
             "terminal" => "Terminal",
             "quick-view" => "Quick View",
@@ -364,6 +364,20 @@ pub const COMMANDS: &[Command] = &[
         id: "settings",
         title: "Settings",
         key: "f9",
+        context: "DotDir",
+        availability: Availability::Always,
+    },
+    Command {
+        id: "new-window",
+        title: "New Window",
+        key: "cmd-n",
+        context: "DotDir",
+        availability: Availability::Always,
+    },
+    Command {
+        id: "quit-app",
+        title: "Quit DotDir",
+        key: "cmd-q",
         context: "DotDir",
         availability: Availability::Always,
     },
@@ -805,7 +819,6 @@ pub fn bind(cx: &mut App, path: &std::path::Path) {
             },
             Some("DotDir"),
         ),
-        KeyBinding::new("cmd-q", RunCommand { id: "quit".into() }, Some("DotDir")),
         KeyBinding::new(
             "alt-pageup",
             RunCommand {

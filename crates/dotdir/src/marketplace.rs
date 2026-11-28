@@ -39,6 +39,10 @@ impl DotDir {
         self.settings_path.with_file_name("extensions")
     }
 
+    pub(crate) fn refresh_market_installed(&mut self) {
+        self.market.installed = open_vsx::installed(&self.extensions_directory());
+    }
+
     pub(crate) fn open_marketplace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.market.installed = open_vsx::installed(&self.extensions_directory());
         self.show_modal(Modal::OpenVsx, window, cx);
@@ -449,14 +453,7 @@ impl DotDir {
                         if source == InstallSource::Vsix {
                             self.market.vsix_result = Some(Ok(self.status.clone()));
                         }
-                        let directory = self.extensions_directory();
-                        self.market.installed = open_vsx::installed(&directory);
-                        self.load_vscode_extensions(&directory);
-                        let reload = self.settings.vscode.enabled(&package.entry.id());
-                        if reload {
-                            self.reset_vscode_host();
-                        }
-                        self.refresh_vscode_language_servers(reload, cx);
+                        self.reload_shared_extensions(cx);
                     }
                     Err(error) => {
                         let message = format!("{error:#}");

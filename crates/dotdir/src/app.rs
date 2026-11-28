@@ -6,7 +6,7 @@ use crate::{
     column_scroll::ColumnScroll,
     commands::{COMMANDS, CommandState, RunCommand},
     diagnostics::{DiagnosticDecorations, DiagnosticStyles},
-    extension_logs::{ERROR_LOG_NAME, ExtensionLogs},
+    extension_logs::ExtensionLogs,
     filesystems::{Filesystems, LOG_SCHEME, ProviderPath, RemoteDocument},
     folder_sizes::{FolderSizeEvent, FolderSizes},
     hex_file::{self, OpenedFile},
@@ -28,6 +28,7 @@ use crate::{
     theme::Palette,
     vscode,
     vscode_theme::{ImportedTheme, ThemeSource},
+    workspace::{self, SavedPane, SavedTab, WindowPlacement, WindowSession, Workspace},
 };
 use anyhow::Context as _;
 use dotdir_archive_api::{ArchiveFormat, OptionKind, OptionValue, Password};
@@ -259,9 +260,10 @@ impl DotDir {
                         .trim()
                         .parse::<u64>()
                         .map_err(|_| anyhow::anyhow!("Enter a whole number of minutes, or 0"))?;
-                    self.settings.archive_password_cache_minutes = minutes;
-                    self.filesystems.archive_passwords.set_minutes(minutes);
-                    self.persist();
+                    self.update_shared_settings(
+                        |settings| settings.archive_password_cache_minutes = minutes,
+                        cx,
+                    )?;
                 }
                 PromptKind::Location => {
                     let location = self.resolve_directory(&value, true)?;
@@ -455,16 +457,17 @@ impl DotDir {
                     ));
                 }
                 PromptKind::CloseTab { pane, id } => self.close_tab(pane, id, window, cx),
+                PromptKind::CloseOtherTabs { pane, keep, ids } => {
+                    self.close_tabs(pane, &ids, Some(keep), window, cx);
+                }
+                PromptKind::QuitApplication => self.request_quit_application(true, window, cx),
                 PromptKind::Quit => {
-                    self.persist();
                     if let Some(op) = &self.operation {
                         op.token.cancel();
                         self.quit_pending = true;
                         self.status = "Cancelling the operation before closing…".into();
                     } else {
-                        self.shutting_down = true;
-                        window.remove_window();
-                        cx.quit();
+                        self.finish_close_window(window, cx);
                     }
                 }
             }
@@ -903,17 +906,22 @@ impl DotDir {
     }
 
     pub fn toggle_vscode_extension(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.settings.vscode.enabled(id) {
-            self.settings
-                .vscode
-                .enabled
-                .retain(|entry| !entry.eq_ignore_ascii_case(id));
-            self.reset_vscode_host();
-        } else {
-            self.settings.vscode.enabled.push(id.into());
+        let result = self.update_shared_settings(
+            |settings| {
+                if settings.vscode.enabled(id) {
+                    settings
+                        .vscode
+                        .enabled
+                        .retain(|entry| !entry.eq_ignore_ascii_case(id));
+                } else {
+                    settings.vscode.enabled.push(id.into());
+                }
+            },
+            cx,
+        );
+        if let Err(error) = result {
+            self.report_error("Could Not Update Extension Settings", &error, cx);
         }
-        self.refresh_vscode_language_servers(false, cx);
-        self.persist();
         cx.notify();
     }
 
@@ -1257,6 +1265,7 @@ impl DotDir {
             }
             self.ensure_terminal(cx);
             self.terminal_visible = true;
+            self.persist(cx);
             if let Some(t) = self.terminals.get_mut(self.terminal_active) {
                 let _ = t.write(format!("{command}\r").as_bytes());
             }
@@ -1344,10 +1353,17 @@ impl DotDir {
         }
     }
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = false;
+        let mut changed = self.sync_workspace(cx);
+        if self
+            .placement_changed
+            .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(200))
+        {
+            self.placement_changed = None;
+            self.persist(cx);
+        }
         if self.panel_split_unsaved && !cx.has_active_drag() {
             self.panel_split_unsaved = false;
-            self.persist();
+            self.persist(cx);
         }
         if let Some(pending) = self.vscode_host.expire() {
             self.report_vscode_error(
@@ -1366,33 +1382,33 @@ impl DotDir {
                 Message::Market(event) => self.handle_marketplace(event, cx),
                 Message::MountedRoots(roots) => self.mounted_roots = roots,
                 Message::IconTheme(request, result) => {
-                    if request != self.icon_theme_request {
+                    if !self.workspace.is_current_icon_request(request) {
                         continue;
                     }
                     match result {
                         Ok(theme) => {
                             self.status = format!("File icons: {} {}", theme.name, theme.version);
-                            self.settings.icon_theme = Some(theme.root.clone());
-                            self.icon_theme = Some(*theme);
-                            self.persist();
+                            if let Err(error) = self.workspace.set_icon_theme(Some(*theme)) {
+                                self.report_error("Could Not Set File Icons", &error, cx);
+                            } else {
+                                self.sync_workspace(cx);
+                            }
                         }
                         Err(error) => self.error(format!("Icon theme: {error:#}"), cx),
                     }
                 }
                 Message::ColorTheme(request, result) => {
-                    if request != self.color_theme_request {
+                    if !self.workspace.is_current_color_request(request) {
                         continue;
                     }
                     match result {
                         Ok(theme) => {
-                            theme.apply(cx);
-                            self.palette = theme.palette;
-                            self.refresh_diagnostic_decorations(cx);
-                            self.dismiss_hover(cx);
                             self.status = format!("Color theme: {}", theme.name);
-                            self.color_theme_name = Some(theme.name);
-                            self.settings.color_theme = Some(theme.source);
-                            self.persist();
+                            if let Err(error) = self.workspace.use_imported_theme(*theme, cx) {
+                                self.report_error("Could Not Set Color Theme", &error, cx);
+                            } else {
+                                self.sync_workspace(cx);
+                            }
                         }
                         Err(error) => self.error(format!("Color theme: {error:#}"), cx),
                     }
@@ -1949,10 +1965,7 @@ impl DotDir {
             }
             self.refresh_all();
             if self.quit_pending && self.error_messages.is_empty() {
-                self.persist();
-                self.shutting_down = true;
-                window.remove_window();
-                cx.quit();
+                self.finish_close_window(window, cx);
                 return;
             }
             self.quit_pending = false;
@@ -1987,8 +2000,14 @@ impl DotDir {
         {
             changed = true;
         }
-        let logs_changed =
-            matches!(self.modal, Some(Modal::ExtensionLogs)) && self.extension_logs.take_changed();
+        let logs_changed = if matches!(self.modal, Some(Modal::ExtensionLogs)) {
+            let revision = self.extension_logs.revision();
+            let changed = self.extension_log_revision != revision;
+            self.extension_log_revision = revision;
+            changed
+        } else {
+            false
+        };
         if logs_changed
             && self.extension_log_scroll.offset().y + self.extension_log_scroll.max_offset().y
                 <= px(4.)
@@ -2174,6 +2193,7 @@ pub(crate) struct Tab {
     load_request: u64,
     preview_path: Option<Location>,
     source_position: Option<lsp_types::Position>,
+    pending_view: Option<(bool, Option<ByteViewMode>)>,
 }
 impl Tab {
     pub fn new(content: TabContent) -> Self {
@@ -2185,6 +2205,7 @@ impl Tab {
             load_request: 0,
             preview_path: None,
             source_position: None,
+            pending_view: None,
         }
     }
     pub fn id(&self) -> u64 {
@@ -2287,19 +2308,40 @@ impl TabStripScroll {
 }
 
 impl Pane {
-    fn restore(paths: &[SavedLocation], saved_active: usize, next_id: &mut u64) -> Self {
+    fn restore_tabs(saved: SavedPane, next_id: &mut u64) -> Self {
         let mut tabs = Vec::new();
         let mut active = 0;
-        for (index, path) in paths.iter().enumerate() {
-            if let Some(location) = path.clone().restore(&ARCHIVE_FORMATS) {
-                if index <= saved_active {
-                    active = tabs.len();
+        for (index, tab) in saved.tabs.into_iter().enumerate() {
+            let id = *next_id;
+            let tab = match tab {
+                SavedTab::Directory { path } => {
+                    let Some(location) = path.restore(&ARCHIVE_FORMATS) else {
+                        continue;
+                    };
+                    Tab::new(TabContent::Directory(DirectoryBrowser::new(id, location)))
                 }
-                tabs.push(Tab::new(TabContent::Directory(DirectoryBrowser::new(
-                    *next_id, location,
-                ))));
-                *next_id += 1;
+                SavedTab::File {
+                    path,
+                    readonly,
+                    byte_mode,
+                } => {
+                    let Some(path) = path.restore_file(&ARCHIVE_FORMATS) else {
+                        continue;
+                    };
+                    let mut tab = Tab::new(TabContent::Pending {
+                        id,
+                        path: Some(path),
+                        error: None,
+                    });
+                    tab.pending_view = Some((readonly, byte_mode));
+                    tab
+                }
+            };
+            if index <= saved.active {
+                active = tabs.len();
             }
+            tabs.push(tab);
+            *next_id += 1;
         }
         if tabs.is_empty() {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
@@ -2312,18 +2354,19 @@ impl Pane {
         Self { tabs, active }
     }
 
-    fn saved_directories(&self) -> (Vec<SavedLocation>, usize) {
-        let mut paths = Vec::new();
-        let mut active = 0;
-        for (index, tab) in self.tabs.iter().enumerate() {
-            if let TabContent::Directory(browser) = &tab.content {
-                if index <= self.active {
-                    active = paths.len();
-                }
-                paths.push(SavedLocation::from(&browser.current().path));
-            }
-        }
-        (paths, active)
+    #[cfg(test)]
+    fn restore(paths: &[SavedLocation], active: usize, next_id: &mut u64) -> Self {
+        Self::restore_tabs(
+            SavedPane {
+                tabs: paths
+                    .iter()
+                    .cloned()
+                    .map(|path| SavedTab::Directory { path })
+                    .collect(),
+                active,
+            },
+            next_id,
+        )
     }
 
     fn insert_after_active(&mut self, tab: Tab) {
@@ -2399,6 +2442,12 @@ pub(crate) enum PromptKind {
         pane: usize,
         id: u64,
     },
+    CloseOtherTabs {
+        pane: usize,
+        keep: u64,
+        ids: Vec<u64>,
+    },
+    QuitApplication,
     Quit,
 }
 pub(crate) enum Modal {
@@ -2560,6 +2609,13 @@ pub(crate) struct DotDir {
     pub tab_strip_scrolls: [TabStripScroll; 2],
     pub panel_scrolls: HashMap<u64, ColumnScroll>,
     pub(crate) panel_split_unsaved: bool,
+    pub(crate) workspace: Workspace,
+    window_id: u64,
+    placement: WindowPlacement,
+    placement_changed: Option<Instant>,
+    shared_revision: u64,
+    appearance_revision: u64,
+    extensions_revision: u64,
     pub folder_sizes: FolderSizes,
     pub active: usize,
     pub documents: HashMap<u64, Document>,
@@ -2567,9 +2623,7 @@ pub(crate) struct DotDir {
     pub settings_path: PathBuf,
     pub palette: Palette,
     pub color_theme_name: Option<String>,
-    color_theme_request: u64,
-    pub icon_theme: Option<IconTheme>,
-    pub icon_theme_request: u64,
+    pub icon_theme: Option<Arc<IconTheme>>,
     pub command_line: Entity<InputState>,
     pub dialog_input: Entity<InputState>,
     pub jump_input: Entity<InputState>,
@@ -2606,6 +2660,7 @@ pub(crate) struct DotDir {
     filesystems: Filesystems,
     password_requests: VecDeque<PasswordRequest>,
     pub extension_log_scroll: ScrollHandle,
+    extension_log_revision: u64,
     pub(crate) market: open_vsx::Market,
     pub(crate) market_search_task: Option<Task<()>>,
     pub search: Option<SearchState>,
@@ -2626,41 +2681,16 @@ pub(crate) struct DotDir {
 }
 impl DotDir {
     pub fn new(
-        settings_path: PathBuf,
-        initial: Option<PathBuf>,
+        workspace: Workspace,
+        session: WindowSession,
+        extra: Option<TabContent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut settings = Settings::load(&settings_path);
-        if let Some(path) = initial {
-            if let Some(path) = path
-                .to_str()
-                .and_then(|path| ProviderPath::parse(path).ok().flatten())
-            {
-                settings.left = vec![SavedLocation::Provider { uri: path }];
-                settings.active_pane = 0;
-                settings.left_active = 0;
-            } else if path.is_dir() {
-                settings.left = vec![SavedLocation::Local(path.clone())];
-                settings.right = vec![SavedLocation::Local(path)];
-                settings.left_active = 0;
-                settings.right_active = 0;
-            } else if path.is_file()
-                && let Some(format) = ARCHIVE_FORMATS.for_path(&path)
-            {
-                let path = path.canonicalize().unwrap_or(path);
-                if let Some(parent) = path.parent() {
-                    settings.right = vec![SavedLocation::Local(parent.into())];
-                    settings.right_active = 0;
-                }
-                if let Ok(root) = Archive::mount_location(path.into(), format) {
-                    settings.left = vec![SavedLocation::from(&root)];
-                    settings.left_active = 0;
-                }
-            }
-        }
-        let palette = Palette::named(&settings.theme);
-        palette.apply(cx);
+        let shared = workspace.snapshot();
+        let mut settings = shared.settings;
+        session.apply_layout(&mut settings);
+        let placement = WindowPlacement::capture(window);
         let (tx, rx) = mpsc::channel();
         let password_tx = tx.clone();
         let passwords =
@@ -2668,8 +2698,8 @@ impl DotDir {
                 let _ = password_tx.send(Message::ArchivePassword(request));
             });
         let lsp_tx = tx.clone();
-        let extension_logs =
-            ExtensionLogs::with_error_file(&settings_path.with_file_name(ERROR_LOG_NAME));
+        let settings_path = workspace.settings_path();
+        let extension_logs = workspace.logs();
         let language_servers = LanguageServers::new(
             settings_path
                 .parent()
@@ -2740,18 +2770,20 @@ impl DotDir {
                     }
                 }
             }),
+            cx.observe_window_bounds(window, |this, window, _| {
+                this.placement = WindowPlacement::capture(window);
+                this.placement_changed = Some(Instant::now());
+            }),
             cx.on_release(|this, _| {
-                this.persist();
                 if let Some(s) = &this.search {
                     s.token.cancel();
                 }
             }),
         ];
         let mut next_id = 1;
-        let panes = [
-            Pane::restore(&settings.left, settings.left_active, &mut next_id),
-            Pane::restore(&settings.right, settings.right_active, &mut next_id),
-        ];
+        let panes = session
+            .panes
+            .map(|pane| Pane::restore_tabs(pane, &mut next_id));
         let cache = extension_cache_directory();
         let vscode_tx = tx.clone();
         let vscode_host =
@@ -2764,7 +2796,7 @@ impl DotDir {
                 if this.shutting_down {
                     return true;
                 }
-                this.request_quit(window, cx);
+                this.request_close_window(window, cx);
                 false
             })
             .unwrap_or(true)
@@ -2792,13 +2824,18 @@ impl DotDir {
             tab_strip_scrolls: Default::default(),
             panel_scrolls: HashMap::new(),
             panel_split_unsaved: false,
+            window_id: session.id,
+            workspace,
+            placement,
+            placement_changed: None,
+            shared_revision: shared.revision,
+            appearance_revision: shared.appearance_revision,
+            extensions_revision: shared.extensions_revision,
             active: settings.active_pane,
             documents: HashMap::new(),
-            palette,
-            color_theme_name: None,
-            color_theme_request: 0,
-            icon_theme: None,
-            icon_theme_request: 0,
+            palette: shared.palette,
+            color_theme_name: shared.color_theme_name,
+            icon_theme: shared.icon_theme,
             command_line,
             dialog_input,
             jump_input,
@@ -2818,8 +2855,8 @@ impl DotDir {
             transfer_prompt_id: 0,
             terminals: vec![],
             terminal_active: 0,
-            terminal_visible: false,
-            panels_visible: true,
+            terminal_visible: session.terminal_visible,
+            panels_visible: session.panels_visible,
             extensions: vec![],
             extension_host: None,
             vscode_extensions: vec![],
@@ -2840,6 +2877,7 @@ impl DotDir {
             folder_sizes: FolderSizes::default(),
             extension_logs,
             extension_log_scroll: ScrollHandle::new(),
+            extension_log_revision: 0,
             market: open_vsx::Market::default(),
             market_search_task: None,
             search: None,
@@ -2870,18 +2908,38 @@ impl DotDir {
         for id in ids {
             this.reload_directory(id, Some(id) == active_directory);
         }
-        if let Some(path) = this.settings.icon_theme.clone() {
-            this.load_icon_theme(path, cx);
+        let files: Vec<_> = this
+            .panes
+            .iter()
+            .enumerate()
+            .flat_map(|(pane, panel)| {
+                panel.tabs.iter().filter_map(move |tab| {
+                    let TabContent::Pending {
+                        path: Some(path), ..
+                    } = &tab.content
+                    else {
+                        return None;
+                    };
+                    let (readonly, byte_mode) = tab.pending_view?;
+                    Some((pane, tab.id(), path.clone(), readonly, byte_mode))
+                })
+            })
+            .collect();
+        for (pane, id, path, readonly, byte_mode) in files {
+            this.open_file_into(pane, path, readonly, Some(id), byte_mode, window, cx);
         }
-        if let Some(source) = this.settings.color_theme.clone() {
-            this.load_color_theme(source, cx);
+        if let Some(content) = extra {
+            let id = this.id();
+            this.panes[this.active].insert_after_active(Tab::with_id(id, content));
+        }
+        if this.terminal_visible {
+            this.ensure_terminal(cx);
         }
         this.focus_pane(this.active, window, cx);
         this
     }
     pub fn load_icon_theme(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.icon_theme_request += 1;
-        let request = self.icon_theme_request;
+        let request = self.workspace.next_icon_request();
         self.status = "Loading file icon theme…".into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -2909,11 +2967,13 @@ impl DotDir {
         );
     }
     pub fn clear_icon_theme(&mut self, cx: &mut Context<Self>) {
-        self.icon_theme_request += 1;
-        self.icon_theme = None;
-        self.settings.icon_theme = None;
+        self.workspace.next_icon_request();
+        if let Err(error) = self.workspace.set_icon_theme(None) {
+            self.report_error("Could Not Set File Icons", &error, cx);
+            return;
+        }
+        self.sync_workspace(cx);
         self.status = "Using built-in file icons".into();
-        self.persist();
         cx.notify();
     }
 
@@ -2982,8 +3042,7 @@ impl DotDir {
     }
 
     fn load_color_theme(&mut self, source: ThemeSource, cx: &mut Context<Self>) {
-        self.color_theme_request += 1;
-        let request = self.color_theme_request;
+        let request = self.workspace.next_color_request();
         self.status = "Loading color theme…".into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -2996,16 +3055,79 @@ impl DotDir {
     }
 
     pub fn use_builtin_theme(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.color_theme_request += 1;
-        self.color_theme_name = None;
-        self.settings.color_theme = None;
-        self.settings.theme = id.into();
-        self.palette = Palette::named(id);
-        self.palette.apply(cx);
-        self.refresh_diagnostic_decorations(cx);
-        self.dismiss_hover(cx);
-        self.persist();
+        self.workspace.next_color_request();
+        if let Err(error) = self.workspace.use_builtin_theme(id, cx) {
+            self.report_error("Could Not Set Color Theme", &error, cx);
+            return;
+        }
+        self.sync_workspace(cx);
         cx.notify();
+    }
+
+    pub(crate) fn update_shared_settings(
+        &mut self,
+        update: impl FnOnce(&mut Settings),
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.workspace.update_settings(update)?;
+        self.sync_workspace(cx);
+        Ok(())
+    }
+
+    pub(crate) fn reload_shared_extensions(&mut self, cx: &mut Context<Self>) {
+        self.workspace.extensions_changed();
+        self.sync_workspace(cx);
+        cx.notify();
+    }
+
+    fn sync_workspace(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(shared) = self.workspace.changes_since(self.shared_revision) else {
+            return false;
+        };
+        self.shared_revision = shared.revision;
+        let profiles_changed =
+            self.settings.remote_connections != shared.settings.remote_connections;
+        let vscode_changed = self.settings.vscode != shared.settings.vscode;
+        let cache_changed = self.settings.archive_password_cache_minutes
+            != shared.settings.archive_password_cache_minutes;
+        self.settings.theme = shared.settings.theme;
+        self.settings.color_theme = shared.settings.color_theme;
+        self.settings.icon_theme = shared.settings.icon_theme;
+        self.settings.archive_password_cache_minutes =
+            shared.settings.archive_password_cache_minutes;
+        self.settings.path_aliases = shared.settings.path_aliases;
+        self.settings.remote_connections = shared.settings.remote_connections;
+        self.settings.vscode = shared.settings.vscode;
+        self.icon_theme = shared.icon_theme;
+        if self.appearance_revision != shared.appearance_revision {
+            self.appearance_revision = shared.appearance_revision;
+            self.palette = shared.palette;
+            self.color_theme_name = shared.color_theme_name;
+            self.refresh_diagnostic_decorations(cx);
+            self.dismiss_hover(cx);
+        }
+        if cache_changed {
+            self.filesystems
+                .archive_passwords
+                .set_minutes(self.settings.archive_password_cache_minutes);
+        }
+        if self.extensions_revision != shared.extensions_revision {
+            self.extensions_revision = shared.extensions_revision;
+            self.extension_errors.clear();
+            self.load_extensions();
+            self.refresh_provider_directories();
+            self.refresh_market_installed();
+            self.refresh_vscode_language_servers(true, cx);
+        } else {
+            if profiles_changed {
+                self.refresh_remote_connections();
+            }
+            if vscode_changed {
+                self.reset_vscode_host();
+                self.refresh_vscode_language_servers(true, cx);
+            }
+        }
+        true
     }
 
     fn refresh_diagnostic_decorations(&mut self, cx: &mut App) {
@@ -3269,7 +3391,7 @@ impl DotDir {
         }
         self.reveal_column(pane, false);
         self.focus_pane(pane, window, cx);
-        self.persist();
+        self.persist(cx);
         cx.notify();
     }
     pub fn focus_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3402,6 +3524,8 @@ impl DotDir {
                             | PromptKind::DeleteArchive(_)
                             | PromptKind::DeleteRemote(_)
                             | PromptKind::CloseTab { .. }
+                            | PromptKind::CloseOtherTabs { .. }
+                            | PromptKind::QuitApplication
                             | PromptKind::Quit
                     ),
                     None => return,
@@ -3430,7 +3554,7 @@ impl DotDir {
             self.reload(directory.id);
         }
         self.focus_pane(pane, window, cx);
-        self.persist();
+        self.persist(cx);
     }
 
     fn tab_position(&self, id: u64) -> Option<(usize, usize)> {
@@ -3815,7 +3939,7 @@ impl DotDir {
         if !self.has_dialog() {
             self.focus_pane(pane, window, cx);
         }
-        self.persist();
+        self.persist(cx);
         cx.notify();
         window.refresh();
     }
@@ -3864,7 +3988,7 @@ impl DotDir {
         {
             self.open_entry(pane, entry, false, window, cx);
         }
-        self.persist();
+        self.persist(cx);
         cx.notify();
     }
     pub fn prompt(
@@ -3891,6 +4015,8 @@ impl DotDir {
                 | PromptKind::DeleteArchive(_)
                 | PromptKind::DeleteRemote(_)
                 | PromptKind::CloseTab { .. }
+                | PromptKind::CloseOtherTabs { .. }
+                | PromptKind::QuitApplication
                 | PromptKind::Quit
         );
         self.modal = Some(Modal::Prompt {
@@ -4333,7 +4459,7 @@ impl DotDir {
         let switches_panel_menu = matches!(self.modal, Some(Modal::PanelMenu(_)))
             && matches!(id, "left-panel-menu" | "right-panel-menu");
         if self.has_dialog()
-            && !matches!(id, "escape" | "quit")
+            && !matches!(id, "escape" | "quit" | "quit-app")
             && (self.overlay_visible() || !switches_panel_menu && id != "palette")
         {
             return;
@@ -4397,7 +4523,7 @@ impl DotDir {
                         };
                     }
                     self.reveal_column(pane, false);
-                    self.persist();
+                    self.persist(cx);
                 } else {
                     let selection = self.shift_selection;
                     if let Some(directory) = self.directory_mut(self.active) {
@@ -4444,7 +4570,7 @@ impl DotDir {
             "hidden" => {
                 self.settings.show_hidden = !self.settings.show_hidden;
                 self.refresh_all();
-                self.persist();
+                self.persist(cx);
             }
             "brief" | "view-brief" | "view-icons" | "view-details" | "view-columns" => {
                 let mode = match id {
@@ -4817,6 +4943,7 @@ Selected entries will be permanently removed from the archive."
             "find" => self.show_modal(Modal::Search, window, cx),
             "terminal" => {
                 self.terminal_visible = !self.terminal_visible;
+                self.persist(cx);
                 if self.terminal_visible {
                     self.ensure_terminal(cx);
                     self.terminal_focus.focus(window, cx);
@@ -4833,6 +4960,7 @@ Selected entries will be permanently removed from the archive."
                 } else {
                     self.focus_pane(self.active, window, cx);
                 }
+                self.persist(cx);
             }
             "command-line" => self.command_line.update(cx, |s, cx| s.focus(window, cx)),
             "escape" => {
@@ -4860,7 +4988,9 @@ Selected entries will be permanently removed from the archive."
                     self.focus_pane(self.active, window, cx);
                 }
             }
-            "quit" => self.request_quit(window, cx),
+            "new-window" => self.open_new_window(None, window, cx),
+            "quit" => self.request_close_window(window, cx),
+            "quit-app" => self.request_quit_application(false, window, cx),
             id if id.starts_with("vscode:") => self.invoke_vscode(id, window, cx),
             _ => {
                 if let Some((ext, c)) = self.extensions.iter().find_map(|e| {
@@ -5035,6 +5165,7 @@ Selected entries will be permanently removed from the archive."
                 };
             if let Some(tab) = self.panes[pane].tabs.iter_mut().find(|tab| tab.id() == id) {
                 tab.content = content;
+                tab.pending_view = None;
             }
             self.release_unused_documents();
             if refocus {
@@ -5074,6 +5205,7 @@ Selected entries will be permanently removed from the archive."
             self.panes[pane].insert_after_active(tab);
         }
         self.focus_pane(pane, window, cx);
+        self.persist(cx);
     }
 
     fn hex_content(
@@ -5710,12 +5842,79 @@ Selected entries will be permanently removed from the archive."
         }
         self.close_tab(pane, id, window, cx);
     }
+    pub(crate) fn request_close_other_tabs(
+        &mut self,
+        pane: usize,
+        keep: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = &self.panes[pane];
+        if !panel.tabs.iter().any(|tab| tab.id() == keep) {
+            return;
+        }
+        let others: Vec<_> = panel.tabs.iter().filter(|tab| tab.id() != keep).collect();
+        let ids = others.iter().map(|tab| tab.id()).collect::<Vec<_>>();
+        let closed = |id| ids.contains(&id);
+        let survives = |content: &TabContent| {
+            self.panes
+                .iter()
+                .flat_map(|pane| &pane.tabs)
+                .filter(|tab| !closed(tab.id()))
+                .any(|tab| match (content, &tab.content) {
+                    (TabContent::Document(document), TabContent::Document(other)) => {
+                        document == other
+                    }
+                    (TabContent::Hex { view, .. }, TabContent::Hex { view: other, .. }) => {
+                        !other.read(cx).readonly && view.read(cx).buffer == other.read(cx).buffer
+                    }
+                    _ => false,
+                })
+        };
+        let mut dirty = false;
+        for tab in others {
+            if let Some((_, saving, modified)) = self.file_changes(&tab.content, cx) {
+                if saving && !survives(&tab.content) {
+                    self.error("Wait for pending saves before closing tabs", cx);
+                    return;
+                }
+                dirty |= modified && !survives(&tab.content);
+            }
+        }
+        if dirty {
+            self.prompt(
+                PromptKind::CloseOtherTabs { pane, keep, ids },
+                "Unsaved changes",
+                "Discard unsaved changes in the other tabs?".into(),
+                String::new(),
+                window,
+                cx,
+            );
+        } else if !ids.is_empty() {
+            self.close_tabs(pane, &ids, Some(keep), window, cx);
+        }
+    }
+
     pub fn close_tab(&mut self, pane: usize, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tabs(pane, &[id], None, window, cx);
+    }
+
+    fn close_tabs(
+        &mut self,
+        pane: usize,
+        ids: &[u64],
+        keep: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_request[pane] += 1;
-        let fallback = Location::from(self.cwd(pane));
-        let p = &mut self.panes[pane];
-        if let Some(i) = p.tabs.iter().position(|t| t.id() == id) {
-            if let TabContent::Directory(browser) = &p.tabs[i].content {
+        let fallback = self.pane_location(pane);
+        for &id in ids {
+            let panel = &mut self.panes[pane];
+            let Some(index) = panel.tabs.iter().position(|tab| tab.id() == id) else {
+                continue;
+            };
+            if let TabContent::Directory(browser) = &panel.tabs[index].content {
                 if let Some(watcher) = &self.watcher {
                     for directory in &browser.columns {
                         watcher.remove(&directory.id.to_string());
@@ -5723,7 +5922,7 @@ Selected entries will be permanently removed from the archive."
                 }
                 self.panel_scrolls.remove(&browser.id);
             }
-            let closed = p.remove_tab(i);
+            let closed = panel.remove_tab(index);
             if let TabContent::Hex { view, .. } = closed.content {
                 let view = view.read(cx);
                 if !view.readonly
@@ -5734,14 +5933,19 @@ Selected entries will be permanently removed from the archive."
                     buffer.update(cx, |buffer, cx| buffer.discard(cx));
                 }
             }
+            if let Some(watcher) = &self.watcher {
+                watcher.remove(&id.to_string());
+            }
         }
         self.release_unused_documents();
-        if let Some(w) = &self.watcher {
-            w.remove(&id.to_string());
-        }
         self.ensure_directory_tab(pane, fallback);
+        if let Some(index) =
+            keep.and_then(|id| self.panes[pane].tabs.iter().position(|tab| tab.id() == id))
+        {
+            self.panes[pane].active = index;
+        }
         self.focus_pane(pane, window, cx);
-        self.persist();
+        self.persist(cx);
     }
     fn ensure_directory_tab(&mut self, pane: usize, fallback: Location) {
         if self.panes[pane].tabs.is_empty() {
@@ -5753,16 +5957,27 @@ Selected entries will be permanently removed from the archive."
             self.reload(id);
         }
     }
-    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.error_messages.is_empty() {
             return;
         }
         if matches!(
             self.modal,
-            Some(Modal::Conflict { .. } | Modal::ArchivePassword { .. })
+            Some(
+                Modal::Conflict { .. }
+                    | Modal::ArchivePassword { .. }
+                    | Modal::RemoteConnections { busy: true, .. }
+            )
         ) {
             self.error(
-                "Respond to or cancel the pending file prompt before closing DotDir.",
+                "Respond to or cancel the pending file prompt before closing this window.",
+                cx,
+            );
+            return;
+        }
+        if self.market.installing.is_some() {
+            self.error(
+                "Wait for the extension installation to finish before closing this window.",
                 cx,
             );
             return;
@@ -5779,25 +5994,218 @@ Selected entries will be permanently removed from the archive."
         if documents.any(|(_, _, dirty)| dirty) || self.operation.is_some() {
             self.prompt(
                 PromptKind::Quit,
-                "Close DotDir",
-                "Discard unsaved buffers and cancel any active operation?".into(),
+                "Close Window",
+                "Discard unsaved buffers and cancel any active operation in this window?".into(),
                 String::new(),
                 window,
                 cx,
             );
         } else {
-            self.persist();
+            self.finish_close_window(window, cx);
+        }
+    }
+
+    fn finish_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist(cx);
+        if let Err(error) = self.workspace.close_window(self.window_id) {
+            eprintln!("Cannot save window session: {error:#}");
+        }
+        self.shutting_down = true;
+        window.remove_window();
+    }
+
+    fn request_quit_application(
+        &mut self,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let windows = self.workspace.other_windows(self.window_id);
+        let mut busy = false;
+        let mut dirty = false;
+        let mut check = |this: &Self, cx: &App| {
+            busy |= this.operation.is_some()
+                || this.saving_file.is_some()
+                || this.market.installing.is_some()
+                || matches!(
+                    this.modal,
+                    Some(
+                        Modal::RemoteConnections { busy: true, .. } | Modal::ArchivePassword { .. }
+                    )
+                );
+            dirty |= this.panes.iter().flat_map(|pane| &pane.tabs).any(|tab| {
+                this.file_changes(&tab.content, cx)
+                    .is_some_and(|(_, _, dirty)| dirty)
+            });
+        };
+        check(self, cx);
+        for window in &windows {
+            if let Some(entity) = window.upgrade() {
+                check(entity.read(cx), cx);
+            }
+        }
+        if busy {
+            self.error(
+                "Finish or cancel pending operations before quitting DotDir.",
+                cx,
+            );
+        } else if dirty && !confirmed {
+            self.prompt(
+                PromptKind::QuitApplication,
+                "Quit DotDir",
+                "Discard unsaved changes in all windows?".into(),
+                String::new(),
+                window,
+                cx,
+            );
+        } else {
+            self.persist(cx);
+            for window in windows {
+                let _ = window.update(cx, |this, cx| this.persist(cx));
+            }
             self.shutting_down = true;
-            window.remove_window();
             cx.quit();
         }
     }
-    pub fn persist(&mut self) {
-        (self.settings.left, self.settings.left_active) = self.panes[0].saved_directories();
-        (self.settings.right, self.settings.right_active) = self.panes[1].saved_directories();
-        self.settings.active_pane = self.active;
-        if let Err(e) = self.settings.save(&self.settings_path) {
-            eprintln!("Cannot save session: {e}");
+
+    pub(crate) fn tab_location<'a>(&'a self, content: &'a TabContent) -> Option<&'a Location> {
+        match content {
+            TabContent::Directory(browser) => Some(&browser.current().path),
+            TabContent::Document(id) => self.documents.get(id).map(|doc| &doc.path),
+            TabContent::Image { path, .. }
+            | TabContent::Hex { path, .. }
+            | TabContent::Media { path, .. } => Some(path),
+            TabContent::Pending { path, .. } => path.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn saved_tab(&self, tab: &Tab, cx: &App) -> Option<SavedTab> {
+        let path = SavedLocation::from(self.tab_location(&tab.content)?);
+        let (readonly, byte_mode) = match &tab.content {
+            TabContent::Directory(_) => return Some(SavedTab::Directory { path }),
+            TabContent::Document(id) => (self.documents.get(id)?.readonly, None),
+            TabContent::Hex { view, .. } => {
+                let view = view.read(cx);
+                (view.readonly, Some(view.mode()))
+            }
+            TabContent::Pending { .. } => tab.pending_view.unwrap_or((true, None)),
+            _ => (true, None),
+        };
+        Some(SavedTab::File {
+            path,
+            readonly,
+            byte_mode,
+        })
+    }
+
+    fn window_session(&self, cx: &App) -> WindowSession {
+        let panes = std::array::from_fn(|index| {
+            let pane = &self.panes[index];
+            let mut active = 0;
+            let mut tabs = Vec::new();
+            for (index, tab) in pane.tabs.iter().enumerate() {
+                if !tab.preview
+                    && let Some(saved) = self.saved_tab(tab, cx)
+                {
+                    if index <= pane.active {
+                        active = tabs.len();
+                    }
+                    tabs.push(saved);
+                }
+            }
+            if tabs.is_empty() {
+                tabs.push(SavedTab::Directory {
+                    path: SavedLocation::from(&self.pane_location(index)),
+                });
+            }
+            SavedPane { tabs, active }
+        });
+        WindowSession {
+            id: self.window_id,
+            panes,
+            active: self.active,
+            presentations: [self.settings.presentation(0), self.settings.presentation(1)],
+            split: self.settings.panel_split,
+            show_hidden: self.settings.show_hidden,
+            font_size: self.settings.font_size,
+            terminal_height: self.settings.terminal_height,
+            terminal_visible: self.terminal_visible,
+            panels_visible: self.panels_visible,
+            placement: Some(self.placement),
+        }
+    }
+
+    pub(crate) fn open_new_window(
+        &mut self,
+        tab: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut session = self.window_session(cx);
+        session.id = self.workspace.new_id();
+        session.placement = Some(WindowPlacement::capture(window).cascaded());
+        session.panels_visible = true;
+        session.terminal_visible = false;
+        session.panes = std::array::from_fn(|pane| SavedPane {
+            tabs: vec![SavedTab::Directory {
+                path: SavedLocation::from(&self.pane_location(pane)),
+            }],
+            active: 0,
+        });
+        let mut extra = None;
+        if let Some(id) = tab {
+            let Some((pane, index)) = self.tab_position(id) else {
+                return;
+            };
+            let selected = &self.panes[pane].tabs[index];
+            session.active = pane;
+            if let Some(tab) = self.saved_tab(selected, cx) {
+                session.panes[pane].tabs = vec![tab];
+            } else {
+                extra = match &selected.content {
+                    TabContent::Panel {
+                        title,
+                        extension,
+                        command,
+                        node,
+                        ..
+                    } => Some(TabContent::Panel {
+                        id: 0,
+                        title: title.clone(),
+                        extension: extension.clone(),
+                        command: command.clone(),
+                        node: node.clone(),
+                    }),
+                    TabContent::SelectionInspector { snapshot, .. } => {
+                        Some(TabContent::SelectionInspector {
+                            id: 0,
+                            snapshot: snapshot.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+            }
+        }
+        let workspace = self.workspace.clone();
+        let view = cx.weak_entity();
+        window.defer(cx, move |_, cx| {
+            match workspace::open_window(workspace, session, extra, cx) {
+                Ok(handle) => {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+                Err(error) => {
+                    let _ = view.update(cx, |this, cx| {
+                        this.error(format!("Could not open a window: {error}"), cx)
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn persist(&self, cx: &App) {
+        if let Err(error) = self.workspace.save_window(self.window_session(cx)) {
+            eprintln!("Cannot save window session: {error:#}");
         }
     }
 }
@@ -5805,8 +6213,8 @@ Selected entries will be permanently removed from the archive."
 #[cfg(test)]
 mod tab_tests {
     use super::{
-        DirectoryBrowser, Pane, SavedLocation, Tab, TabContent, parse_copy_destinations,
-        quote_copy_destination,
+        ByteViewMode, Pane, SavedLocation, SavedPane, SavedTab, Tab, TabContent,
+        parse_copy_destinations, quote_copy_destination,
     };
     use std::path::PathBuf;
 
@@ -5883,30 +6291,32 @@ mod tab_tests {
     }
 
     #[test]
-    fn saving_with_a_file_tab_active_keeps_the_preceding_directory_selected() {
-        let folder = |id, path: &str| {
-            Tab::new(TabContent::Directory(DirectoryBrowser::new(
-                id,
-                PathBuf::from(path).into(),
-            )))
-        };
-        let mut pane = Pane {
-            tabs: vec![
-                folder(1, "first"),
-                folder(2, "selected"),
-                Tab::new(TabContent::Document(3)),
-                folder(4, "last"),
-            ],
-            active: 2,
-        };
-        let (paths, active) = pane.saved_directories();
-        assert_eq!(paths.len(), 3);
-        assert_eq!(active, 1);
-        assert!(
-            matches!(&paths[active], SavedLocation::Local(path) if path == &PathBuf::from("selected"))
+    fn restores_the_active_file_and_its_view_mode() {
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("data.bin");
+        std::fs::write(&file, b"test").unwrap();
+        let pane = Pane::restore_tabs(
+            SavedPane {
+                tabs: vec![
+                    SavedTab::Directory {
+                        path: SavedLocation::Local(scratch.path().into()),
+                    },
+                    SavedTab::File {
+                        path: SavedLocation::Local(file.clone()),
+                        readonly: true,
+                        byte_mode: Some(ByteViewMode::Dump),
+                    },
+                ],
+                active: 1,
+            },
+            &mut 1,
         );
-        pane.active = 1;
-        assert_eq!(pane.saved_directories().1, active);
+        assert_eq!(pane.active, 1);
+        let tab = &pane.tabs[1];
+        assert_eq!(tab.pending_view, Some((true, Some(ByteViewMode::Dump))));
+        assert!(
+            matches!(&tab.content, TabContent::Pending { path: Some(path), .. } if path.local() == Some(file.as_path()))
+        );
     }
 
     #[test]

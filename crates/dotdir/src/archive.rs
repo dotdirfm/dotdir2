@@ -98,17 +98,21 @@ pub enum SavedLocation {
 
 impl SavedLocation {
     pub fn restore(self, formats: &ArchiveFormats) -> Option<Location> {
-        self.restore_at(formats, 0)
+        self.restore_at(formats, 0, false)
     }
 
-    fn restore_at(self, formats: &ArchiveFormats, depth: usize) -> Option<Location> {
+    pub fn restore_file(self, formats: &ArchiveFormats) -> Option<Location> {
+        self.restore_at(formats, 0, true)
+    }
+
+    fn restore_at(self, formats: &ArchiveFormats, depth: usize, file: bool) -> Option<Location> {
         const LEGACY_ZIP_ID: &str = "dotdir.zip";
         let (format, source, member) = match self {
             Self::Local(path) => {
-                let available = if depth == 0 {
-                    path.is_dir()
-                } else {
+                let available = if file || depth > 0 {
                     path.is_file()
+                } else {
+                    path.is_dir()
                 };
                 return available.then_some(Location::Local(path));
             }
@@ -128,7 +132,7 @@ impl SavedLocation {
         if depth >= MAX_ARCHIVE_DEPTH {
             return None;
         }
-        let source = source.restore_at(formats, depth + 1)?;
+        let source = source.restore_at(formats, depth + 1, true)?;
         Some(Arc::new(Archive::new(source, format)).location(member))
     }
 }

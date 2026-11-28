@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
@@ -227,14 +228,9 @@ impl Guest {
                     let bytecode = module.write(WriteOptions::default())?;
                     let mut bytes = Sha256::digest(&bytecode).to_vec();
                     bytes.extend(bytecode);
-                    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-                    fs::write(&temp, bytes)?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
-                    }
-                    fs::rename(temp, &path)?;
+                    let mut temp = tempfile::NamedTempFile::new_in(cache)?;
+                    temp.write_all(&bytes)?;
+                    temp.persist(&path)?;
                     module
                 };
                 let (_, promise) = module.eval()?;

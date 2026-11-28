@@ -224,15 +224,15 @@ impl DotDir {
                 }
                 let saved_credential = new_credential && result.is_ok();
                 let result = result.and_then(|_| {
-                    let mut settings = this.settings.clone();
-                    settings.remote_connections.retain(|saved| {
-                        saved.protocol != profile.protocol || saved.name != profile.name
-                    });
-                    settings.remote_connections.push(profile.clone());
-                    settings.save(&this.settings_path)?;
-                    this.settings = settings;
-                    this.refresh_remote_connections();
-                    Ok(())
+                    this.update_shared_settings(
+                        |settings| {
+                            settings.remote_connections.retain(|saved| {
+                                saved.protocol != profile.protocol || saved.name != profile.name
+                            });
+                            settings.remote_connections.push(profile.clone());
+                        },
+                        cx,
+                    )
                 });
                 match result {
                     Ok(()) => {
@@ -268,16 +268,17 @@ impl DotDir {
         if *busy {
             return;
         }
-        let mut settings = self.settings.clone();
-        settings
-            .remote_connections
-            .retain(|saved| saved.protocol != profile.protocol || saved.name != profile.name);
-        if let Err(error) = settings.save(&self.settings_path) {
+        if let Err(error) = self.update_shared_settings(
+            |settings| {
+                settings.remote_connections.retain(|saved| {
+                    saved.protocol != profile.protocol || saved.name != profile.name
+                });
+            },
+            cx,
+        ) {
             self.report_error("Could Not Remove Connection", &error, cx);
             return;
         }
-        self.settings = settings;
-        self.refresh_remote_connections();
         self.open_remote_connections(window, cx);
         self.remove_remote_credential(profile, cx);
     }

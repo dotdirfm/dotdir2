@@ -496,7 +496,7 @@ impl DotDir {
                                         browser.active = index;
                                     }
                                     this.focus_pane(pane, window, cx);
-                                    this.persist();
+                                    this.persist(cx);
                                 })),
                         )
                         .child(self.panel_entries(

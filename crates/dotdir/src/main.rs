@@ -40,6 +40,7 @@ mod ui;
 mod vscode;
 mod vscode_nls;
 mod vscode_theme;
+mod workspace;
 
 use gpui_kit::{
     assets::{Assets, icon_assets},
@@ -81,35 +82,22 @@ fn main() {
             gpui_kit::init(cx);
             syntax::register_perl();
             commands::bind(cx, &config.join("keybindings.json"));
-            let preferred_size = size(px(1200.), px(800.));
-            let display = cx.primary_display();
-            let bounds = match &display {
-                Some(display) => {
-                    let work_area = display.visible_bounds();
-                    // Leave room for the native window frame around the client area.
-                    let available = work_area.size.map(|axis| axis * 0.9);
-                    Bounds::centered_at(work_area.center(), preferred_size.min(&available))
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            let workspace = workspace::Workspace::load(config.join("settings.json"), cx);
+            let mut sessions = workspace.startup_sessions();
+            if let (Some(session), Some(path)) = (sessions.first_mut(), initial) {
+                session.open_initial_path(path);
+            }
+            for session in sessions {
+                if let Err(error) = workspace::open_window(workspace.clone(), session, None, cx) {
+                    eprintln!("Could not restore DotDir window: {error:#}");
                 }
-                None => Bounds::centered(None, preferred_size, cx),
-            };
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(700.), px(420.)).min(&bounds.size)),
-                    display_id: display.map(|display| display.id()),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("DotDir".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                cx,
-                move |window, cx| {
-                    cx.new(|cx| app::DotDir::new(config.join("settings.json"), initial, window, cx))
-                },
-            )
-            .expect("open DotDir window");
-            cx.activate(true);
+            }
+            if cx.windows().is_empty() {
+                cx.quit();
+            } else {
+                cx.activate(true);
+            }
         });
 }
 

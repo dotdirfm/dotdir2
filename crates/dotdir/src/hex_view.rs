@@ -43,7 +43,7 @@ enum ByteOrder {
     Big,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ByteViewMode {
     #[default]
     Hex,

@@ -203,6 +203,7 @@ pub fn save(
     stamp: &SourceStamp,
     edits: &BTreeMap<u64, ByteEdit>,
 ) -> Result<SourceStamp> {
+    let _guard = crate::operations::LOCAL_SAVE_LOCK.lock().unwrap();
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(windows)]

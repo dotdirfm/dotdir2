@@ -16,7 +16,7 @@ use gpui_kit::{
         button::Button,
         checkbox::Checkbox,
         input::{Editor, Input, Redo, Undo},
-        menu::{DropdownMenu, PopupMenuItem},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
         progress::Progress,
         resizable::resize_handle,
     },
@@ -722,7 +722,11 @@ impl DotDir {
                                     cx,
                                 );
                             }))
-                    })),
+                    }))
+                    .context_menu({
+                        let app = cx.weak_entity();
+                        move |menu, _, cx| Self::tab_context_menu(menu, &app, pane, id, cx)
+                    }),
             )
         }
         let end = tab_count;
@@ -1066,6 +1070,65 @@ impl DotDir {
             .into_any_element()
     }
 
+    fn tab_context_menu(
+        menu: PopupMenu,
+        app: &WeakEntity<Self>,
+        pane: usize,
+        id: u64,
+        cx: &App,
+    ) -> PopupMenu {
+        let Some(view) = app.upgrade() else {
+            return menu;
+        };
+        let this = view.read(cx);
+        let tabs = &this.panes[pane].tabs;
+        let Some(tab) = tabs.iter().find(|tab| tab.id() == id) else {
+            return menu;
+        };
+        let has_path = this.tab_location(&tab.content).is_some();
+        let item =
+            |label,
+             disabled,
+             action: fn(&mut Self, usize, u64, &mut Window, &mut Context<Self>)| {
+                let app = app.clone();
+                PopupMenuItem::new(label)
+                    .disabled(disabled)
+                    .on_click(move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            if !this.has_dialog() {
+                                action(this, pane, id, window, cx);
+                            }
+                        });
+                    })
+            };
+        menu.item(item("Copy Path", !has_path, |this, pane, id, _, cx| {
+            if let Some(path) = this.panes[pane]
+                .tabs
+                .iter()
+                .find(|tab| tab.id() == id)
+                .and_then(|tab| this.tab_location(&tab.content))
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.display()));
+                this.status = "Path copied".into();
+                cx.notify();
+            }
+        }))
+        .item(item(
+            "Open in New Window",
+            !has_path && matches!(tab.content, TabContent::Pending { .. }),
+            |this, _, id, window, cx| {
+                this.open_new_window(Some(id), window, cx);
+            },
+        ))
+        .separator()
+        .item(item("Close", false, Self::request_close_tab))
+        .item(item(
+            "Close Other Tabs",
+            tabs.len() < 2,
+            Self::request_close_other_tabs,
+        ))
+    }
+
     fn render_panel_splitter(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -1100,7 +1163,7 @@ impl DotDir {
                         .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                             if event.click_count() == 2 && !this.has_dialog() {
                                 this.settings.panel_split = 0.5;
-                                this.persist();
+                                this.persist(cx);
                                 cx.notify();
                             }
                         })),
@@ -1841,6 +1904,8 @@ impl DotDir {
                         | PromptKind::DeleteArchive(_)
                         | PromptKind::DeleteRemote(_)
                         | PromptKind::CloseTab { .. }
+                        | PromptKind::CloseOtherTabs { .. }
+                        | PromptKind::QuitApplication
                         | PromptKind::Quit
                 ) {
                     content = content.child(Input::new(&self.dialog_input));
@@ -1848,8 +1913,10 @@ impl DotDir {
                 let confirm = match kind {
                     PromptKind::Trash(_) => "Move to Trash",
                     PromptKind::DeleteArchive(_) | PromptKind::DeleteRemote(_) => "Delete Entries",
-                    PromptKind::CloseTab { .. } => "Discard Changes",
-                    PromptKind::Quit => "Close Without Saving",
+                    PromptKind::CloseTab { .. } | PromptKind::CloseOtherTabs { .. } => {
+                        "Discard Changes"
+                    }
+                    PromptKind::Quit | PromptKind::QuitApplication => "Close Without Saving",
                     PromptKind::Transfer { kind, .. } => kind.title(),
                     _ => "OK",
                 };
@@ -1923,7 +1990,7 @@ impl DotDir {
                     |this, _, cx| {
                         this.settings.show_hidden = !this.settings.show_hidden;
                         this.refresh_all();
-                        this.persist();
+                        this.persist(cx);
                         cx.notify();
                     },
                     cx,
@@ -1941,7 +2008,7 @@ impl DotDir {
                             "−",
                             |this, _, cx| {
                                 this.settings.font_size = (this.settings.font_size - 1.).max(10.);
-                                this.persist();
+                                this.persist(cx);
                                 cx.notify();
                             },
                             cx,
@@ -1951,7 +2018,7 @@ impl DotDir {
                             "+",
                             |this, _, cx| {
                                 this.settings.font_size = (this.settings.font_size + 1.).min(24.);
-                                this.persist();
+                                this.persist(cx);
                                 cx.notify();
                             },
                             cx,
@@ -2200,11 +2267,7 @@ impl DotDir {
                     "reload-extensions",
                     "Reload Extensions",
                     |this, _, cx| {
-                        this.extension_errors.clear();
-                        this.load_extensions();
-                        this.refresh_provider_directories();
-                        this.refresh_vscode_language_servers(true, cx);
-                        cx.notify();
+                        this.reload_shared_extensions(cx);
                     },
                     cx,
                 ));

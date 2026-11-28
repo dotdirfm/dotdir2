@@ -17,7 +17,7 @@ pub(crate) struct ExtensionLogs(Arc<Mutex<LogBuffer>>);
 struct LogBuffer {
     lines: VecDeque<(Arc<str>, String)>,
     groups: BTreeSet<String>,
-    changed: bool,
+    revision: u64,
     error_file: Option<File>,
 }
 
@@ -102,8 +102,8 @@ impl ExtensionLogs {
         })
     }
 
-    pub fn take_changed(&self) -> bool {
-        std::mem::take(&mut self.0.lock().unwrap().changed)
+    pub fn revision(&self) -> u64 {
+        self.0.lock().unwrap().revision
     }
 }
 
@@ -138,7 +138,7 @@ impl LogSource {
                 self.group.clone(),
                 format!("{time} [{}] {line}{suffix}", self.label),
             ));
-            buffer.changed = true;
+            buffer.revision += 1;
             if is_error && buffer.error_file.is_some() {
                 let _ = writeln!(
                     disk_entry,

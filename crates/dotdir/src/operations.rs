@@ -12,7 +12,7 @@ use dotdir_core::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     time::Duration,
 };
 
@@ -450,9 +450,11 @@ impl Drop for Operation {
     }
 }
 
-/// Saves are serialized by the document owner. An external modification is
-/// rejected before writing, and the UI retains the unsaved buffer on failure.
+pub(crate) static LOCAL_SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Check the disk version under the lock shared by all windows and hex editors.
 pub fn save_document(path: &std::path::Path, expected: &[u8], text: &str) -> anyhow::Result<()> {
+    let _guard = LOCAL_SAVE_LOCK.lock().unwrap();
     let disk = std::fs::read(path)?;
     if disk != expected {
         anyhow::bail!(
@@ -466,6 +468,23 @@ pub fn save_document(path: &std::path::Path, expected: &[u8], text: &str) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_windows_cannot_both_save_against_the_same_local_file_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, "original").unwrap();
+        let saved = std::thread::scope(|scope| {
+            let first = scope.spawn(|| save_document(&path, b"original", "first edit"));
+            let second = scope.spawn(|| save_document(&path, b"original", "second edit"));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(saved.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(matches!(
+            std::fs::read_to_string(path).unwrap().as_str(),
+            "first edit" | "second edit"
+        ));
+    }
     #[test]
     fn progress_uses_item_counts_when_byte_totals_are_unavailable() {
         let mut progress = copy::CopyProgress {

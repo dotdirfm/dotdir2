@@ -92,7 +92,7 @@ impl QuickPick {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     pub node: Option<PathBuf>,

@@ -721,14 +721,18 @@ impl Settings {
         s
     }
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = path.with_extension("tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(temp, path)?;
-        Ok(())
+        save_json(path, self)
     }
+}
+
+pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
 }
 
 pub fn human_size(size: u64) -> String {
