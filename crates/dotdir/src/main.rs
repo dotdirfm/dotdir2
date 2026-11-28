@@ -30,6 +30,8 @@ mod operations;
 mod panel_menu;
 mod panels;
 mod quick_actions;
+mod remote_connections;
+mod remote_download;
 mod selection_inspector;
 mod syntax;
 mod terminal;
@@ -39,7 +41,31 @@ mod vscode;
 mod vscode_nls;
 mod vscode_theme;
 
-use gpui_kit::*;
+use gpui_kit::{
+    assets::{Assets, icon_assets},
+    *,
+};
+use std::borrow::Cow;
+
+icon_assets!(ExtraIcons, [Lightbulb]);
+
+struct DotDirAssets;
+
+impl AssetSource for DotDirAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => Assets.load(path),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<SharedString>> {
+        let mut paths = Assets.list(prefix)?;
+        paths.extend(ExtraIcons.list(prefix)?);
+        Ok(paths)
+    }
+}
+
 fn main() {
     let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     let config = std::env::var_os("DOTDIR_CONFIG_DIR")
@@ -50,7 +76,7 @@ fn main() {
                 .join("dev.dotdir.native")
         });
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(DotDirAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             syntax::register_perl();
@@ -85,4 +111,17 @@ fn main() {
             .expect("open DotDir window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssetSource as _, DotDirAssets, quick_actions};
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn editor_gutter_and_default_icons_are_bundled() {
+        for path in [quick_actions::ICON_PATH, IconName::Close.path().as_ref()] {
+            assert!(DotDirAssets.load(path).unwrap().is_some(), "{path}");
+        }
+    }
 }

@@ -223,10 +223,14 @@ pub struct Entry {
     pub modified: f64,
 }
 
-#[derive(Debug, Clone)]
+trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+#[derive(Clone)]
 enum FileBacking {
     Local(Arc<Mutex<BufReader<File>>>),
     Memory(Arc<Zeroizing<Vec<u8>>>),
+    Stream(Arc<Mutex<Box<dyn ReadSeek>>>),
 }
 
 /// An independent cursor over an entire file or a bounded subrange of it.
@@ -273,6 +277,16 @@ impl VirtualFile {
         }
     }
 
+    pub fn streaming(reader: impl Read + Seek + Send + 'static, length: u64) -> Self {
+        Self {
+            backing: FileBacking::Stream(Arc::new(Mutex::new(Box::new(reader)))),
+            start: 0,
+            length,
+            position: 0,
+            protected: false,
+        }
+    }
+
     pub fn slice(self, start: u64, length: u64) -> Result<Self> {
         ensure!(
             start <= self.length && length <= self.length - start,
@@ -310,7 +324,7 @@ impl VirtualFile {
 
     pub fn memory_usage(&self) -> u64 {
         match &self.backing {
-            FileBacking::Local(_) => 0,
+            FileBacking::Local(_) | FileBacking::Stream(_) => 0,
             FileBacking::Memory(data) => data.len() as u64,
         }
     }
@@ -359,6 +373,15 @@ impl Read for VirtualFile {
                 let offset = offset as usize;
                 output.copy_from_slice(&data[offset..offset + count]);
                 count
+            }
+            FileBacking::Stream(reader) => {
+                let mut reader = reader
+                    .lock()
+                    .map_err(|_| io::Error::other("File reader is unavailable"))?;
+                if reader.stream_position()? != offset {
+                    reader.seek(SeekFrom::Start(offset))?;
+                }
+                reader.read(output)?
             }
         };
         self.position += read as u64;

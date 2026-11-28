@@ -21,6 +21,7 @@ use crate::{
     operations::*,
     panel_menu::{JumpStep, PanelMenu},
     quick_actions::QuickActions,
+    remote_connections::ConnectionForm,
     selection_inspector::{self, SelectionSnapshot},
     syntax::language_for,
     terminal::Terminal,
@@ -101,7 +102,7 @@ pub(crate) enum Message {
     Simple(anyhow::Result<()>),
 }
 
-fn read_password(input: &InputState) -> Password {
+pub(crate) fn read_password(input: &InputState) -> Password {
     let text = input.text();
     let mut password = Password::new(Vec::with_capacity(text.len()));
     for chunk in text.chunks() {
@@ -155,6 +156,10 @@ fn parse_copy_destinations(value: &str) -> anyhow::Result<Vec<String>> {
 
 impl DotDir {
     pub fn accept_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(Modal::RemoteConnections { .. })) {
+            self.save_remote_connection(window, cx);
+            return;
+        }
         if matches!(self.modal, Some(Modal::ArchivePassword { .. })) {
             if let Some(Modal::ArchivePassword { request, input }) = self.modal.take() {
                 let password = read_password(input.read(cx));
@@ -566,6 +571,8 @@ impl DotDir {
             opposite_archive_writable: self.opposite_archive_destination().is_some(),
             archive_creation: ARCHIVE_FORMATS.creators().next().is_some(),
             provider: matches!(location, Location::Provider(_)),
+            remote_download: matches!(&location, Location::Provider(path)
+                if path.name().is_some() && self.filesystems.is_remote(path)),
             entry: entry.is_some(),
             real_entry: entry.is_some_and(|entry| !entry.parent),
             file: entry.is_some_and(|entry| !entry.directory && !entry.parent),
@@ -576,6 +583,7 @@ impl DotDir {
             items: directory.is_some_and(|d| d.entries.iter().any(|e| !e.parent)),
             selection: directory
                 .is_some_and(|d| !d.marked.is_empty() || d.focused().is_some_and(|e| !e.parent)),
+            file_tab: self.active_file_path().is_some(),
             parent: directory.is_some_and(|d| d.path.parent().is_some()),
             can_save: self.panels_visible
                 && (document.is_some_and(|d| !d.readonly && !d.saving)
@@ -693,6 +701,7 @@ impl DotDir {
         let mut filesystems = self
             .filesystems
             .rebuild_providers(self.extension_logs.clone());
+        filesystems.set_remote_profiles(&self.settings.remote_connections, &self.settings_path);
         let directory = self.settings_path.with_file_name("extensions");
         self.load_vscode_extensions(&directory);
         self.reset_vscode_host();
@@ -1938,6 +1947,15 @@ pub(crate) struct Document {
     pub lsp_status: Option<String>,
     pub _subscription: Subscription,
 }
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        if let Some(buffer) = &self.lsp {
+            buffer.close();
+        }
+    }
+}
+
 impl Document {
     pub(crate) fn inactive_editor(&self) -> Option<&Entity<EditorState>> {
         self.inactive_view.as_ref().map(|view| &view.input)
@@ -1971,7 +1989,9 @@ impl Document {
     }
 
     fn clear_language_server(&mut self, status: Option<String>, cx: &mut App) {
-        self.lsp = None;
+        if let Some(buffer) = self.lsp.take() {
+            buffer.close();
+        }
         self.lsp_status = status;
         self.input.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
@@ -2312,6 +2332,10 @@ pub(crate) enum Modal {
     },
     PanelMenu(PanelMenu),
     Settings,
+    RemoteConnections {
+        form: Option<Box<ConnectionForm>>,
+        busy: bool,
+    },
     Extensions,
     OpenVsx,
     ExtensionLogs,
@@ -2963,6 +2987,17 @@ impl DotDir {
         }
     }
 
+    fn active_file_path(&self) -> Option<&Location> {
+        let pane = &self.panes[self.active];
+        match &pane.tabs.get(pane.active)?.content {
+            TabContent::Document(id) => self.documents.get(id).map(|doc| &doc.path),
+            TabContent::Image { path, .. }
+            | TabContent::Hex { path, .. }
+            | TabContent::Media { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     pub(crate) fn active_hex(&self) -> Option<(&Location, &Entity<HexView>)> {
         match &self.panes[self.active]
             .tabs
@@ -3032,6 +3067,12 @@ impl DotDir {
         self.folder_sizes
             .invalidate_unwatched(|path| matches!(path, Location::Provider(_)));
         self.refresh_directories(|path| matches!(path, Location::Provider(_)));
+    }
+
+    pub(crate) fn refresh_remote_connections(&mut self) {
+        self.filesystems
+            .set_remote_profiles(&self.settings.remote_connections, &self.settings_path);
+        self.refresh_provider_directories();
     }
 
     fn refresh_directories(&mut self, matches: impl Fn(&Location) -> bool) {
@@ -3207,6 +3248,13 @@ impl DotDir {
                 }
                 if let Some(Modal::ArchivePassword { input, .. }) = &this.modal {
                     input.update(cx, |input, cx| input.focus(window, cx));
+                    return;
+                }
+                if let Some(Modal::RemoteConnections {
+                    form: Some(form), ..
+                }) = &this.modal
+                {
+                    form.focus(window, cx);
                     return;
                 }
                 let input = match &this.modal {
@@ -3730,7 +3778,9 @@ impl DotDir {
         policy: ConflictPolicy,
     ) -> bool {
         match policy {
-            ConflictPolicy::Append => !matches!(kind, OperationKind::Move),
+            ConflictPolicy::Append => {
+                !matches!(kind, OperationKind::Move | OperationKind::Download)
+            }
             ConflictPolicy::Resume => {
                 matches!(kind, OperationKind::Copy)
                     && !archive_target
@@ -4053,6 +4103,12 @@ impl DotDir {
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.modal,
+            Some(Modal::RemoteConnections { busy: true, .. })
+        ) {
+            return;
+        }
         match self.modal.take() {
             Some(Modal::Conflict { reply, .. }) => {
                 let _ = reply.send(ConflictResolution::Cancel);
@@ -4122,6 +4178,7 @@ impl DotDir {
             selection_inspector::SUMMARY => self.status = self.selection_snapshot().summary(),
             "left-panel-menu" => self.open_panel_menu(0, window, cx),
             "right-panel-menu" => self.open_panel_menu(1, window, cx),
+            "remote-connections" => self.open_remote_connections(window, cx),
             "keep-preview" => {
                 if let Some((pane, index)) = self.preview_target() {
                     self.panes[pane].tabs[index].make_permanent();
@@ -4405,6 +4462,29 @@ impl DotDir {
                     }
                 }
             }
+            "copy-path" => {
+                let paths = if let Some(directory) = self.directory(self.active) {
+                    directory
+                        .selected()
+                        .into_iter()
+                        .map(|entry| entry.path.display())
+                        .collect::<Vec<_>>()
+                } else {
+                    self.active_file_path()
+                        .map(Location::display)
+                        .into_iter()
+                        .collect()
+                };
+                if paths.is_empty() {
+                    return;
+                }
+                self.status = if paths.len() == 1 {
+                    "Path copied".into()
+                } else {
+                    format!("{} paths copied", paths.len())
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+            }
             "copy" | "move" | "trash" => {
                 let Some(directory) = self.directory(self.active) else {
                     return;
@@ -4418,6 +4498,8 @@ impl DotDir {
                     return;
                 }
                 let from_archive = matches!(directory.path, Location::Archive { .. });
+                let from_remote = matches!(&directory.path, Location::Provider(path)
+                    if self.filesystems.is_remote(path));
                 let description = format!(
                     "{} item(s) from {}",
                     sources.len(),
@@ -4447,7 +4529,10 @@ Selected entries will be permanently removed from the archive."
                     };
                     self.prompt(kind, title, description, String::new(), window, cx);
                 } else {
-                    let archive_destination = self.opposite_archive_destination().cloned();
+                    let archive_destination = self
+                        .opposite_archive_destination()
+                        .cloned()
+                        .filter(|_| !from_remote);
                     let destination = archive_destination
                         .as_ref()
                         .map(Location::display)
@@ -4459,6 +4544,7 @@ Selected entries will be permanently removed from the archive."
                         .unwrap_or_default();
                     let kind = match id {
                         "move" => OperationKind::Move,
+                        "copy" if from_remote => OperationKind::Download,
                         _ if from_archive && archive_destination.is_none() => {
                             OperationKind::Extract
                         }

@@ -19,12 +19,14 @@ pub struct CommandState {
     pub opposite_archive_writable: bool,
     pub archive_creation: bool,
     pub provider: bool,
+    pub remote_download: bool,
     pub entry: bool,
     pub real_entry: bool,
     pub file: bool,
     pub byte_viewer: bool,
     pub items: bool,
     pub selection: bool,
+    pub file_tab: bool,
     pub parent: bool,
     pub can_save: bool,
     pub line_wrap: Option<bool>,
@@ -60,6 +62,8 @@ pub enum Availability {
     EditableFile,
     Items,
     Copy,
+    CopyPath,
+    RemoteConnections,
     MutateSelection,
     CreateArchive,
     Parent,
@@ -99,10 +103,24 @@ impl Availability {
             }
             Self::Items => state.directory && state.items,
             Self::Copy => {
-                state.directory && state.selection && state.operation_idle && !state.provider
+                state.directory
+                    && state.selection
+                    && state.operation_idle
+                    && (!state.provider || state.remote_download)
+            }
+            Self::RemoteConnections => {
+                state.panels_visible
+                    && dotdir_remote::Protocol::ALL
+                        .into_iter()
+                        .any(dotdir_remote::Protocol::enabled)
+            }
+            Self::CopyPath => {
+                state.panels_visible && (state.directory && state.selection || state.file_tab)
             }
             Self::MutateSelection => Self::Copy.matches(state) && (local || state.archive_writable),
-            Self::CreateArchive => Self::Copy.matches(state) && state.archive_creation,
+            Self::CreateArchive => {
+                Self::Copy.matches(state) && state.archive_creation && !state.provider
+            }
             Self::Parent => state.directory && state.parent,
             Self::RenameOrSave => {
                 (state.directory && local && state.real_entry && state.operation_idle)
@@ -138,6 +156,7 @@ impl Command {
         match self.id {
             "view" if state.directory && state.real_entry && !state.file => "Calculate Folder Size",
             "copy" if state.archive && !state.opposite_archive_writable => "Extract Archive",
+            "copy" if state.remote_download => "Download to Local Folder",
             "trash" if state.archive => "Delete Archive Entries",
             "toggle-line-wrap" if state.line_wrap == Some(true) => "Disable Line Wrap",
             "toggle-line-wrap" if state.line_wrap == Some(false) => "Enable Line Wrap",
@@ -166,6 +185,7 @@ impl Command {
             "view" => "View",
             "edit" => "Edit",
             "copy" if state.archive && !state.opposite_archive_writable => "Extract",
+            "copy" if state.remote_download => "Download",
             "copy" => "Copy",
             "move" => "Move",
             "mkdir" => "Mkdir",
@@ -294,6 +314,20 @@ pub const COMMANDS: &[Command] = &[
         key: "f5",
         context: "FilePane",
         availability: Availability::Copy,
+    },
+    Command {
+        id: "copy-path",
+        title: "Copy Path",
+        key: "cmd-shift-c",
+        context: "DotDir",
+        availability: Availability::CopyPath,
+    },
+    Command {
+        id: "remote-connections",
+        title: "Remote Connections",
+        key: "",
+        context: "DotDir",
+        availability: Availability::RemoteConnections,
     },
     Command {
         id: "move",
@@ -873,6 +907,53 @@ mod tests {
         assert!(available("keep-preview", &state));
         state.panels_visible = false;
         assert!(!available("keep-preview", &state));
+    }
+
+    #[test]
+    fn copy_path_requires_a_visible_selection_or_file_tab() {
+        let mut state = CommandState {
+            panels_visible: true,
+            directory: true,
+            entry: true,
+            ..Default::default()
+        };
+        assert!(!available("copy-path", &state));
+        state.selection = true;
+        assert!(available("copy-path", &state));
+        state.directory = false;
+        state.selection = false;
+        state.file_tab = true;
+        assert!(available("copy-path", &state));
+        state.panels_visible = false;
+        assert!(!available("copy-path", &state));
+    }
+
+    #[test]
+    fn remote_panel_can_download_without_mutating_the_remote_filesystem() {
+        let mut state = CommandState {
+            panels_visible: true,
+            directory: true,
+            provider: true,
+            remote_download: true,
+            operation_idle: true,
+            archive_creation: true,
+            real_entry: true,
+            selection: true,
+            ..Default::default()
+        };
+        assert!(available("copy", &state));
+        for command in [
+            "move",
+            "trash",
+            "rename",
+            "mkdir",
+            "new-file",
+            "create-archive",
+        ] {
+            assert!(!available(command, &state), "{command}");
+        }
+        state.remote_download = false;
+        assert!(!available("copy", &state));
     }
 
     #[test]

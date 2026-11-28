@@ -636,6 +636,8 @@ pub struct Settings {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub path_aliases: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remote_connections: Vec<dotdir_remote::Profile>,
     pub vscode: crate::vscode::Settings,
 }
 impl Default for Settings {
@@ -657,6 +659,7 @@ impl Default for Settings {
             terminal_height: 240.,
             archive_password_cache_minutes: crate::archive_passwords::DEFAULT_MINUTES,
             path_aliases: BTreeMap::new(),
+            remote_connections: Vec::new(),
             vscode: Default::default(),
         }
     }

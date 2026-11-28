@@ -275,6 +275,7 @@ pub struct Buffer {
     id: u64,
     uri: String,
     connection: Arc<Connection>,
+    closed: Cell<bool>,
     text: RefCell<Rope>,
     revision: Cell<i32>,
     diagnostics: RefCell<Option<DiagnosticSet>>,
@@ -306,6 +307,7 @@ impl Buffer {
             id,
             uri,
             connection,
+            closed: Cell::new(false),
             text: RefCell::new(text),
             revision: Cell::new(1),
             diagnostics: RefCell::new(None),
@@ -323,6 +325,12 @@ impl Buffer {
             return workspace.location(&path);
         }
         Some(path.into())
+    }
+
+    pub fn close(&self) {
+        if !self.closed.replace(true) {
+            let _ = self.connection.send(Event::Close(self.id));
+        }
     }
 
     pub fn session(&self) -> u64 {
@@ -431,6 +439,7 @@ impl Buffer {
         method: &'static str,
         params: Value,
     ) -> Result<async_channel::Receiver<Result<Value>>> {
+        ensure!(!self.closed.get(), "Editor is closed");
         let (reply, receiver) = async_channel::bounded(1);
         self.connection.send(Event::Query {
             id: self.id,
@@ -542,7 +551,7 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let _ = self.connection.send(Event::Close(self.id));
+        self.close();
     }
 }
 
@@ -1151,6 +1160,16 @@ impl Server {
                 language,
                 text,
             } => {
+                // A server tracks documents by URI. Retire any older buffer
+                // before opening its replacement, even if the editor still
+                // holds references to the older buffer.
+                if let Some(old) = self
+                    .documents
+                    .iter()
+                    .find_map(|(&id, document)| (document.uri == uri).then_some(id))
+                {
+                    self.close_document(old)?;
+                }
                 self.notify("textDocument/didOpen", json!({
                     "textDocument": {"uri": uri, "languageId": language, "version": 1, "text": text.to_string()},
                 }))?;
@@ -1189,16 +1208,7 @@ impl Server {
                 }
             }
             Event::Close(id) => {
-                if let Some(document) = self.documents.remove(&id) {
-                    if let Some(request) = document.diagnostic {
-                        self.requests.remove(&request);
-                        self.notify("$/cancelRequest", json!({"id": request}))?;
-                    }
-                    self.notify(
-                        "textDocument/didClose",
-                        json!({"textDocument": {"uri": document.uri}}),
-                    )?;
-                }
+                self.close_document(id)?;
             }
             Event::Query {
                 id,
@@ -1220,6 +1230,20 @@ impl Server {
             Event::Stop => {}
         }
         Ok(())
+    }
+
+    fn close_document(&mut self, id: u64) -> Result<()> {
+        let Some(document) = self.documents.remove(&id) else {
+            return Ok(());
+        };
+        if let Some(request) = document.diagnostic {
+            self.requests.remove(&request);
+            self.notify("$/cancelRequest", json!({"id": request}))?;
+        }
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": document.uri}}),
+        )
     }
 
     fn flush_document(&mut self, id: u64) -> Result<()> {
@@ -1628,6 +1652,119 @@ mod tests {
         result.recv_blocking().unwrap().unwrap()
     }
 
+    fn installed_typescript_sdk(extension: &vscode::Extension, executable: &str) -> PathBuf {
+        fs::read_dir(extension.directory().join("node_modules/@typescript"))
+            .unwrap()
+            .filter_map(|entry| Some(entry.ok()?.path().join("lib")))
+            .find(|dir| dir.join(executable).is_file())
+            .expect("TypeScript SDK in the installed package")
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed TypeScript 7 extension"]
+    fn installed_typescript_diagnoses_new_tabs_in_an_active_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().canonicalize().unwrap();
+        let paths = if let Some(files) = std::env::var_os("DOTDIR_TEST_TYPESCRIPT_FILES") {
+            std::env::split_paths(&files)
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<Vec<_>>()
+        } else {
+            fs::write(
+                project.join("tsconfig.json"),
+                r#"{"compilerOptions":{"types":[],"jsx":"preserve","strict":true}}"#,
+            )
+            .unwrap();
+            ["first", "second", "third", "fourth"]
+                .map(|name| {
+                    let path = project.join(format!("{name}.tsx"));
+                    fs::write(&path, format!("export const {name}: number = \"wrong\";\n"))
+                        .unwrap();
+                    path
+                })
+                .to_vec()
+        };
+        assert!(paths.len() >= 2);
+        let root = std::env::var_os("DOTDIR_TEST_TYPESCRIPT_EXTENSIONS")
+            .map(PathBuf::from)
+            .unwrap_or_else(installed_extensions_root);
+        let extensions = vscode::discover(&root, &vscode::Settings::default());
+        let mut settings = vscode::Settings {
+            enabled: vec!["typescriptteam.native-preview".into()],
+            ..Default::default()
+        };
+        let (extension, _) = vscode::language_extension(&extensions, &settings, &paths[0]).unwrap();
+        let executable = if cfg!(windows) { "tsc.exe" } else { "tsc" };
+        let sdk = installed_typescript_sdk(extension, executable);
+        settings.configuration.extend([
+            ("js/ts.experimental.useTsgo".into(), Value::Bool(true)),
+            ("js/ts.tsdk.path".into(), json!(sdk)),
+        ]);
+
+        let (events, notices) = mpsc::channel();
+        let mut servers = LanguageServers::new(
+            temp.path().into(),
+            ExtensionLogs::default(),
+            move |notice| {
+                let _ = events.send(notice);
+            },
+        );
+        let open = |servers: &mut LanguageServers, id, path: &Path| {
+            let (extension, language) =
+                vscode::language_extension(&extensions, &settings, path).unwrap();
+            servers
+                .attach_extension(
+                    id,
+                    path,
+                    Rope::from(fs::read_to_string(path).unwrap()),
+                    language,
+                    extension,
+                    &settings,
+                )
+                .unwrap()
+        };
+        let diagnostics = |mut pending: HashSet<u64>| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !pending.is_empty() {
+                match notices.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Notice::Diagnostics {
+                        document,
+                        revision: 1,
+                        items,
+                        ..
+                    }) if items.iter().any(|item| {
+                        item.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                    }) =>
+                    {
+                        pending.remove(&document);
+                    }
+                    Ok(Notice::Failed { error, .. }) => panic!("{error}"),
+                    Ok(_) => {}
+                    Err(error) => panic!("Waiting for diagnostics from tabs {pending:?}: {error}"),
+                }
+            }
+        };
+
+        let first = open(&mut servers, 1, &paths[0]);
+        diagnostics(HashSet::from([1]));
+        let buffers: Vec<_> = paths[1..]
+            .iter()
+            .enumerate()
+            .map(|(index, path)| open(&mut servers, index as u64 + 2, path))
+            .collect();
+        assert!(
+            buffers
+                .iter()
+                .all(|buffer| buffer.session() == first.session())
+        );
+        diagnostics((2..=paths.len() as u64).collect());
+
+        drop(buffers);
+        let reopened = open(&mut servers, paths.len() as u64 + 1, &paths[1]);
+        assert_eq!(reopened.session(), first.session());
+        diagnostics(HashSet::from([paths.len() as u64 + 1]));
+    }
+
     #[test]
     #[cfg(feature = "zip-extension")]
     #[ignore = "requires the installed TypeScript 7 Native Preview SDK"]
@@ -1988,11 +2125,7 @@ mod tests {
         let (extension, language) =
             vscode::language_extension(&extensions, &settings, &path).unwrap();
         let executable = if cfg!(windows) { "tsc.exe" } else { "tsc" };
-        let sdk = fs::read_dir(extension.directory().join("node_modules/@typescript"))
-            .unwrap()
-            .filter_map(|entry| Some(entry.ok()?.path().join("lib")))
-            .find(|dir| dir.join(executable).is_file())
-            .expect("TypeScript SDK in the installed package");
+        let sdk = installed_typescript_sdk(extension, executable);
         settings
             .configuration
             .insert("js/ts.experimental.useTsgo".into(), Value::Bool(true));
@@ -2207,6 +2340,54 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("x: number;"))
         }));
+
+        // An editor or an outstanding LSP request can still hold the old
+        // buffer after its tab has closed.
+        let old_session = reopened.session();
+        let mut replacement = typescript
+            .attach_extension(3, &path, Rope::from(input), language, extension, &settings)
+            .unwrap();
+        assert_eq!(replacement.session(), old_session);
+        drop(reopened);
+        assert!(!query(&replacement, "textDocument/definition", 1, 2).is_null());
+        diagnostic(3, 1, &has_type_error);
+
+        fs::write(&path, input).unwrap();
+        let neighbor_path = project.join("neighbor.ts");
+        let neighbor_text = "export const neighbor = 1;\n";
+        fs::write(&neighbor_path, neighbor_text).unwrap();
+        let neighbor = typescript
+            .attach_extension(
+                4,
+                &neighbor_path,
+                Rope::from(neighbor_text),
+                language,
+                extension,
+                &settings,
+            )
+            .unwrap();
+        for id in 5..8 {
+            replacement.close();
+            let next = typescript
+                .attach_extension(id, &path, Rope::from(input), language, extension, &settings)
+                .unwrap();
+            assert_eq!(next.session(), neighbor.session());
+            replacement = next;
+            diagnostic(id, 1, &has_type_error);
+            assert!(!query(&replacement, "textDocument/definition", 1, 2).is_null());
+        }
+        drop(neighbor);
+        for id in 8..11 {
+            let previous_session = replacement.session();
+            replacement.close();
+            drop(replacement);
+            replacement = typescript
+                .attach_extension(id, &path, Rope::from(input), language, extension, &settings)
+                .unwrap();
+            assert_ne!(replacement.session(), previous_session);
+            diagnostic(id, 1, &has_type_error);
+            assert!(!query(&replacement, "textDocument/definition", 1, 2).is_null());
+        }
     }
 
     #[test]

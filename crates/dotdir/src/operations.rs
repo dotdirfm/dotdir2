@@ -2,6 +2,7 @@ use crate::{
     archive::Location,
     archive_ops::{self, TransferContext},
     filesystems::Filesystems,
+    remote_download,
 };
 use anyhow::{Context, bail};
 use dotdir_archive_api::{ArchiveFormat, CreationOptions};
@@ -18,6 +19,7 @@ use std::{
 #[derive(Clone, Copy, Debug)]
 pub enum OperationKind {
     Copy,
+    Download,
     Move,
     Trash,
     Extract,
@@ -29,6 +31,7 @@ impl OperationKind {
     pub fn title(self) -> &'static str {
         match self {
             Self::Copy => "Copy",
+            Self::Download => "Download",
             Self::Move => "Move",
             Self::Trash => "Move to Trash",
             Self::Extract => "Extract Archive",
@@ -129,6 +132,24 @@ impl Operation {
         options: CopyOptions,
         filesystems: Filesystems,
     ) -> Self {
+        if matches!(kind, OperationKind::Download) {
+            return Self::spawn(id, kind, move |cancel, emit, conflict| {
+                let destination = destination
+                    .local()
+                    .context("Choose a local directory for downloads")?;
+                remote_download::download(
+                    sources,
+                    destination,
+                    options.conflict_policy,
+                    &TransferContext {
+                        filesystems: &filesystems,
+                        cancel,
+                        emit,
+                        conflict,
+                    },
+                )
+            });
+        }
         if let Location::Local(directory) = &destination
             && sources.iter().all(|source| source.local().is_some())
         {

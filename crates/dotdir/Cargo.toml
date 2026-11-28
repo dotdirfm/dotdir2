@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["sevenz-extension", "tar-extension", "zip-extension"]
+default = ["sevenz-extension", "tar-extension", "zip-extension", "ftp-extension", "webdav-extension", "smb-extension", "s3-extension"]
 sevenz-extension = ["dep:dotdir-sevenz"]
 tar-extension = ["dep:dotdir-tar"]
 zip-extension = ["dep:dotdir-zip"]
+ftp-extension = ["dotdir-remote/ftp"]
+webdav-extension = ["dotdir-remote/webdav"]
+smb-extension = ["dotdir-remote/smb"]
+s3-extension = ["dotdir-remote/s3"]
 
 [dependencies]
 anyhow.workspace = true
@@ -17,6 +21,7 @@ serde_json.workspace = true
 dotdir-core = { path = "../dotdir-core" }
 dotdir-archive-api = { path = "../dotdir-archive-api" }
 dotdir-extension-host = { path = "../dotdir-extension-host" }
+dotdir-remote = { path = "../../extensions/remote" }
 dotdir-sevenz = { path = "../../extensions/sevenz", optional = true }
 dotdir-tar = { path = "../../extensions/tar", optional = true }
 dotdir-zip = { path = "../../extensions/zip", optional = true }

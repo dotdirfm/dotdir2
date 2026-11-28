@@ -195,12 +195,15 @@ function bufferEdits(edit, uri) {
 
 class LanguageSession {
   documents = new Map();
+  tabs = new Map();
   providers = new Map();
   open = new EventEmitter();
   change = new EventEmitter();
   close = new EventEmitter();
   save = new EventEmitter();
   active = new EventEmitter();
+  tabsChanged = new EventEmitter();
+  visibleEditorsChanged = new EventEmitter();
   configurationChanged = new EventEmitter();
   contentProviders = new Map();
   readers = new Set();
@@ -216,18 +219,19 @@ class LanguageSession {
     const session = this;
     const group = {
       get activeTab() {
-        return session.editor && { input: new TabInputText(session.editor.document.uri), group: this, isActive: true };
+        return session.editor && session.tabs.get(session.editor.document.uri.toString());
       },
-      get tabs() { return [...session.documents.values()].map(document => ({ input: new TabInputText(document.uri), group: this })); },
+      get tabs() { return [...session.tabs.values()]; },
       isActive: true,
       viewColumn: 1
     };
+    this.tabGroup = group;
     const alerts = message => { console.error(message); return Promise.resolve(undefined); };
     Object.assign(api.window, {
       onDidChangeActiveTextEditor: this.active.event,
-      onDidChangeVisibleTextEditors: emptyEvent,
+      onDidChangeVisibleTextEditors: this.visibleEditorsChanged.event,
       onDidChangeTextEditorSelection: emptyEvent,
-      tabGroups: { all: [group], activeTabGroup: group, onDidChangeTabs: emptyEvent, onDidChangeTabGroups: emptyEvent },
+      tabGroups: { all: [group], activeTabGroup: group, onDidChangeTabs: this.tabsChanged.event, onDidChangeTabGroups: emptyEvent },
       createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
       createTreeView: () => ({
         visible: false, selection: [],
@@ -244,7 +248,7 @@ class LanguageSession {
     });
     Object.defineProperties(api.window, {
       activeTextEditor: { get: () => session.editor },
-      visibleTextEditors: { get: () => [...session.documents.values()].map(document => ({ document, viewColumn: 1 })) }
+      visibleTextEditors: { get: () => session.visibleEditors() }
     });
     Object.assign(api.workspace, {
       isTrusted: true,
@@ -498,6 +502,10 @@ class LanguageSession {
     };
   }
 
+  visibleEditors() {
+    return [...this.documents.values()].map(document => ({ document, viewColumn: 1 }));
+  }
+
   register(kind, selector, provider) {
     const providers = this.providers.get(kind) ?? new Set();
     this.providers.set(kind, providers);
@@ -731,7 +739,16 @@ class LanguageSession {
       const item = params.textDocument;
       const uri = Uri.parse(item.uri);
       const document = new TextDocument({ ...item, uri, fileName: uri.fsPath });
+      const session = this;
+      const previousTab = this.tabGroup.activeTab;
+      const tab = {
+        input: new TabInputText(uri),
+        group: this.tabGroup,
+        get isActive() { return session.editor?.document === document; },
+        get isDirty() { return document.isDirty; }
+      };
       this.documents.set(item.uri, document);
+      this.tabs.set(item.uri, tab);
       this.editor = { document, selection: new Selection(0, 0, 0, 0), viewColumn: 1 };
       if (!this.activating) {
         this.activating = Promise.resolve().then(() => activateExtension(this.request, this.context(this.request)));
@@ -746,6 +763,8 @@ class LanguageSession {
       } else {
         this.open.fire(document);
       }
+      this.tabsChanged.fire({ opened: [tab], closed: [], changed: previousTab ? [previousTab] : [] });
+      this.visibleEditorsChanged.fire(this.visibleEditors());
       this.active.fire(this.editor);
       this.send({ method: 'dotdir/documentReady', params: { uri: item.uri } });
       return;
@@ -771,15 +790,24 @@ class LanguageSession {
       return;
     }
     if (method === 'textDocument/didClose') {
-      const document = this.documents.get(params.textDocument.uri);
-      this.documents.delete(params.textDocument.uri);
-      this.codeActions.delete(params.textDocument.uri);
-      if (document) { document.isClosed = true; this.close.fire(document); }
-      if (document && this.editor?.document === document) {
+      const { uri } = params.textDocument;
+      const document = this.documents.get(uri);
+      const tab = this.tabs.get(uri);
+      if (!document || !tab) return;
+      this.documents.delete(uri);
+      this.tabs.delete(uri);
+      this.codeActions.delete(uri);
+      document.isClosed = true;
+      this.close.fire(document);
+      const activeChanged = this.editor?.document === document;
+      if (activeChanged) {
         const next = [...this.documents.values()].at(-1);
         this.editor = next && { document: next, selection: new Selection(0, 0, 0, 0), viewColumn: 1 };
-        this.active.fire(this.editor);
       }
+      const activeTab = this.tabGroup.activeTab;
+      this.tabsChanged.fire({ opened: [], closed: [tab], changed: activeChanged && activeTab ? [activeTab] : [] });
+      this.visibleEditorsChanged.fire(this.visibleEditors());
+      if (activeChanged) this.active.fire(this.editor);
       return;
     }
     if (method === 'dotdir/executeCommand') {

@@ -335,7 +335,7 @@ impl Location {
             Self::Archive { archive, member } => {
                 archive.read_member(member, &filesystems.archive_operation(), limit, cancel)
             }
-            Self::Provider(path) => filesystems.read_file(path, limit as usize),
+            Self::Provider(path) => filesystems.read_file(path, limit as usize, cancel),
         }
     }
 
@@ -353,9 +353,18 @@ impl Location {
                 cancel,
                 SEEKABLE_LIMIT,
             ),
-            Self::Provider(path) => Ok(VirtualFile::memory(
-                filesystems.read_file(path, SEEKABLE_LIMIT as usize)?,
-            )),
+            Self::Provider(path) => {
+                if filesystems.is_remote(path) {
+                    let file = filesystems.open_remote(path, cancel)?;
+                    Ok(VirtualFile::streaming(file.reader, file.size))
+                } else {
+                    Ok(VirtualFile::memory(filesystems.read_file(
+                        path,
+                        SEEKABLE_LIMIT as usize,
+                        cancel,
+                    )?))
+                }
+            }
         }
     }
 
@@ -904,9 +913,14 @@ impl Archive {
                 ensure_directory(&base, parent)?;
                 let source_label =
                     PathBuf::from(format!("{}!/{}", self.source.display(), path.display()));
-                if let Some((target, mode)) =
-                    extraction_target(&source_label, target, entry, &mut policy, cancel, conflict)?
-                {
+                if let Some((target, mode)) = extraction_target(
+                    &source_label,
+                    target,
+                    entry.modified,
+                    &mut policy,
+                    cancel,
+                    conflict,
+                )? {
                     ensure!(
                         archive_path.as_ref().is_none_or(|source| target != *source
                             && !same_file::is_same_file(&target, source).unwrap_or(false)),
@@ -1144,7 +1158,7 @@ pub(crate) fn valid_component(name: &str) -> bool {
     true
 }
 
-fn ensure_directory(base: &Path, relative: &Path) -> Result<()> {
+pub(crate) fn ensure_directory(base: &Path, relative: &Path) -> Result<()> {
     let mut path = base.to_path_buf();
     for component in relative.components() {
         path.push(component);
@@ -1163,16 +1177,16 @@ fn ensure_directory(base: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-enum WriteMode {
+pub(crate) enum WriteMode {
     New,
     Replace,
     Append,
 }
 
-fn extraction_target(
+pub(crate) fn extraction_target(
     source: &Path,
     target: PathBuf,
-    entry: &Member,
+    modified_ms: f64,
     policy: &mut ConflictPolicy,
     cancel: &CancelToken,
     conflict: &dyn Fn(&Path, &Path) -> ConflictResolution,
@@ -1212,7 +1226,7 @@ fn extraction_target(
                 .modified()?
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
-            if entry.modified > modified.as_millis() as f64 {
+            if modified_ms > modified.as_millis() as f64 {
                 ConflictResolution::Overwrite
             } else {
                 ConflictResolution::Skip

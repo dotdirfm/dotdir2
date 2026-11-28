@@ -1477,6 +1477,14 @@ impl DotDir {
             ),
             Modal::PanelMenu(_) => unreachable!(),
             Modal::Settings => ("Settings".into(), String::new()),
+            Modal::RemoteConnections { form, .. } => (
+                match form {
+                    Some(form) => form.title(),
+                    None => "Remote Connections",
+                }
+                .into(),
+                String::new(),
+            ),
             Modal::Extensions => ("Extensions".into(), String::new()),
             Modal::OpenVsx => ("Extensions".into(), String::new()),
             Modal::ExtensionLogs => ("Extension Logs".into(), String::new()),
@@ -1907,6 +1915,9 @@ impl DotDir {
                     );
                 }, cx));
                 content=content.child(self.button("keybindings","Edit keybindings.json",|this,window,cx|{let path=this.settings_path.with_file_name("keybindings.json");if !path.exists(){let _=std::fs::write(&path,"[\n  {\"key\": \"cmd-l\", \"command\": \"location\", \"context\": \"DotDir\"}\n]\n");}this.dismiss(window,cx);this.open_document(this.active,path,false,window,cx);},cx));
+            }
+            Modal::RemoteConnections { form, busy } => {
+                content = content.child(self.render_remote_connections(form.as_deref(), *busy, cx));
             }
             Modal::OpenVsx => {
                 content = content.child(self.render_marketplace(window, cx));

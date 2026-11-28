@@ -15,6 +15,7 @@ use std::{
 const PROBE_DELAY: Duration = Duration::from_millis(250);
 const BUTTON_SIZE: Pixels = px(16.);
 pub(crate) const GUTTER_WIDTH: Pixels = px(18.);
+pub(crate) const ICON_PATH: &str = "icons/lightbulb.svg";
 
 pub(crate) fn action_range(buffer: &Buffer, text: &Rope, selection: Range<usize>) -> Range<usize> {
     if !selection.is_empty() {
@@ -209,7 +210,7 @@ impl Element for QuickActionButton {
             })
             .child(
                 Icon::empty()
-                    .path("icons/lightbulb.svg")
+                    .path(ICON_PATH)
                     .size(px(13.))
                     .text_color(self.color),
             )

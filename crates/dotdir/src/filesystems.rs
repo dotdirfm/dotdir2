@@ -5,15 +5,17 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use dotdir_core::copy::CancelToken;
+use dotdir_remote::{Connection, Profile, Protocol, RemoteFile};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -166,13 +168,19 @@ pub struct ProviderEntry {
 }
 
 trait Provider: Send + Sync {
-    fn read_directory(&self, path: &ProviderPath) -> Result<Vec<ProviderEntry>>;
-    fn read_file(&self, path: &ProviderPath, limit: usize) -> Result<Vec<u8>>;
+    fn read_directory(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<Vec<ProviderEntry>>;
+    fn read_file(&self, path: &ProviderPath, limit: usize, cancel: &CancelToken)
+    -> Result<Vec<u8>>;
 }
 
 #[derive(Clone)]
 pub struct Filesystems {
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
+    remote: Arc<HashMap<String, RemoteProvider>>,
     pub(crate) archive_passwords: Arc<ArchivePasswords>,
     password_scope: Option<Arc<PasswordScope>>,
     interactive: bool,
@@ -182,6 +190,7 @@ impl Filesystems {
     pub fn new(logs: ExtensionLogs) -> Self {
         Self {
             providers: Self::builtin_providers(logs),
+            remote: Arc::new(HashMap::new()),
             archive_passwords: Arc::new(ArchivePasswords::unattended()),
             password_scope: None,
             interactive: true,
@@ -232,6 +241,9 @@ impl Filesystems {
     }
 
     fn provider(&self, path: &ProviderPath) -> Result<&dyn Provider> {
+        if let Some(provider) = self.remote.get(&path.scheme) {
+            return Ok(provider);
+        }
         self.providers
             .get(&path.scheme)
             .map(Arc::as_ref)
@@ -243,7 +255,15 @@ impl Filesystems {
     }
 
     pub fn read_directory(&self, path: &ProviderPath) -> Result<Vec<ProviderEntry>> {
-        let entries = self.provider(path)?.read_directory(path)?;
+        self.read_directory_cancellable(path, &CancelToken::new())
+    }
+
+    pub fn read_directory_cancellable(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<Vec<ProviderEntry>> {
+        let entries = self.provider(path)?.read_directory(path, cancel)?;
         let mut names = HashSet::new();
         for entry in &entries {
             ensure!(
@@ -260,13 +280,62 @@ impl Filesystems {
         Ok(entries)
     }
 
-    pub fn read_file(&self, path: &ProviderPath, limit: usize) -> Result<Vec<u8>> {
-        let data = self.provider(path)?.read_file(path, limit)?;
+    pub fn read_file(
+        &self,
+        path: &ProviderPath,
+        limit: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>> {
+        ensure!(!cancel.is_cancelled(), "File read cancelled");
+        let data = self.provider(path)?.read_file(path, limit, cancel)?;
         ensure!(
             data.len() <= limit,
             "Files over 16 MiB require the streaming viewer"
         );
         Ok(data)
+    }
+
+    pub fn set_remote_profiles(&mut self, profiles: &[Profile], settings_path: &Path) {
+        let namespace = credential_namespace(settings_path);
+        self.remote = Arc::new(
+            Protocol::ALL
+                .into_iter()
+                .filter(|protocol| protocol.enabled())
+                .map(|protocol| {
+                    let mounts = profiles
+                        .iter()
+                        .filter(|profile| profile.protocol == protocol)
+                        .map(|profile| {
+                            (
+                                profile.name.clone(),
+                                Mount {
+                                    profile: profile.clone(),
+                                    connection: Mutex::default(),
+                                },
+                            )
+                        })
+                        .collect();
+                    (
+                        protocol.scheme().to_owned(),
+                        RemoteProvider {
+                            namespace: namespace.clone(),
+                            mounts,
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    pub fn is_remote(&self, path: &ProviderPath) -> bool {
+        self.remote.contains_key(&path.scheme)
+    }
+
+    pub fn open_remote(&self, path: &ProviderPath, cancel: &CancelToken) -> Result<RemoteFile> {
+        self.remote
+            .get(&path.scheme)
+            .context("Expected a remote connection")?
+            .open(path, cancel)
     }
 
     pub fn register(
@@ -300,7 +369,9 @@ impl Filesystems {
                 "Invalid filesystem protocol: {scheme}"
             );
             ensure!(
-                schemes.insert(scheme) && !self.providers.contains_key(scheme),
+                schemes.insert(scheme)
+                    && !self.providers.contains_key(scheme)
+                    && !self.remote.contains_key(scheme),
                 "Filesystem protocol is already registered: {scheme}"
             );
         }
@@ -320,8 +391,110 @@ impl Filesystems {
     }
 }
 
+pub(crate) fn credential_namespace(settings_path: &Path) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(settings_path.as_os_str().as_encoded_bytes())
+    )
+}
+
+struct Mount {
+    profile: Profile,
+    connection: Mutex<Option<Connection>>,
+}
+
+struct RemoteProvider {
+    namespace: String,
+    mounts: std::collections::BTreeMap<String, Mount>,
+}
+
+impl RemoteProvider {
+    fn mount<'a>(&'a self, path: &'a ProviderPath) -> Result<(&'a Mount, &'a [String])> {
+        let (name, parts) = path
+            .parts
+            .split_first()
+            .context("Select a saved connection")?;
+        let mount = self
+            .mounts
+            .get(name)
+            .with_context(|| format!("Unknown connection: {name}"))?;
+        Ok((mount, parts))
+    }
+
+    fn connection(&self, mount: &Mount, cancel: &CancelToken) -> Result<Connection> {
+        let mut slot = mount
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote connection is unavailable"))?;
+        if let Some(connection) = &*slot {
+            return Ok(connection.clone());
+        }
+        let connection = mount.profile.connect(&self.namespace, cancel)?;
+        *slot = Some(connection.clone());
+        Ok(connection)
+    }
+
+    fn open(&self, path: &ProviderPath, cancel: &CancelToken) -> Result<RemoteFile> {
+        let (mount, parts) = self.mount(path)?;
+        self.connection(mount, cancel)?.open(parts, cancel)
+    }
+}
+
+impl Provider for RemoteProvider {
+    fn read_directory(
+        &self,
+        path: &ProviderPath,
+        cancel: &CancelToken,
+    ) -> Result<Vec<ProviderEntry>> {
+        if path.parts.is_empty() {
+            return Ok(self
+                .mounts
+                .keys()
+                .map(|name| ProviderEntry {
+                    name: name.clone(),
+                    directory: true,
+                    size: 0,
+                    modified_ms: 0,
+                })
+                .collect());
+        }
+        let (mount, parts) = self.mount(path)?;
+        Ok(self
+            .connection(mount, cancel)?
+            .entries(parts, cancel)?
+            .into_iter()
+            .map(|entry| ProviderEntry {
+                name: entry.name,
+                directory: entry.directory,
+                size: entry.size,
+                modified_ms: entry.modified_ms,
+            })
+            .collect())
+    }
+
+    fn read_file(
+        &self,
+        path: &ProviderPath,
+        limit: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>> {
+        let file = self.open(path, cancel)?;
+        ensure!(
+            file.size <= limit as u64,
+            "Remote file exceeds the preview limit"
+        );
+        let mut data = Vec::with_capacity(file.size as usize);
+        file.reader.take(file.size).read_to_end(&mut data)?;
+        ensure!(
+            data.len() as u64 == file.size,
+            "Remote file changed during the read"
+        );
+        Ok(data)
+    }
+}
+
 impl Provider for ExtensionLogs {
-    fn read_directory(&self, path: &ProviderPath) -> Result<Vec<ProviderEntry>> {
+    fn read_directory(&self, path: &ProviderPath, _: &CancelToken) -> Result<Vec<ProviderEntry>> {
         match path.parts.as_slice() {
             [] => Ok(self
                 .groups()
@@ -349,7 +522,7 @@ impl Provider for ExtensionLogs {
         }
     }
 
-    fn read_file(&self, path: &ProviderPath, _: usize) -> Result<Vec<u8>> {
+    fn read_file(&self, path: &ProviderPath, _: usize, _: &CancelToken) -> Result<Vec<u8>> {
         let [group, file] = path.parts.as_slice() else {
             bail!("Extension log file does not exist")
         };
@@ -455,13 +628,13 @@ impl NodeProvider {
 }
 
 impl Provider for NodeProvider {
-    fn read_directory(&self, path: &ProviderPath) -> Result<Vec<ProviderEntry>> {
+    fn read_directory(&self, path: &ProviderPath, _: &CancelToken) -> Result<Vec<ProviderEntry>> {
         let data = self.request("readDirectory", path, LIST_LIMIT)?;
         Ok(serde_json::from_slice(&data)
             .context("Invalid filesystem provider directory entries")?)
     }
 
-    fn read_file(&self, path: &ProviderPath, limit: usize) -> Result<Vec<u8>> {
+    fn read_file(&self, path: &ProviderPath, limit: usize, _: &CancelToken) -> Result<Vec<u8>> {
         self.request("readFile", path, limit)
     }
 }
@@ -597,7 +770,9 @@ mod tests {
         let file = filesystems.read_directory(&folder).unwrap().remove(0);
         assert_eq!(file.size, 3);
         assert_eq!(
-            filesystems.read_file(&folder.child(file.name), 3).unwrap(),
+            filesystems
+                .read_file(&folder.child(file.name), 3, &CancelToken::new())
+                .unwrap(),
             [0, 28, 255]
         );
         assert!(

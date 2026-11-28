@@ -95,6 +95,7 @@ package and signing settings as the test builds.
 | ⌘F3 / ⌘F4 | Live preview / edit in opposite pane |
 | ⌘Shift+Enter | Keep Preview Tab (make it permanent) |
 | F5 / F6 / F7 / F8 | Copy / move / mkdir / Trash |
+| ⌘⇧C | Copy the selected paths or current file path |
 | F9 / F10 / F11 / F12 | Settings / close / extensions / terminal |
 | ⌘L / ⌘T / ⌘W / Ctrl+Tab | Go to path / new tab / close tab / next tab |
 | ⌘R / ⌘. / ⌘1 | Refresh / hidden entries / toggle Brief and Details |
@@ -347,6 +348,26 @@ path on macOS is `~/Library/Application Support/dev.dotdir.native/dotdir.log`.
 
 Node.js extensions can register custom protocols for browsing folders and
 previewing files in DotDir. [Filesystem extension API](docs/architecture.md#filesystem-extensions)
+
+### Remote connections
+
+Open **F1 → Remote Connections → New Connection…** to set up FTP/FTPS,
+WebDAV, SMB, or S3. Saved connections can also be opened through **⌘L** using
+URLs such as `webdav://office/projects` or `s3://backups/2026`. Passwords
+and S3 secret access keys go into the system credential store. S3 can also
+use an AWS profile. On Linux, saving credentials requires a running
+Secret Service.
+
+FTPS uses explicit TLS. An SMB connection opens a named share, and an S3
+connection opens a named bucket. S3 prefixes appear as folders, so each
+object and folder in a listing needs a distinct name.
+
+Use **Enter** to browse, **F3** to preview, and **F5 Download** to copy
+selected files or folders to a local directory. Downloads stream in the
+background and support cancellation. Remote connections are read-only in
+this version. The default build bundles all four providers. Custom builds
+can select `ftp-extension`, `webdav-extension`, `smb-extension`, and
+`s3-extension` individually.
 
 The bundled **Image & Video Viewer** is a native port of the original 1.1.6
 extension. Press **F3** on an image or video, then use **Left/Right** to browse the
